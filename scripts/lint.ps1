@@ -2,9 +2,20 @@ param(
     [string]$BuildDir = "build-v143"
 )
 
+$utf8 = New-Object System.Text.UTF8Encoding $false
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
+
 $ErrorActionPreference = "Stop"
 
 Write-Host "Running Lizard..."
+
+$lizard = Get-Command lizard -ErrorAction SilentlyContinue
+
+if (-not $lizard) {
+    Write-Error "Lizard was not found in PATH. Install it before running lint."
+    exit 1
+}
 
 lizard src `
     -l cpp `
@@ -18,6 +29,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Running Cppcheck..."
+
+$cppcheck = Get-Command cppcheck -ErrorAction SilentlyContinue
+
+if (-not $cppcheck) {
+    Write-Error "Cppcheck was not found in PATH. Install Cppcheck and restart your terminal/IDE."
+    exit 1
+}
 
 $solution = Get-ChildItem $BuildDir -Filter *.sln |
 Select-Object -First 1
