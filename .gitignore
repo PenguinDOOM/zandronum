@@ -16,5 +16,8 @@ src/network/servercommands.h
 # Cppcheck cache
 .cppcheck-cache/
 
+# Serena
+.serena/
+
 #Ignore insiders AI rules
 .github\instructions\codacy.instructions.md
