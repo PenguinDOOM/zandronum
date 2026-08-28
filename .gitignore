@@ -19,5 +19,11 @@ src/network/servercommands.h
 # Serena
 .serena/
 
+# Local development files
+completes/
+guardrails/
+plans/
+requests/
+
 #Ignore insiders AI rules
 .github\instructions\codacy.instructions.md

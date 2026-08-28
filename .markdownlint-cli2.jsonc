@@ -1,0 +1,20 @@
+{
+    "config": {
+        "MD033": {
+            "allowed_elements": [
+                "br"
+            ]
+        }
+    },
+    "gitignore": true,
+    "ignores": [
+        "**/.git/**",
+        "**/.serena/**",
+        "**/.vs/**",
+        "**/.vscode/**",
+        "**/plans/**",
+        "**/guardrails/**",
+        "**/completes/**",
+        "**/requests/**"
+    ]
+}
