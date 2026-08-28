@@ -1,0 +1,5 @@
+#!/bin/sh
+powershell.exe -NoProfile -ExecutionPolicy Bypass \
+    -File scripts/lint-staged.ps1
+
+exit $?
