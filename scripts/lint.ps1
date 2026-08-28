@@ -1,3 +1,7 @@
+param(
+    [string]$BuildDir = "build-v143"
+)
+
 $ErrorActionPreference = "Stop"
 
 Write-Host "Running Lizard..."
@@ -7,17 +11,13 @@ lizard src `
     -C 20 `
     -T nloc=80 `
     --warning-msvs `
-    -t 0
+    -i -1
 
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
 Write-Host "Running Cppcheck..."
-
-param(
-    [string]$BuildDir = "build-v143"
-)
 
 $solution = Get-ChildItem $BuildDir -Filter *.sln |
 Select-Object -First 1
@@ -35,7 +35,7 @@ cmake -S . -B $BuildDir -G "Visual Studio 17 2022" -A x64 -T v143
 cppcheck `
     --project="$($solution.FullName)" `
     "--project-configuration=Release|x64" `
-    --enable=warning, performance, portability `
+    "--enable=warning,performance,portability" `
     --error-exitcode=1 `
     --cppcheck-build-dir=".cppcheck-cache" `
     --template=vs
