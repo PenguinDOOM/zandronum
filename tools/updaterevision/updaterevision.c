@@ -91,6 +91,54 @@ int main(int argc, char **argv)
 		pclose(stream);
 	}
 
+    // Fall back to Git when building from a Git mirror.
+    if (!gotrev)
+    {
+        char gitstatus[128];
+
+        stream = popen(
+            "git describe --tags --always --long && "
+            "git log -1 --format=\"%cI*%H?%ct\"",
+            "r");
+
+        if (stream != NULL)
+        {
+            if (fgets(vertag, sizeof vertag, stream) == vertag &&
+                fgets(lastlog, sizeof lastlog, stream) == lastlog)
+            {
+                stripnl(vertag);
+                stripnl(lastlog);
+                gotrev = 1;
+
+                {
+                    char *p = strrchr(lastlog, '?');
+                    if (p)
+                    {
+                        *p = 0;
+                        hgdate = atoi(p + 1);
+                    }
+                }
+            }
+
+            pclose(stream);
+        }
+
+        if (gotrev)
+        {
+            stream = popen(
+                "git status --porcelain --untracked-files=no",
+                "r");
+
+            if (stream != NULL)
+            {
+                if (fgets(gitstatus, sizeof gitstatus, stream) != NULL)
+                    localchanges = 1;
+
+                pclose(stream);
+            }
+        }
+    }
+
 	if (gotrev)
 	{
 		hash = strchr(lastlog, '*');

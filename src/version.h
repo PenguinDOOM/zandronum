@@ -80,7 +80,20 @@ int GetRevisionNumber();
 // [BB] Use the revision number to automatically make builds from
 // different revisions incompatible. Skulltag only uses one byte
 // to transfer NETGAMEVERSION, so we need to limit its value to [0,255].
-#define NETGAMEVERSION (GetRevisionNumber() % 256)
+//#define NETGAMEVERSION (GetRevisionNumber() % 256)
+
+// Network protocol compatibility revision.
+//
+// This fork intentionally remains wire-compatible with
+// Zandronum 3.3-alpha-r260112-1855 for changes that do not alter
+// networking, serialization, or gameplay simulation.
+//
+// Update this value only when network compatibility is intentionally broken.
+#ifndef NETGAME_COMPAT_REVISION
+#define NETGAME_COMPAT_REVISION 1768244130UL
+#endif
+
+#define NETGAMEVERSION (NETGAME_COMPAT_REVISION % 256)
 
 // Version stored in the ini's [LastRun] section.
 // Bump it if you made some configuration change that you want to
