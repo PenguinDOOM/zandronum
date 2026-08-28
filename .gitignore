@@ -1,0 +1,20 @@
+
+# CMake / Visual Studio build output
+build*/
+out*/
+
+# Zandronum auto generated files
+sqlite/sqlite3.c
+sqlite/sqlite3.h
+sqlite/sqlite3ext.h
+src/gitinfo.h
+protocolspec/generator/__pycache__/*
+sqlite/sqlite-*.tar.gz
+src/network/servercommands.cpp
+src/network/servercommands.h
+
+# Cppcheck cache
+.cppcheck-cache/
+
+#Ignore insiders AI rules
+.github\instructions\codacy.instructions.md
