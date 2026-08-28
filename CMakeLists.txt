@@ -1,5 +1,4 @@
-# [SB] Set the minimum version to 3.5, since it's the lowest CMake 4.0 will accept.
-cmake_minimum_required( VERSION 3.5 )
+cmake_minimum_required( VERSION 3.10 )
 project(Zandronum)
 
 if( COMMAND cmake_policy )
