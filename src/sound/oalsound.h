@@ -74,9 +74,65 @@ public:
 	OpenALFinalizeState FinalizeState;
 };
 
+class OpenALSoundStream : public SoundStream
+{
+public:
+	OpenALSoundStream (OpenALSoundRenderer *owner, SoundStreamCallback callback, int bufferBytes, int flags, int sampleRate, void *userData);
+	~OpenALSoundStream ();
+
+	bool Play (bool looping, float volume);
+	void Stop ();
+	void SetVolume (float volume);
+	bool SetPaused (bool paused);
+	unsigned int GetPosition ();
+	bool IsEnded ();
+
+#ifdef OAL_LIFECYCLE_TEST
+	void SetProcessedFramesForTest (unsigned long long frames);
+#endif
+
+	unsigned int Source;
+	unsigned int Buffers[4];
+
+private:
+	friend class OpenALSoundRenderer;
+
+	bool QueueBuffer (unsigned int buffer);
+	bool ConvertBuffer ();
+	void ApplyGain ();
+	void ApplyPauseState ();
+	void Update ();
+	void SetInactive (bool paused);
+	void ReleaseResources ();
+
+	OpenALSoundRenderer *Owner;
+	SoundStreamCallback Callback;
+	void *UserData;
+	std::vector<BYTE> InputBuffer;
+	std::vector<BYTE> OutputBuffer;
+	unsigned int BufferFrames[4];
+	unsigned int SampleRate;
+	unsigned int StreamChannels;
+	unsigned int InputBits;
+	unsigned int OutputBits;
+	unsigned int OutputFormat;
+	unsigned long long ProcessedFrames;
+	float Volume;
+	bool EndOfInput;
+	bool Failed;
+	bool Ended;
+	bool Playing;
+	bool UserPaused;
+	bool InactivePaused;
+	bool InputIsFloat;
+	bool ResourcesReleased;
+};
+
 class OpenALSoundRenderer : public SoundRenderer
 {
 public:
+	friend class OpenALSoundStream;
+
 	OpenALSoundRenderer ();
 	~OpenALSoundRenderer ();
 
@@ -170,6 +226,7 @@ private:
 	void InitializePauseState (OpenALChannel *channel);
 	void ApplyChannelPauseState (OpenALChannel *channel);
 	unsigned long long GetChannelClock (bool noPause) const;
+	void DestroyStream (OpenALSoundStream *stream);
 
 #ifdef OAL_LIFECYCLE_TEST
 	void InjectStartFailureForTest ();
@@ -197,6 +254,7 @@ private:
 	bool SyncPaused;
 	bool PendingStartNoPause;
 	std::vector<OpenALChannel *> ActiveChannels;
+	std::vector<OpenALSoundStream *> ActiveStreams;
 	std::vector<LogicalPosition> LogicalPositions;
 	std::vector<unsigned int> RetiringSources;
 #ifdef OAL_LIFECYCLE_TEST

@@ -191,8 +191,8 @@ private:
 	bool IsVoiceChatAllowed( void ) const;
 	bool IsPlayerTalking( const unsigned int player ) const;
 	bool IsRecording( void ) const;
-	bool IsTestingMicrophone( void ) const { return isTesting; }
-	float GetTestRMSVolume( void ) const { return testRMSVolume; }
+	bool IsTestingMicrophone( void ) const { return HasFMODAudio( ) && isTesting; }
+	float GetTestRMSVolume( void ) const { return HasFMODAudio( ) ? testRMSVolume : MIN_DECIBELS; }
 	float GetChannelVolume( const unsigned int player ) const;
 	void SetChannelVolume( const unsigned int player, float volume, const bool updateServer );
 	void SetVolume( float volume );
@@ -248,6 +248,7 @@ private:
 		VOIPChannel( const unsigned int player );
 		~VOIPChannel( void );
 
+		bool IsValid( void ) const;
 		bool ShouldPlayIn3DMode( void ) const;
 		int GetUnreadSamples( void ) const;
 		int DecodeOpusFrame( const unsigned char *inBuffer, const unsigned int inLength, float *outBuffer, const unsigned int outLength );
@@ -262,11 +263,14 @@ private:
 	~VOIPController( void ) { Shutdown( ); }
 
 	void ReadRecordSamples( unsigned char *soundBuffer, unsigned int length );
+	bool CanReadRecordSamples( const unsigned char *soundBuffer, const unsigned int length ) const;
+	void DenoiseRecordSamples( float *samples );
 	void SendAudioPacket( void );
 	void UpdateTestRMSVolume( unsigned char *soundBuffer, const unsigned int length );
 	int EncodeOpusFrame( const float *inBuffer, const unsigned int inLength, unsigned char *outBuffer, const unsigned int outLength );
 	bool IsUsingALSA( void ) const;
 	bool IsForbiddenToHearPlayer( const unsigned int player ) const;
+	bool HasFMODAudio( void ) const { return isInitialized && system != nullptr; }
 
 	static FMOD_CREATESOUNDEXINFO CreateSoundExInfo( const unsigned int sampleRate, const unsigned int fileLength );
 	static FMOD_RESULT F_CALLBACK ChannelCallback( FMOD_CHANNEL *channel, FMOD_CHANNEL_CALLBACKTYPE type, void *commanddata1, void *commanddata2 );

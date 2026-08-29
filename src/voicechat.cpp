@@ -469,6 +469,28 @@ void VOIPController::Shutdown( void )
 {
 	Deactivate( );
 
+	for ( unsigned int i = 0; i < MAXPLAYERS; i++ )
+	{
+		if ( VoIPChannels[i] != nullptr )
+		{
+			delete VoIPChannels[i];
+			VoIPChannels[i] = nullptr;
+		}
+	}
+
+	if ( recordSound != nullptr )
+	{
+		if ( system != nullptr )
+		{
+			if ( IsRecording( ))
+				system->recordStop( recordDriverID );
+
+			recordSound->release( );
+		}
+
+		recordSound = nullptr;
+	}
+
 	if ( encoder != nullptr )
 	{
 		opus_encoder_destroy( encoder );
@@ -481,11 +503,12 @@ void VOIPController::Shutdown( void )
 		repacketizer = nullptr;
 	}
 
-	if ( VoIPChannelGroup != nullptr )
+	if (( VoIPChannelGroup != nullptr ) && ( system != nullptr ))
 	{
 		VoIPChannelGroup->release( );
-		VoIPChannelGroup = nullptr;
 	}
+
+	VoIPChannelGroup = nullptr;
 
 	if ( denoiseModel != nullptr )
 	{
@@ -500,8 +523,11 @@ void VOIPController::Shutdown( void )
 	}
 
 	isInitialized = false;
+	isActive = false;
 	isTesting = false;
 	isRecordButtonPressed = false;
+	transmissionType = TRANSMISSIONTYPE_OFF;
+	this->system = nullptr;
 	Printf( "VoIP controller shutting down.\n" );
 }
 
@@ -515,7 +541,7 @@ void VOIPController::Shutdown( void )
 
 void VOIPController::Activate( void )
 {
-	if (( isInitialized == false ) || ( isActive ) || ( CLIENTDEMO_IsPlaying( )))
+	if (( HasFMODAudio( ) == false ) || ( isActive ) || ( CLIENTDEMO_IsPlaying( )))
 		return;
 
 	if ( voice_muteself == false )
@@ -534,7 +560,7 @@ void VOIPController::Activate( void )
 
 void VOIPController::Deactivate( void )
 {
-	if (( isInitialized == false ) || ( isActive == false ))
+	if (( HasFMODAudio( ) == false ) || ( isActive == false ))
 		return;
 
 	// [AK] Clear all of the VoIP channels.
@@ -612,6 +638,9 @@ static void voicechat_ReadSoundBuffer( T *object, FMOD::Sound *sound, unsigned i
 //
 void VOIPController::Tick( void )
 {
+	if ( HasFMODAudio( ) == false )
+		return;
+
 	// [AK] Check if any players' voices need to be unignored.
 	for ( unsigned int i = 0; i < MAXPLAYERS; i++ )
 	{
@@ -629,10 +658,6 @@ void VOIPController::Tick( void )
 				CHAT_UnignorePlayer( i, true );
 		}
 	}
-
-	// [AK] Don't tick while the VoIP controller is uninitialized.
-	if ( isInitialized == false )
-		return;
 
 	if ( IsVoiceChatAllowed( ))
 	{
@@ -803,10 +828,32 @@ static float voicechat_ByteArrayToFloat( unsigned char *bytes )
 	return dataUnion.f;
 }
 
+bool VOIPController::CanReadRecordSamples( const unsigned char *soundBuffer, const unsigned int length ) const
+{
+	return HasFMODAudio( ) && ( soundBuffer != nullptr ) && ( length != 0 );
+}
+
+void VOIPController::DenoiseRecordSamples( float *samples )
+{
+	if (( voice_suppressnoise ) && ( denoiseState != nullptr ))
+	{
+		for ( unsigned int i = 0; i < RECORD_SAMPLES_PER_FRAME; i++ )
+			samples[i] *= SHRT_MAX;
+
+		rnnoise_process_frame( denoiseState, samples, samples );
+
+		for ( unsigned int i = 0; i < RECORD_SAMPLES_PER_FRAME; i++ )
+			samples[i] /= SHRT_MAX;
+	}
+}
+
 //*****************************************************************************
 //
 void VOIPController::ReadRecordSamples( unsigned char *soundBuffer, unsigned int length )
 {
+	if ( CanReadRecordSamples( soundBuffer, length ) == false )
+		return;
+
 	float uncompressedBuffer[RECORD_SAMPLES_PER_FRAME];
 	float downsizedBuffer[PLAYBACK_SAMPLES_PER_FRAME];
 	float rms = 0.0f;
@@ -815,16 +862,7 @@ void VOIPController::ReadRecordSamples( unsigned char *soundBuffer, unsigned int
 		uncompressedBuffer[i] = clamp<float>( voicechat_ByteArrayToFloat( soundBuffer + i * SAMPLE_SIZE ) * voice_recordvolume * 2.5f, -2.5f, 2.5f );
 
 	// [AK] Denoise the audio frame.
-	if (( voice_suppressnoise ) && ( denoiseState != nullptr ))
-	{
-		for ( unsigned int i = 0; i < RECORD_SAMPLES_PER_FRAME; i++ )
-			uncompressedBuffer[i] *= SHRT_MAX;
-
-		rnnoise_process_frame( denoiseState, uncompressedBuffer, uncompressedBuffer );
-
-		for ( unsigned int i = 0; i < RECORD_SAMPLES_PER_FRAME; i++ )
-			uncompressedBuffer[i] /= SHRT_MAX;
-	}
+	DenoiseRecordSamples( uncompressedBuffer );
 
 	// [AK] If using voice activity detection, calculate the RMS. This must be
 	// done after denoising the audio frame.
@@ -898,6 +936,9 @@ void VOIPController::ReadRecordSamples( unsigned char *soundBuffer, unsigned int
 
 void VOIPController::SendAudioPacket( void )
 {
+	if (( HasFMODAudio( ) == false ) || ( repacketizer == nullptr ))
+		return;
+
 	const unsigned int numFrames = opus_repacketizer_get_nb_frames( repacketizer );
 
 	// [AK] According to Opus, in order to guarantee success, the size of the
@@ -951,7 +992,7 @@ void VOIPController::UpdateTestRMSVolume( unsigned char *soundBuffer, const unsi
 
 void VOIPController::StartRecording( void )
 {
-	if ( IsRecording( ))
+	if (( HasFMODAudio( ) == false ) || ( IsRecording( )))
 		return;
 
 	// [AK] Don't start recording audio while using ALSA.
@@ -1024,6 +1065,12 @@ void VOIPController::StartRecording( void )
 
 void VOIPController::StopRecording( void )
 {
+	if ( HasFMODAudio( ) == false )
+	{
+		recordSound = nullptr;
+		return;
+	}
+
 	if ( IsRecording( ) == false )
 		return;
 
@@ -1052,7 +1099,7 @@ void VOIPController::StopRecording( void )
 
 void VOIPController::StartTransmission( const TRANSMISSIONTYPE_e type, const bool getRecordPosition )
 {
-	if (( isInitialized == false ) || ( isActive == false ) || ( transmissionType != TRANSMISSIONTYPE_OFF ))
+	if (( HasFMODAudio( ) == false ) || ( isActive == false ) || ( transmissionType != TRANSMISSIONTYPE_OFF ))
 		return;
 
 	// [AK] Don't start transmitting audio while using ALSA.
@@ -1086,6 +1133,9 @@ void VOIPController::StartTransmission( const TRANSMISSIONTYPE_e type, const boo
 
 void VOIPController::StopTransmission( void )
 {
+	if ( HasFMODAudio( ) == false )
+		return;
+
 	transmissionType = TRANSMISSIONTYPE_OFF;
 }
 
@@ -1099,6 +1149,9 @@ void VOIPController::StopTransmission( void )
 
 bool VOIPController::IsVoiceChatAllowed( void ) const
 {
+	if ( HasFMODAudio( ) == false )
+		return false;
+
 	// [AK] Voice chat can only be used in online games.
 	if ( NETWORK_GetState( ) != NETSTATE_CLIENT )
 		return false;
@@ -1126,6 +1179,9 @@ bool VOIPController::IsVoiceChatAllowed( void ) const
 
 bool VOIPController::IsPlayerTalking( const unsigned int player ) const
 {
+	if ( HasFMODAudio( ) == false )
+		return false;
+
 	if ( player == static_cast<unsigned>( consoleplayer ))
 	{
 		// [AK] The local player isn't transmitting during a microphone test.
@@ -1166,7 +1222,7 @@ bool VOIPController::IsRecording( void ) const
 {
 	bool isRecording = false;
 
-	if (( system != nullptr ) && ( system->isRecording( recordDriverID, &isRecording ) == FMOD_OK ))
+	if ( HasFMODAudio( ) && ( system->isRecording( recordDriverID, &isRecording ) == FMOD_OK ))
 		return isRecording;
 
 	return false;
@@ -1182,7 +1238,7 @@ bool VOIPController::IsRecording( void ) const
 
 float VOIPController::GetChannelVolume( const unsigned int player ) const
 {
-	return ( player < MAXPLAYERS ? channelVolumes[player] : 0.0f );
+	return ( HasFMODAudio( ) && ( player < MAXPLAYERS )) ? channelVolumes[player] : 0.0f;
 }
 
 //*****************************************************************************
@@ -1195,7 +1251,7 @@ float VOIPController::GetChannelVolume( const unsigned int player ) const
 
 void VOIPController::SetChannelVolume( const unsigned int player, float volume, const bool updateServer )
 {
-	if (( isInitialized == false ) || ( player >= MAXPLAYERS ))
+	if (( HasFMODAudio( ) == false ) || ( player >= MAXPLAYERS ))
 		return;
 
 	const float oldVolume = channelVolumes[player];
@@ -1224,7 +1280,7 @@ void VOIPController::SetChannelVolume( const unsigned int player, float volume, 
 
 void VOIPController::SetVolume( float volume )
 {
-	if ( isInitialized == false )
+	if ( HasFMODAudio( ) == false )
 		return;
 
 	if ( VoIPChannelGroup == nullptr )
@@ -1249,7 +1305,7 @@ void VOIPController::SetVolume( float volume )
 
 void VOIPController::SetPitch( float pitch )
 {
-	if ( isInitialized == false )
+	if ( HasFMODAudio( ) == false )
 		return;
 
 	float oldPitch = 1.0f;
@@ -1299,6 +1355,9 @@ void VOIPController::SetPitch( float pitch )
 
 void VOIPController::SetMicrophoneTest( const bool enable )
 {
+	if ( HasFMODAudio( ) == false )
+		return;
+
 	if ( isTesting == enable )
 		return;
 
@@ -1357,8 +1416,11 @@ void VOIPController::RetrieveRecordDrivers( TArray<FString> &list ) const
 
 	list.Clear( );
 
+	if ( HasFMODAudio( ) == false )
+		return;
+
 	// [AK] Don't retrieve any record drivers while using ALSA.
-	if (( system != nullptr ) && ( system->getRecordNumDrivers( &numDrivers ) == FMOD_OK ) && ( IsUsingALSA( ) == false ))
+	if (( system->getRecordNumDrivers( &numDrivers ) == FMOD_OK ) && ( IsUsingALSA( ) == false ))
 	{
 		for ( int i = 0; i < numDrivers; i++ )
 		{
@@ -1380,6 +1442,9 @@ void VOIPController::RetrieveRecordDrivers( TArray<FString> &list ) const
 FString VOIPController::GrabStats( void ) const
 {
 	FString out;
+
+	if ( HasFMODAudio( ) == false )
+		return out;
 
 	out.Format( "VoIP controller status: %s", transmissionType != TRANSMISSIONTYPE_OFF ? "transmitting" : ( isActive ? "activated" : "deactivated" ));
 
@@ -1426,6 +1491,9 @@ FString VOIPController::GrabStats( void ) const
 
 void VOIPController::ReceiveAudioPacket( const unsigned int player, const unsigned int frame, const unsigned char *data, const unsigned int length )
 {
+	if ( HasFMODAudio( ) == false )
+		return;
+
 	// [AK] If this is the local player, then they're testing their microphone.
 	if (( isActive == false ) && ( player != static_cast<unsigned>( consoleplayer )))
 		return;
@@ -1437,7 +1505,17 @@ void VOIPController::ReceiveAudioPacket( const unsigned int player, const unsign
 
 	// [AK] If this player's channel doesn't exist yet, create a new one.
 	if ( VoIPChannels[player] == nullptr )
-		VoIPChannels[player] = new VOIPChannel( player );
+	{
+		VOIPChannel *newChannel = new VOIPChannel( player );
+
+		if ( newChannel->IsValid( ) == false )
+		{
+			delete newChannel;
+			return;
+		}
+
+		VoIPChannels[player] = newChannel;
+	}
 
 	// [AK] Don't accept any frames that arrived too late.
 	if ( frame < VoIPChannels[player]->lastFrameRead )
@@ -1499,6 +1577,9 @@ void VOIPController::ReceiveAudioPacket( const unsigned int player, const unsign
 
 void VOIPController::UpdateProximityChat( void )
 {
+	if ( HasFMODAudio( ) == false )
+		return;
+
 	for ( unsigned int i = 0; i < MAXPLAYERS; i++ )
 	{
 		if (( playeringame[i] == false ) || ( VoIPChannels[i] == nullptr ) || ( VoIPChannels[i]->channel == nullptr ))
@@ -1542,14 +1623,14 @@ void VOIPController::UpdateRolloffDistances( void )
 
 void VOIPController::RemoveVoIPChannel( const unsigned int player )
 {
-	if (( player < MAXPLAYERS ) && ( VoIPChannels[player] != nullptr ))
-	{
-		delete VoIPChannels[player];
-		VoIPChannels[player] = nullptr;
+	if (( HasFMODAudio( ) == false ) || ( player >= MAXPLAYERS ) || ( VoIPChannels[player] == nullptr ))
+		return;
 
-		// [AK] Set their "talking" status to false.
-		PLAYER_SetStatus( &players[player], PLAYERSTATUS_TALKING, false );
-	}
+	delete VoIPChannels[player];
+	VoIPChannels[player] = nullptr;
+
+	// [AK] Set their "talking" status to false.
+	PLAYER_SetStatus( &players[player], PLAYERSTATUS_TALKING, false );
 }
 
 //*****************************************************************************
@@ -1594,7 +1675,7 @@ bool VOIPController::IsUsingALSA( void ) const
 {
 	FMOD_OUTPUTTYPE outputType = FMOD_OUTPUTTYPE_UNKNOWN;
 
-	if (( system != nullptr ) && ( system->getOutput( &outputType ) == FMOD_OK ) && ( outputType == FMOD_OUTPUTTYPE_ALSA ))
+	if ( HasFMODAudio( ) && ( system->getOutput( &outputType ) == FMOD_OK ) && ( outputType == FMOD_OUTPUTTYPE_ALSA ))
 		return true;
 
 	return false;
@@ -1661,6 +1742,9 @@ FMOD_CREATESOUNDEXINFO VOIPController::CreateSoundExInfo( const unsigned int sam
 
 FMOD_RESULT F_CALLBACK VOIPController::ChannelCallback( FMOD_CHANNEL *channel, FMOD_CHANNEL_CALLBACKTYPE type, void *commanddata1, void *commanddata2 )
 {
+	if ( GetInstance( ).HasFMODAudio( ) == false )
+		return FMOD_OK;
+
 	if ( type == FMOD_CHANNEL_CALLBACKTYPE_END )
 	{
 		FMOD::Channel *castedChannel = reinterpret_cast<FMOD::Channel *>( channel );
@@ -1724,6 +1808,11 @@ VOIPController::VOIPChannel::VOIPChannel( const unsigned int player ) :
 	dspEpochLo( 0 ),
 	endDelaySamples( 0 )
 {
+	VOIPController &controller = VOIPController::GetInstance( );
+
+	if ( controller.HasFMODAudio( ) == false )
+		return;
+
 	int opusErrorCode = OPUS_OK;
 	decoder = opus_decoder_create( PLAYBACK_SAMPLE_RATE, 1, &opusErrorCode );
 
@@ -1734,10 +1823,7 @@ VOIPController::VOIPChannel::VOIPChannel( const unsigned int player ) :
 	FMOD_CREATESOUNDEXINFO exinfo = CreateSoundExInfo( PLAYBACK_SAMPLE_RATE, PLAYBACK_SOUND_LENGTH );
 	FMOD_MODE mode = FMOD_3D | FMOD_OPENUSER | FMOD_LOOP_NORMAL | FMOD_SOFTWARE;
 
-	if ( VOIPController::GetInstance( ).system == nullptr )
-		Printf( TEXTCOLOR_ORANGE "Failed to create sound for VoIP channel %u: no valid FMOD system.\n", player );
-
-	const FMOD_RESULT fmodErrorCode = VOIPController::GetInstance( ).system->createSound( nullptr, mode, &exinfo, &sound );
+	const FMOD_RESULT fmodErrorCode = controller.system->createSound( nullptr, mode, &exinfo, &sound );
 
 	if ( fmodErrorCode != FMOD_OK )
 		Printf( TEXTCOLOR_ORANGE "Failed to create sound for VoIP channel %u: %s\n", player, FMOD_ErrorString( fmodErrorCode ));
@@ -1753,17 +1839,19 @@ VOIPController::VOIPChannel::VOIPChannel( const unsigned int player ) :
 
 VOIPController::VOIPChannel::~VOIPChannel( void )
 {
-	if ( channel != nullptr )
+	if (( channel != nullptr ) && VOIPController::GetInstance( ).HasFMODAudio( ))
 	{
 		channel->stop( );
-		channel = nullptr;
 	}
 
-	if ( sound != nullptr )
+	this->channel = nullptr;
+
+	if (( sound != nullptr ) && VOIPController::GetInstance( ).HasFMODAudio( ))
 	{
 		sound->release( );
-		sound = nullptr;
 	}
+
+	this->sound = nullptr;
 
 	if ( decoder != nullptr )
 	{
@@ -1773,6 +1861,11 @@ VOIPController::VOIPChannel::~VOIPChannel( void )
 
 	// [AK] Reset this channel's volume back to default.
 	VOIPController::GetInstance( ).channelVolumes[player] = 1.0f;
+}
+
+bool VOIPController::VOIPChannel::IsValid( void ) const
+{
+	return ( sound != nullptr ) && ( decoder != nullptr );
 }
 
 //*****************************************************************************
@@ -1787,6 +1880,9 @@ VOIPController::VOIPChannel::~VOIPChannel( void )
 
 bool VOIPController::VOIPChannel::ShouldPlayIn3DMode( void ) const
 {
+	if ( VOIPController::GetInstance( ).HasFMODAudio( ) == false )
+		return false;
+
 	if (( sv_proximityvoicechat == false ) || ( gamestate != GS_LEVEL ) || ( PLAYER_IsValidPlayer( player ) == false ))
 		return false;
 
@@ -1848,10 +1944,15 @@ int VOIPController::VOIPChannel::DecodeOpusFrame( const unsigned char *inBuffer,
 
 void VOIPController::VOIPChannel::StartPlaying( void )
 {
-	if ( channel != nullptr )
+	VOIPController &controller = VOIPController::GetInstance( );
+
+	if (( controller.HasFMODAudio( ) == false ) || ( channel != nullptr ) || ( sound == nullptr ))
 		return;
 
-	const FMOD_RESULT fmodErrorCode = VOIPController::GetInstance( ).system->playSound( FMOD_CHANNEL_FREE, sound, true, &channel );
+	if (( player != static_cast<unsigned>( consoleplayer )) && ( controller.VoIPChannelGroup == nullptr ))
+		return;
+
+	const FMOD_RESULT fmodErrorCode = controller.system->playSound( FMOD_CHANNEL_FREE, sound, true, &channel );
 
 	if ( fmodErrorCode != FMOD_OK )
 	{
@@ -1859,7 +1960,7 @@ void VOIPController::VOIPChannel::StartPlaying( void )
 		return;
 	}
 
-	channel->setUserData( &VOIPController::GetInstance( ).proximityInfo );
+	channel->setUserData( &controller.proximityInfo );
 	channel->setCallback( VOIPController::ChannelCallback );
 
 	// [AK] Give the VoIP channels more priority than other sounds.
@@ -1881,8 +1982,8 @@ void VOIPController::VOIPChannel::StartPlaying( void )
 	}
 	else
 	{
-		channel->setChannelGroup( VOIPController::GetInstance( ).VoIPChannelGroup );
-		channel->setVolume( VOIPController::GetInstance( ).channelVolumes[player] );
+		channel->setChannelGroup( controller.VoIPChannelGroup );
+		channel->setVolume( controller.channelVolumes[player] );
 	}
 
 	voicechat_ReadSoundBuffer( this, sound, lastReadPosition, MIN( GetUnreadSamples( ), READ_BUFFER_SIZE ), &VOIPChannel::ReadSamples );
@@ -1976,6 +2077,11 @@ void VOIPController::VOIPChannel::ReadSamples( unsigned char *soundBuffer, const
 
 void VOIPController::VOIPChannel::Update3DAttributes( void )
 {
+	VOIPController &controller = VOIPController::GetInstance( );
+
+	if (( controller.HasFMODAudio( ) == false ) || ( channel == nullptr ))
+		return;
+
 	FMOD_VECTOR pos = { 0.0f, 0.0f, 0.0f };
 	FMOD_VECTOR vel = { 0.0f, 0.0f, 0.0f };
 	FMOD_RESULT fmodErrorCode = FMOD_OK;
@@ -1984,13 +2090,13 @@ void VOIPController::VOIPChannel::Update3DAttributes( void )
 	// and velocity to the listener's. This effectively makes them sound "2D".
 	if ( ShouldPlayIn3DMode( ) == false )
 	{
-		if ( VOIPController::GetInstance( ).system == nullptr )
+		if ( controller.system == nullptr )
 		{
 			Printf( TEXTCOLOR_ORANGE "Can't get 3D attributes of the listener without a valid FMOD system.\n" );
 			return;
 		}
 
-		fmodErrorCode = VOIPController::GetInstance( ).system->get3DListenerAttributes( 0, &pos, &vel, nullptr, nullptr );
+		fmodErrorCode = controller.system->get3DListenerAttributes( 0, &pos, &vel, nullptr, nullptr );
 
 		if ( fmodErrorCode != FMOD_OK )
 		{
@@ -2025,6 +2131,9 @@ void VOIPController::VOIPChannel::Update3DAttributes( void )
 
 void VOIPController::VOIPChannel::UpdatePlayback( void )
 {
+	if (( VOIPController::GetInstance( ).HasFMODAudio( ) == false ) || ( channel == nullptr ))
+		return;
+
 	unsigned int playbackPosition = 0;
 
 	// [AK] Check how many new samples have been played since the last call.
@@ -2055,7 +2164,7 @@ void VOIPController::VOIPChannel::UpdatePlayback( void )
 
 void VOIPController::VOIPChannel::UpdateEndDelay( const bool resetEpoch )
 {
-	if (( channel == nullptr ) || ( VOIPController::GetInstance( ).system == nullptr ))
+	if (( channel == nullptr ) || ( VOIPController::GetInstance( ).HasFMODAudio( ) == false ))
 		return;
 
 	// [AK] Resetting the epoch means that we get the current DSP clock time of

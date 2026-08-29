@@ -84,6 +84,138 @@ namespace
 		return Events.size () > index && Events[index].Reason == reason && Events[index].SawAttached && Events[index].SawFinalizing;
 	}
 
+	void ReleaseOwner (FISoundChannel *owner);
+	void StopAndDrain (OpenALSoundRenderer &renderer, FISoundChannel *owner);
+
+	struct StreamFixture
+	{
+		explicit StreamFixture (int buffers) : BuffersRemaining (buffers), CallCount (0), Ready (true) {}
+		StreamFixture (int buffers, bool ready) : BuffersRemaining (buffers), CallCount (0), Ready (ready) {}
+
+		int BuffersRemaining;
+		int CallCount;
+		bool Ready;
+	};
+
+	bool StreamCallback (SoundStream *, void *buffer, int length, void *userData)
+	{
+		StreamFixture *fixture = (StreamFixture *)userData;
+		++fixture->CallCount;
+		if (!fixture->Ready)
+		{
+			return false;
+		}
+		if (fixture->BuffersRemaining-- <= 0)
+		{
+			return false;
+		}
+		memset (buffer, 0, (size_t)length);
+		return true;
+	}
+
+	void DrainStream (OpenALSoundRenderer &renderer, OpenALSoundStream *stream)
+	{
+		for (int attempt = 0; attempt < 150 && !stream->IsEnded (); ++attempt)
+		{
+			std::this_thread::sleep_for (std::chrono::milliseconds (10));
+			renderer.UpdateSounds ();
+		}
+	}
+
+	void TestPrePlayEmptyStream (OpenALSoundRenderer &renderer)
+	{
+		StreamFixture fixture (2, false);
+		OpenALSoundStream *stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (reinterpret_cast<SoundStreamCallback> (StreamCallback), 1600, 1, 8000, &fixture));
+		Check (stream != NULL && fixture.CallCount == 0 && !stream->IsEnded (),
+			"callback stream does not treat pre-Play empty data as EOF");
+		if (stream != NULL)
+		{
+			fixture.Ready = true;
+			Check (stream->Play (false, 1.f), "callback stream starts after caller-side producer readiness");
+			DrainStream (renderer, stream);
+			Check (stream->GetPosition () > 0 && stream->IsEnded () && fixture.CallCount == 3,
+				"post-Play callback data plays and drains after pre-Play empty state");
+			delete stream;
+		}
+	}
+
+	void TestStoppedStreamReplay (OpenALSoundRenderer &renderer)
+	{
+		StreamFixture fixture (8);
+		OpenALSoundStream *stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (reinterpret_cast<SoundStreamCallback> (StreamCallback), 1600, 1, 8000, &fixture));
+		Check (stream != NULL && stream->Play (false, 0.5f), "callback stream starts for explicit stop");
+		if (stream != NULL)
+		{
+			stream->Stop ();
+			Check (!stream->IsEnded () && stream->GetPosition () == 0, "callback stream stop resets playback without ending the stream");
+			Check (stream->Play (false, 0.5f), "callback stream replays after explicit stop");
+			DrainStream (renderer, stream);
+			Check (stream->GetPosition () > 0 && stream->IsEnded (), "replayed callback stream drains normally after explicit stop");
+			delete stream;
+		}
+	}
+
+	void TestStreamPositionConversion (OpenALSoundRenderer &renderer)
+	{
+		StreamFixture fixture (1);
+		OpenALSoundStream *stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (reinterpret_cast<SoundStreamCallback> (StreamCallback), 1600, 1, 48000, &fixture));
+		if (stream != NULL)
+		{
+			stream->SetProcessedFramesForTest (48ull * 60 * 5 * 1000);
+			Check (stream->GetPosition () == 300000, "48 kHz stream position reports several minutes without false saturation");
+			stream->SetProcessedFramesForTest (std::numeric_limits<unsigned long long>::max ());
+			Check (stream->GetPosition () == std::numeric_limits<unsigned int>::max (), "stream position safely saturates true millisecond overflow");
+			delete stream;
+		}
+	}
+
+	void TestStreams (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		StreamFixture fixture (5);
+		OpenALSoundStream *stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (reinterpret_cast<SoundStreamCallback> (StreamCallback), 1600, 1, 8000, &fixture));
+		Check (stream != NULL && stream->Source != 0 && stream->Buffers[0] != 0 && stream->Buffers[1] != 0 &&
+			stream->Buffers[2] != 0 && stream->Buffers[3] != 0 && renderer.ActiveStreams.size () == 1,
+			"callback stream owns a dedicated source and four buffers");
+		Check (stream != NULL && stream->Source != renderer.Sources[0], "callback stream does not borrow the SFX source pool");
+		FISoundChannel *sfx = renderer.StartSound (sound, 0.5f, 128, 80, SNDF_LOOP, NULL);
+		Check (sfx != NULL && sfx->SysChannel != NULL, "SFX allocation does not evict the callback stream");
+		renderer.SetMusicVolume (0.5f);
+		Check (stream != NULL && stream->Play (false, 0.8f), "callback stream begins playback from queued PCM");
+		if (stream != NULL)
+		{
+			ALfloat gain = 0.f;
+			alGetSourcef (stream->Source, AL_GAIN, &gain);
+			Check (NearlyEqual (gain, 0.4f), "callback stream gain combines stream and global music volume");
+			stream->SetPaused (true);
+			ALint state = AL_STOPPED;
+			alGetSourcei (stream->Source, AL_SOURCE_STATE, &state);
+			Check (state == AL_PAUSED, "callback stream pauses its dedicated source");
+			stream->SetPaused (false);
+			renderer.SetInactive (INACTIVE_Mute);
+			alGetSourcef (stream->Source, AL_GAIN, &gain);
+			Check (NearlyEqual (gain, 0.f), "inactive mute suppresses callback stream gain");
+			renderer.SetInactive (INACTIVE_Complete);
+			alGetSourcei (stream->Source, AL_SOURCE_STATE, &state);
+			Check (state == AL_PAUSED, "complete inactive pauses callback stream");
+			renderer.SetInactive (INACTIVE_Active);
+			DrainStream (renderer, stream);
+			Check (stream->GetPosition () > 0 && stream->IsEnded () && fixture.CallCount > 4,
+				"callback stream refills processed buffers then drains EOF before ending");
+			unsigned int streamSource = stream->Source;
+			unsigned int streamBuffer = stream->Buffers[0];
+			delete stream;
+			Check (!alIsSource (streamSource) && !alIsBuffer (streamBuffer) && renderer.ActiveStreams.empty (),
+				"ended callback stream releases dedicated OpenAL resources on destruction");
+		}
+		StopAndDrain (renderer, sfx);
+		ReleaseOwner (sfx);
+		renderer.SetMusicVolume (1.f);
+		TestPrePlayEmptyStream (renderer);
+		TestStoppedStreamReplay (renderer);
+		TestStreamPositionConversion (renderer);
+		Check (renderer.OpenStream ("unsupported.ogg", 0, 0, 0) == NULL, "encoded stream opening is rejected safely");
+	}
+
 	void ReleaseOwner (FISoundChannel *owner)
 	{
 		delete owner;
@@ -874,6 +1006,7 @@ int main ()
 	TestLongClockRestartBounds (renderer);
 	TestRestartConversionBounds (renderer);
 	TestClockWrap (renderer);
+	TestStreams (renderer, longSound);
 	TestCrossRendererResetHandoff ();
 
 	renderer.UnloadSound (longSound);
