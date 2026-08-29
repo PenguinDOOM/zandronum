@@ -54,8 +54,10 @@ cppcheck `
     --project="$($solution.FullName)" `
     "--project-configuration=Release|x64" `
     "--enable=warning,performance,portability" `
-    --error-exitcode=1 `
     --cppcheck-build-dir=".cppcheck-cache" `
     --template=vs
 
-exit $LASTEXITCODE
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Cppcheck failed to execute correctly."
+    exit $LASTEXITCODE
+}
