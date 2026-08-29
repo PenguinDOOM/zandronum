@@ -1152,7 +1152,7 @@ static FSoundChan *S_StartSound(AActor *actor, const sector_t *sec, const FPolyO
 		}
 		else
 		{
-			chan = (FSoundChan*)GSnd->StartSound (sfx->data, volume, pitch, startflags, NULL);
+			chan = static_cast<FSoundChan *> (GSnd->StartSound (sfx->data, volume, pitch, basepriority, startflags, NULL));
 		}
 	}
 	if (chan == NULL && (chanflags & CHAN_LOOP))
@@ -1252,7 +1252,7 @@ void S_RestartSound(FSoundChan *chan)
 	else
 	{
 		chan->ChanFlags &= ~(CHAN_EVICTED|CHAN_ABSTIME);
-		ochan = (FSoundChan*)GSnd->StartSound(sfx->data, chan->Volume, chan->Pitch, startflags, chan);
+		ochan = static_cast<FSoundChan *> (GSnd->StartSound(sfx->data, chan->Volume, chan->Pitch, chan->Priority, startflags, chan));
 	}
 	assert(ochan == NULL || ochan == chan);
 	if (ochan == NULL)

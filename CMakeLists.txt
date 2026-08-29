@@ -8,6 +8,7 @@ endif( COMMAND cmake_policy )
 
 list( APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR} )
 include( FindPackageHandleStandardArgs )
+include( CTest )
 
 # Generator expression are available some time in CMake 2.8. Due to
 # cmake_minimum_required, we can assume a minor version of > 7 implies major >= 2
@@ -254,6 +255,10 @@ add_subdirectory( wadsrc_bm )
 # [BB] Compatibility wad to support Skulltag mods.
 add_subdirectory( wadsrc_st )
 add_subdirectory( src )
+
+if( NOT NO_SOUND )
+	target_sources( zdoom PRIVATE ${CMAKE_SOURCE_DIR}/src/sound/oaldata.cpp )
+endif( NOT NO_SOUND )
 
 # [AK] Library for noise suppression for VoIP.
 if ( NOT NO_SOUND )

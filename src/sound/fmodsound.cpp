@@ -1708,12 +1708,13 @@ SoundStream *FMODSoundRenderer::OpenStream(const char *filename_or_data, int fla
 //
 //==========================================================================
 
-FISoundChannel *FMODSoundRenderer::StartSound(SoundHandle sfx, float vol, int pitch, int flags, FISoundChannel *reuse_chan)
+FISoundChannel *FMODSoundRenderer::StartSound(SoundHandle sfx, float vol, int pitch, int priority, int flags, FISoundChannel *reuse_chan)
 {
 	FMOD_RESULT result;
 	FMOD_MODE mode;
 	FMOD::Channel *chan;
 	float freq;
+	(void)priority;
 
 	if (FMOD_OK == ((FMOD::Sound *)sfx.data)->getDefaults(&freq, NULL, NULL, NULL))
 	{

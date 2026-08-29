@@ -104,7 +104,7 @@ public:
 	virtual SoundStream *OpenStream (const char *filename, int flags, int offset, int length) = 0;
 
 	// Starts a sound.
-	virtual FISoundChannel *StartSound (SoundHandle sfx, float vol, int pitch, int chanflags, FISoundChannel *reuse_chan) = 0;
+	virtual FISoundChannel *StartSound (SoundHandle sfx, float vol, int pitch, int priority, int chanflags, FISoundChannel *reuse_chan) = 0;
 	virtual FISoundChannel *StartSound3D (SoundHandle sfx, SoundListener *listener, float vol, FRolloffInfo *rolloff, float distscale, int pitch, int priority, const FVector3 &pos, const FVector3 &vel, int channum, int chanflags, FISoundChannel *reuse_chan) = 0;
 
 	// Stops a sound channel.

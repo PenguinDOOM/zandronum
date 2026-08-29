@@ -28,7 +28,7 @@ public:
 	void StopStream (SoundStream *stream);
 
 	// Starts a sound.
-	FISoundChannel *StartSound (SoundHandle sfx, float vol, int pitch, int chanflags, FISoundChannel *reuse_chan);
+	FISoundChannel *StartSound (SoundHandle sfx, float vol, int pitch, int priority, int chanflags, FISoundChannel *reuse_chan);
 	FISoundChannel *StartSound3D (SoundHandle sfx, SoundListener *listener, float vol, FRolloffInfo *rolloff, float distscale, int pitch, int priority, const FVector3 &pos, const FVector3 &vel, int channum, int chanflags, FISoundChannel *reuse_chan);
 
 	// Stops a sound channel.
