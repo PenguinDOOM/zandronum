@@ -1894,6 +1894,10 @@ test &lt;= $screenblocks 10 "echo the view window is shrunk" "echo the view wind
 				<div class="v" id="snd_3d">snd_3d</div>
 				<div class="t">boolean: false</div>
 				<div class="d">Setting this cvar to true will enable the use of 3D sound hardware.</div>
+				<div class="v" id="snd_backend">snd_backend</div>
+				<div class="t">string: "fmod"</div>
+				<div class="d">Selects the sound backend. The accepted values are "fmod" and "openal", without regard to case. "fmod" is the default and uses the existing FMOD backend. "openal" selects the native OpenAL Soft backend. An unknown value produces a warning and uses FMOD. If OpenAL cannot initialize, the failure is reported and FMOD is used instead. Run <a href="#snd_reset">snd_reset</a> after changing this cvar.
+					With OpenAL, software-generated PCM music streams remain supported through <code>CreateStream</code>, including the OPL, GME, DUMB, FluidSynth, and Timidity producers. The OpenAL <code>OpenStream</code> path used for encoded music, MIDI-file playback, and file or URL stream paths is unavailable, and VoIP is unavailable. FMOD retains its existing encoded-music and VoIP behavior. OpenAL area sounds within 32 map units use a centered panning approximation; farther area sounds use normal positional panning while attenuation still uses the true distance.</div>
 				<div class="v" id="snd_buffersize">snd_buffersize</div>
 				<div class="t">integer: 0</div>
 				<div class="d">This is the length of the sound buffer in milliseconds. Leaving this 
@@ -1928,8 +1932,9 @@ test &lt;= $screenblocks 10 "echo the view window is shrunk" "echo the view wind
 					notice a difference.
 				</div>
 				<div class="c" id="snd_listdrivers">snd_listdrivers</div>
-				<div class="b">Lists the drivers supported by the current <a href="#snd_output">snd_output</a>
-					setting.</div>
+				<div class="b">Lists the drivers or playback devices available to the current backend. With FMOD,
+					this lists drivers for the current <a href="#snd_output">snd_output</a> setting. With OpenAL,
+					this lists enumerated OpenAL playback devices when device enumeration is available.</div>
 				<div class="v" id="snd_matrix">snd_matrix</div>
 				<div class="t">boolean: false</div>
 				<div class="d">Setting this to true enables simple software support for the rear 
@@ -1944,12 +1949,18 @@ test &lt;= $screenblocks 10 "echo the view window is shrunk" "echo the view wind
 				<div class="d">This is the volume digital music is played at and can range from 0 
 					to 1. Digital music includes MODs, OGGs, MP3s, and SPCs.
 				</div>
+				<div class="v" id="snd_openal_device">snd_openal_device</div>
+				<div class="t">string: "default"</div>
+				<div class="d">Selects the OpenAL playback device when <a href="#snd_backend">snd_backend</a> is "openal". "default" uses the system default OpenAL device. Any other value must exactly match an enumerated OpenAL device name; use <a href="#snd_listdrivers">snd_listdrivers</a> to list device names when enumeration is available. If a named device is not found or cannot be opened, the failure is reported and FMOD is used instead of silently selecting another OpenAL device. Run <a href="#snd_reset">snd_reset</a> after changing this cvar. This cvar has no effect when FMOD is selected.</div>
 				<div class="v" id="snd_output">snd_output</div>
 				<div class="t">string: "default"</div>
-				<div class="d">Selects either DirectSound or WaveOut for sound playback. "Default" 
-					selects WaveOut under NT 4 and DirectSound under all other operating systems. 
-					"DSound" or "DirectSound" will force the use of DirectSound, and "WinMM" or 
-					"WaveOut" will force the use of WaveOut.</div>
+				<div class="d">FMOD-only setting that selects the FMOD output API when <a href="#snd_backend">snd_backend</a>
+					is "fmod". "Auto" and "Default" select FMOD autodetection. Other names depend on the
+					FMOD version and platform; supported names include "No sound", "DirectSound" or "DSound",
+					"Windows Multimedia", "WinMM" or "WaveOut", and platform-specific outputs such as
+					"WASAPI", "ASIO", "OSS", "ALSA", "ESD", "PulseAudio", "Pulse", "SDL", "Sound Manager",
+					and "Core Audio". Older FMOD builds may also provide "OpenAL". With OpenAL selected,
+					this setting is ignored; use <a href="#snd_openal_device">snd_openal_device</a> to choose a device.</div>
 				<div class="v" id="snd_pitched">snd_pitched</div>
 				<div class="t">boolean: false for Doom, true for other games</div>
 				<div class="d">When set to true, the random pitch effect found in early versions of 
@@ -1958,8 +1969,9 @@ test &lt;= $screenblocks 10 "echo the view window is shrunk" "echo the view wind
 					defaults to true because all versions of those games use pitch shifting.
 				</div>
 				<div class="c" id="snd_reset">snd_reset</div>
-				<div class="b">Activates any changes that have been made to <a href="#snd_3d">snd_3d</a>,
-					<a href="#snd_output">snd_output</a>, <a href="#snd_samplerate">snd_samplerate</a>, 
+				<div class="b">Reinitializes sound and activates changes that have been made to <a href="#snd_backend">snd_backend</a>,
+					<a href="#snd_openal_device">snd_openal_device</a>, <a href="#snd_3d">snd_3d</a>,
+					<a href="#snd_output">snd_output</a>, <a href="#snd_samplerate">snd_samplerate</a>,
 					or <a href="#snd_driver">snd_driver</a>.</div>
 				<div class="v" id="snd_samplerate">snd_samplerate</div>
 				<div class="t">integer: 44100</div>
@@ -1975,7 +1987,10 @@ test &lt;= $screenblocks 10 "echo the view window is shrunk" "echo the view wind
 					from 0 to 1. This does not set the volume for your sound card's wave playback.
 				</div>
 				<div class="c" id="snd_status">snd_status</div>
-				<div class="b">Lists information about the current sound device.</div>
+				<div class="b">Lists backend-specific sound status. FMOD reports its version, output type, speaker mode,
+					driver, software mixer, and DSP buffer details. OpenAL reports the OpenAL Soft device, vendor,
+					renderer, version, output sample rate when available, the required loop-points extension, and
+					allocated, requested, free, and active SFX sources.</div>
 				<div class="v" id="snd_surround">snd_surround</div>
 				<div class="t">boolean: true</div>
 				<div class="d">When true, selected sounds will be played on the surround channel. 

@@ -2,6 +2,9 @@ stages:
   - build
   - deploy
 
+variables:
+  OPENAL_COMMIT: b2c48f7718ef3fcf67921a8b6534c4914e328970
+
 # For Linux, we use custom Docker images that have our dependencies pre-installed.
 # This saves some time when building.
 
@@ -11,35 +14,154 @@ stages:
   script:
     - mkdir -p build && cd build
     - |
+      set -euo pipefail
       if [[ "$SERVERONLY" != "ON" ]]; then
-        dpkg-query -W -f='OpenAL Soft package: ${Package} ${Version}\n' libopenal-dev;
+        dpkg-query -W -f='OpenAL Soft package: ${Package} ${Version}\n' libopenal1;
         test -f /usr/include/AL/al.h;
         OPENAL_LIBRARY="$(dpkg -L libopenal-dev | grep '/libopenal\.so$' | head -n 1)";
         test -n "$OPENAL_LIBRARY";
+        OPENAL_RUNTIME_SOURCE="$(dpkg -L libopenal1 | grep -E '/libopenal\.so\.[0-9]+(\.[0-9]+)*$' | grep -v '/debug/' | head -n 1)";
+        OPENAL_COPYRIGHT="$(dpkg -L libopenal1 | grep '/usr/share/doc/libopenal1/copyright$' | head -n 1)";
+        test -n "$OPENAL_RUNTIME_SOURCE" && test -f "$OPENAL_RUNTIME_SOURCE";
+        test -n "$OPENAL_COPYRIGHT" && test -f "$OPENAL_COPYRIGHT";
+        OPENAL_RUNTIME_NAME='libopenal.so.1';
+        OPENAL_PACKAGE_VERSION="$(dpkg-query -W -f='${Version}' libopenal1)";
+        OPENAL_ARCH="$(dpkg --print-architecture)";
       fi
-    - cmake
+    - |
+      cmake_args=(
         -GNinja
         -DCMAKE_BUILD_TYPE=Release
         -DRELEASE_WITH_DEBUG_FILE=ON
         -DSERVERONLY=${SERVERONLY}
         -DFMOD_LIBRARY=${FMOD_DIR_PATH}/api/lib/libfmodex64-${FMOD_SO_VERSION}.so
         -DFMOD_INCLUDE_DIR=${FMOD_DIR_PATH}/api/inc
-        -DOPENAL_INCLUDE_DIR=/usr/include
-        -DOPENAL_LIBRARY=${OPENAL_LIBRARY}
-        ..
-    - ninja
-    - if [[ "$SERVERONLY" != "ON" ]]; then
-        cp ${FMOD_DIR_PATH}/api/lib/libfmodex64-${FMOD_SO_VERSION}.so .;
+      )
+      if [[ "$SERVERONLY" != "ON" ]]; then
+        cmake_args+=(
+          -DOPENAL_INCLUDE_DIR=/usr/include
+          -DOPENAL_LIBRARY="$OPENAL_LIBRARY"
+        )
       fi
+      cmake "${cmake_args[@]}" ..
+    - ninja
     # liboutput_sdl is a symlink, we need the actual file
     - if [ -L liboutput_sdl.so ]; then
         cp --remove-destination "$(readlink liboutput_sdl.so)" liboutput_sdl.so ;
       fi
+    - |
+      set -euo pipefail
+      sound_enabled=false
+      if [[ "$SERVERONLY" != "ON" ]]; then
+      sound_enabled=true
+      FMOD_RUNTIME_NAME="$(basename "${FMOD_DIR_PATH}/api/lib/libfmodex64-${FMOD_SO_VERSION}.so")"
+      cp "${FMOD_DIR_PATH}/api/lib/${FMOD_RUNTIME_NAME}" "${FMOD_RUNTIME_NAME}"
+      cp --dereference "$OPENAL_RUNTIME_SOURCE" "$OPENAL_RUNTIME_NAME"
+      cp --dereference "$OPENAL_COPYRIGHT" OpenAL-Soft-COPYING.txt
+      printf '%s\n' \
+        'OpenAL Soft source location' \
+        'Repository: https://github.com/kcat/openal-soft' \
+        "Distribution package: libopenal1 $OPENAL_PACKAGE_VERSION ($OPENAL_ARCH)" \
+        'License: LGPL-2.0-or-later (see OpenAL-Soft-COPYING.txt)' \
+        > OpenAL-Soft-SOURCE.txt
+      mapfile -t sound_executables < <(find . -maxdepth 1 -type f -name 'zandronum*' -perm /111 -printf '%f\n' | sort)
+      for executable in "${sound_executables[@]}"; do
+        resolved_openal="$(LD_LIBRARY_PATH="$PWD" ldd "./$executable" | awk '$1 == "libopenal.so.1" { print $3; exit }')"
+        test -n "$resolved_openal"
+        test "$(readlink -f "$resolved_openal")" = "$(readlink -f "$PWD/$OPENAL_RUNTIME_NAME")"
+      done
+      fi
+
+      PACKAGE_ROOT="$PWD" \
+      SOUND_ENABLED="$sound_enabled" \
+      EXPECTED_FMOD="${FMOD_RUNTIME_NAME-}" \
+      EXPECTED_OPENAL="${OPENAL_RUNTIME_NAME-}" \
+      VCS_COMMIT="$CI_COMMIT_SHA" \
+      CI_RUN="$CI_PIPELINE_ID" \
+      CI_JOB="$CI_JOB_ID" \
+      CI_ARCH="$(dpkg --print-architecture)" \
+      OPENAL_PACKAGE_VERSION="${OPENAL_PACKAGE_VERSION-}" \
+      python3 - <<'PY'
+      import hashlib
+      import json
+      import os
+      from pathlib import Path
+
+      root = Path(os.environ['PACKAGE_ROOT']).resolve()
+      sound_enabled = os.environ['SOUND_ENABLED'] == 'true'
+
+      def matching(pattern):
+        return sorted(path for path in root.glob(pattern) if path.is_file())
+
+      def record(path):
+        relative = path.relative_to(root).as_posix()
+        if Path(relative).is_absolute() or '..' in Path(relative).parts:
+          raise RuntimeError(f'non-relative manifest path: {relative}')
+        return {'path': relative, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+
+      executables = [path for path in matching('zandronum*') if os.access(path, os.X_OK)]
+      pk3s = matching('*.pk3')
+      fmod = matching('libfmodex*.so*')
+      openal = matching('libopenal.so*')
+      licenses = matching('OpenAL-Soft-*.txt')
+      if not executables or not pk3s:
+        raise RuntimeError('the package must contain executable and PK3 inputs')
+      metadata = (
+        os.environ['VCS_COMMIT'],
+        os.environ['CI_RUN'],
+        os.environ['CI_JOB'],
+        os.environ['CI_ARCH'],
+      )
+      if any(not value.strip() for value in metadata):
+        raise RuntimeError('the package provenance metadata is incomplete')
+      if sound_enabled:
+        if not os.environ['OPENAL_PACKAGE_VERSION'].strip():
+          raise RuntimeError('the package OpenAL version is missing')
+        if [path.name for path in fmod] != [os.environ['EXPECTED_FMOD']]:
+          raise RuntimeError('the package FMOD runtime set is missing or substituted')
+        if [path.name for path in openal] != [os.environ['EXPECTED_OPENAL']]:
+          raise RuntimeError('the package OpenAL runtime set is missing or substituted')
+        if [path.name for path in licenses] != ['OpenAL-Soft-COPYING.txt', 'OpenAL-Soft-SOURCE.txt']:
+          raise RuntimeError('the package OpenAL license/notice set is missing or has extras')
+      elif fmod or openal or licenses:
+        raise RuntimeError('server-only package unexpectedly contains sound runtime inputs')
+
+      manifest = {
+        'schema': 'phase1a-runtime-manifest',
+        'schema_version': 1,
+        'vcs': {'commit': os.environ['VCS_COMMIT']},
+        'ci': {
+          'provider': 'gitlab',
+          'run': os.environ['CI_RUN'],
+          'job': os.environ['CI_JOB'],
+        },
+        'platform': {'os': 'linux', 'arch': os.environ['CI_ARCH']},
+        'sound_enabled': sound_enabled,
+        'openal': {
+          'source_commit': None,
+          'resolved_package_version': os.environ['OPENAL_PACKAGE_VERSION'] or None,
+        },
+        'files': {
+          'executables': [record(path) for path in executables],
+          'fmod_runtime': [record(path) for path in fmod],
+          'openal_runtime': [record(path) for path in openal],
+          'pk3s': [record(path) for path in pk3s],
+          'license_notice': [record(path) for path in licenses],
+        },
+      }
+      (root / 'phase1a-runtime-manifest.json').write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8'
+      )
+      PY
   artifacts:
     paths:
       - build/zandronum*
       - build/*.pk3
       - build/*.so
+      - build/*.so.*
+      - build/OpenAL-Soft-COPYING.txt
+      - build/OpenAL-Soft-SOURCE.txt
+      - build/phase1a-runtime-manifest.json
 
 build_linux:
   <<: *linux
@@ -63,10 +185,15 @@ appimage:
   stage: deploy
   image: registry.heptapod.net/zandronum/ci-images/zandronum-build-ubuntu:latest
   script:
-    - mkdir -p AppDir/usr/bin AppDir/usr/lib
+    - set -euo pipefail
+    - mkdir -p AppDir/usr/bin AppDir/usr/lib AppDir/usr/share/licenses/zandronum
     - cp build/zandronum* AppDir/usr/bin
     - cp build/*.pk3 AppDir/usr/bin
     - cp build/liboutput_sdl.so AppDir/usr/bin
+    - cp build/libfmodex*.so AppDir/usr/lib
+    - cp build/OpenAL-Soft-COPYING.txt AppDir/usr/share/licenses/zandronum
+    - cp build/OpenAL-Soft-SOURCE.txt AppDir/usr/share/licenses/zandronum
+    - test -f build/libopenal.so.1
     - cp appimage/AppRun AppDir
     - cp appimage/zandronum.desktop AppDir
     - cp appimage/zandronum.png AppDir
@@ -76,7 +203,159 @@ appimage:
     # and so linuxdeploy can't find it automatically
     - linuxdeploy --appimage-extract-and-run
       -l/usr/lib/x86_64-linux-gnu/libSDL2.so
+      --appdir AppDir -v0
+    - |
+      set -euo pipefail
+      mapfile -t bundled_openal < <(find AppDir -type f -name 'libopenal.so*' | sort)
+      if ((${#bundled_openal[@]} == 0)); then
+      mapfile -t openal_inputs < <(find build -maxdepth 1 -type f -name 'libopenal.so.*' | sort)
+      ((${#openal_inputs[@]} == 1))
+      linuxdeploy --appimage-extract-and-run
+        -l"${openal_inputs[0]}"
+        --appdir AppDir -v0
+      mapfile -t bundled_openal < <(find AppDir -type f -name 'libopenal.so*' | sort)
+      fi
+      ((${#bundled_openal[@]} == 1))
+      test -f build/libopenal.so.1
+      test "$(sha256sum "${bundled_openal[0]}" | awk '{print $1}')" = "$(sha256sum build/libopenal.so.1 | awk '{print $1}')"
+
+      APPDIR="$PWD/AppDir" \
+      VCS_COMMIT="$CI_COMMIT_SHA" \
+      CI_RUN="$CI_PIPELINE_ID" \
+      CI_JOB="$CI_JOB_ID" \
+      CI_ARCH='x86_64' \
+      python3 - <<'PY'
+      import hashlib
+      import json
+      import os
+      from pathlib import Path
+
+      root = Path(os.environ['APPDIR']).resolve()
+
+      def matching(pattern):
+        return sorted(path for path in root.glob(pattern) if path.is_file())
+
+      def matching_openal():
+        return sorted(path for path in root.rglob('libopenal.so*') if path.is_file())
+
+      def record(path):
+        relative = path.relative_to(root).as_posix()
+        if Path(relative).is_absolute() or '..' in Path(relative).parts:
+          raise RuntimeError(f'non-relative manifest path: {relative}')
+        return {'path': relative, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+
+      executables = [path for path in matching('usr/bin/zandronum*') if os.access(path, os.X_OK)]
+      pk3s = matching('usr/bin/*.pk3')
+      fmod = matching('usr/lib/libfmodex*.so*')
+      openal = matching_openal()
+      licenses = matching('usr/share/licenses/zandronum/OpenAL-Soft-*.txt')
+      if not executables or not pk3s:
+        raise RuntimeError('the AppDir must contain executable and PK3 inputs')
+      if len(fmod) != 1:
+        raise RuntimeError('the AppDir FMOD runtime set is missing or has extras')
+      if len(openal) != 1:
+        raise RuntimeError('the AppDir OpenAL runtime set is missing or has extras')
+      if [path.name for path in licenses] != ['OpenAL-Soft-COPYING.txt', 'OpenAL-Soft-SOURCE.txt']:
+        raise RuntimeError('the AppDir OpenAL license/notice set is missing or has extras')
+
+      build_manifest_path = Path('build/phase1a-runtime-manifest.json')
+      if not build_manifest_path.is_file():
+        raise RuntimeError('the build OpenAL manifest is missing')
+      build_manifest = json.loads(build_manifest_path.read_text(encoding='utf-8'))
+      if build_manifest.get('sound_enabled') is not True:
+        raise RuntimeError('the build manifest is not a sound-enabled manifest')
+      openal_package_version = build_manifest.get('openal', {}).get('resolved_package_version')
+      if not isinstance(openal_package_version, str) or not openal_package_version.strip():
+        raise RuntimeError('the build OpenAL package version is missing')
+      source_openal = Path('build/libopenal.so.1')
+      if hashlib.sha256(openal[0].read_bytes()).hexdigest() != hashlib.sha256(source_openal.read_bytes()).hexdigest():
+        raise RuntimeError('the AppDir OpenAL runtime does not match the build artifact')
+
+      manifest = {
+        'schema': 'phase1a-runtime-manifest',
+        'schema_version': 1,
+        'vcs': {'commit': os.environ['VCS_COMMIT']},
+        'ci': {
+          'provider': 'gitlab',
+          'run': os.environ['CI_RUN'],
+          'job': os.environ['CI_JOB'],
+        },
+        'platform': {'os': 'linux-appimage', 'arch': os.environ['CI_ARCH']},
+        'sound_enabled': True,
+        'openal': {
+          'source_commit': None,
+          'resolved_package_version': openal_package_version,
+        },
+        'files': {
+          'executables': [record(path) for path in executables],
+          'fmod_runtime': [record(path) for path in fmod],
+          'openal_runtime': [record(path) for path in openal],
+          'pk3s': [record(path) for path in pk3s],
+          'license_notice': [record(path) for path in licenses],
+        },
+      }
+      (root / 'phase1a-runtime-manifest.json').write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8'
+      )
+      PY
+    - linuxdeploy --appimage-extract-and-run
       --appdir AppDir --output appimage -v0
+    - |
+      set -euo pipefail
+      appimage="$(find . -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
+      test -n "$appimage"
+      rm -rf squashfs-root
+      "$appimage" --appimage-extract >/dev/null
+      test -f squashfs-root/phase1a-runtime-manifest.json
+      mapfile -t extracted_openal < <(find squashfs-root -type f -name 'libopenal.so*' | sort)
+      ((${#extracted_openal[@]} == 1))
+      MANIFEST_ROOT="$PWD/squashfs-root" python3 - <<'PY'
+      import hashlib
+      import json
+      import os
+      from pathlib import Path
+
+      root = Path(os.environ['MANIFEST_ROOT']).resolve()
+      manifest = json.loads((root / 'phase1a-runtime-manifest.json').read_text(encoding='utf-8'))
+      if manifest.get('sound_enabled') is not True:
+        raise RuntimeError('the extracted AppImage manifest is not sound-enabled')
+      if not manifest.get('openal', {}).get('resolved_package_version'):
+        raise RuntimeError('the extracted AppImage OpenAL package version is missing')
+
+      def actual(pattern):
+        return sorted(
+          path.relative_to(root).as_posix()
+          for path in root.glob(pattern)
+          if path.is_file()
+        )
+
+      actual_openal = sorted(
+        path.relative_to(root).as_posix()
+        for path in root.rglob('libopenal.so*')
+        if path.is_file()
+      )
+      actual_inputs = {
+        'executables': [path for path in actual('usr/bin/zandronum*') if os.access(root / path, os.X_OK)],
+        'fmod_runtime': actual('usr/lib/libfmodex*.so*'),
+        'openal_runtime': actual_openal,
+        'pk3s': actual('usr/bin/*.pk3'),
+        'license_notice': actual('usr/share/licenses/zandronum/OpenAL-Soft-*.txt'),
+      }
+      for category in ('executables', 'fmod_runtime', 'openal_runtime', 'pk3s', 'license_notice'):
+        manifest_paths = sorted(item['path'] for item in manifest['files'][category])
+        if manifest_paths != actual_inputs[category]:
+          raise RuntimeError(f'unexpected or substituted AppImage inputs: {category}')
+        for item in manifest['files'][category]:
+          relative = Path(item['path'])
+          if relative.is_absolute() or '..' in relative.parts:
+            raise RuntimeError(f'non-relative manifest path: {item["path"]}')
+          path = root / relative
+          if not path.is_file():
+            raise RuntimeError(f'manifest input is missing: {item["path"]}')
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          if digest != item['sha256']:
+            raise RuntimeError(f'manifest hash mismatch: {item["path"]}')
+      PY
   dependencies:
     - build_linux
   artifacts:
@@ -93,6 +372,10 @@ appimage:
 #   ZA_FMOD_DIR               FMOD Ex root directory
 #   ZA_OPENAL_WIN32_ROOT      32-bit OpenAL Soft install root with include, lib, and bin directories
 #   ZA_OPENAL_X64_ROOT        64-bit OpenAL Soft install root with include, lib, and bin directories
+#   ZA_OPENAL_WIN32_COMMIT    trusted OpenAL Soft commit SHA for ZA_OPENAL_WIN32_ROOT
+#   ZA_OPENAL_WIN32_SHA256    trusted SHA256 for ZA_OPENAL_WIN32_ROOT\bin\OpenAL32.dll
+#   ZA_OPENAL_X64_COMMIT      trusted OpenAL Soft commit SHA for ZA_OPENAL_X64_ROOT
+#   ZA_OPENAL_X64_SHA256      trusted SHA256 for ZA_OPENAL_X64_ROOT\bin\OpenAL32.dll
 # Ensure your runner uses PowerShell 7 or later. (_not_ Windows PowerShell!) 
 
 .windows: &windows
@@ -100,7 +383,8 @@ appimage:
   tags:
     - zan-win-build
   script:
-    - $fmodArch = "" ;
+    - >
+      $fmodArch = "" ;
       $opensslArch = "x86" ;
       $opensslRoot = $env:ZA_OPENSSL_WIN32_ROOT ;
       If ($env:ARCH -eq "x64") {
@@ -150,7 +434,122 @@ appimage:
       & 'C:\Program Files (x86)\MSBuild\14.0\Bin\amd64\MSBuild.exe'
         /property:Configuration=Release
         zandronum.sln &&
-      Copy-Item "$env:ZA_FMOD_ROOT\api\fmodex${fmodArch}.dll" -Destination "Release"
+      Copy-Item "$env:ZA_FMOD_ROOT\api\fmodex${fmodArch}.dll" -Destination "Release" ;
+      $release = (Resolve-Path "Release").Path ;
+      $openalTarget = Join-Path $release "OpenAL32.dll" ;
+      Copy-Item $openalRuntime -Destination $openalTarget ;
+      $openalRuntimeHash = (Get-FileHash -LiteralPath $openalRuntime -Algorithm SHA256).Hash.ToLowerInvariant() ;
+      $packagedOpenalHash = (Get-FileHash -LiteralPath $openalTarget -Algorithm SHA256).Hash.ToLowerInvariant() ;
+      if ($packagedOpenalHash -cne $openalRuntimeHash) {
+        throw "The packaged OpenAL32.dll does not match the architecture-specific OpenAL runtime.";
+      } ;
+      if ($env:OPENAL_COMMIT -notmatch '^[0-9a-fA-F]{40}$') {
+        throw "OPENAL_COMMIT must be a full pinned commit SHA.";
+      } ;
+      $openalRunnerKey = if ($env:ARCH -eq "x64") { "X64" } else { "WIN32" } ;
+      $openalCommitVariable = "ZA_OPENAL_${openalRunnerKey}_COMMIT" ;
+      $openalShaVariable = "ZA_OPENAL_${openalRunnerKey}_SHA256" ;
+      $openalRuntimeCommit = [Environment]::GetEnvironmentVariable($openalCommitVariable) ;
+      $openalExpectedHash = [Environment]::GetEnvironmentVariable($openalShaVariable) ;
+      if ([string]::IsNullOrWhiteSpace($openalRuntimeCommit) -or $openalRuntimeCommit -notmatch '^[0-9a-fA-F]{40}$') {
+        throw "$openalCommitVariable must provide the full OpenAL Soft commit SHA for ARCH=$env:ARCH.";
+      } ;
+      if ([string]::IsNullOrWhiteSpace($openalExpectedHash) -or $openalExpectedHash -notmatch '^[0-9a-fA-F]{64}$') {
+        throw "$openalShaVariable must provide the expected SHA256 for ARCH=$env:ARCH.";
+      } ;
+      $openalRuntimeCommit = $openalRuntimeCommit.Trim().ToLowerInvariant() ;
+      $openalExpectedHash = $openalExpectedHash.Trim().ToLowerInvariant() ;
+      $openalPinnedCommit = $env:OPENAL_COMMIT.Trim().ToLowerInvariant() ;
+      if ($openalRuntimeCommit -cne $openalPinnedCommit) {
+        throw "$openalCommitVariable does not match OPENAL_COMMIT.";
+      } ;
+      if ($packagedOpenalHash -cne $openalExpectedHash) {
+        throw "The copied OpenAL32.dll does not match $openalShaVariable.";
+      } ;
+      function Get-PeMachineType {
+        param([string]$Path)
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
+          throw "The copied OpenAL32.dll is not a valid PE file: $Path"
+        }
+        $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+        if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length -or
+            $bytes[$peOffset] -ne 0x50 -or $bytes[$peOffset + 1] -ne 0x45 -or
+            $bytes[$peOffset + 2] -ne 0x00 -or $bytes[$peOffset + 3] -ne 0x00) {
+          throw "The copied OpenAL32.dll is not a valid PE image: $Path"
+        }
+        return [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+      } ;
+      $expectedMachine = if ($env:ARCH -eq "x64") { 0x8664 } elseif ($env:ARCH -eq "Win32") { 0x014c } else { throw "Unsupported ARCH=$env:ARCH." } ;
+      $actualMachine = Get-PeMachineType -Path $openalTarget ;
+      if ($actualMachine -ne $expectedMachine) {
+        throw "The copied OpenAL32.dll machine type 0x$('{0:X4}' -f $actualMachine) does not match ARCH=$env:ARCH.";
+      } ;
+      $openalLicenses = @(Get-ChildItem -LiteralPath $openalRoot -File -Filter "COPYING" -Recurse) ;
+      if ($openalLicenses.Count -ne 1) {
+        throw "Expected exactly one OpenAL Soft COPYING file below $openalRoot.";
+      } ;
+      Copy-Item $openalLicenses[0].FullName -Destination (Join-Path $release "OpenAL-Soft-COPYING.txt") ;
+      $sourceNotice = "OpenAL Soft source location$([Environment]::NewLine)Repository: https://github.com/kcat/openal-soft$([Environment]::NewLine)Commit: $env:OPENAL_COMMIT$([Environment]::NewLine)License: LGPL-2.0-or-later (see OpenAL-Soft-COPYING.txt)" ;
+      Set-Content -LiteralPath (Join-Path $release "OpenAL-Soft-SOURCE.txt") -Value $sourceNotice -Encoding utf8 -NoNewline ;
+      $expectedExecutables = @(Get-ChildItem -LiteralPath $release -File -Filter "*.exe" | Sort-Object Name) ;
+      $expectedPk3s = @(Get-ChildItem -LiteralPath $release -File -Filter "*.pk3" | Sort-Object Name) ;
+      $fmodRuntimes = @(Get-ChildItem -LiteralPath $release -File | Where-Object { $_.Name -like "fmodex*.dll" } | Sort-Object Name) ;
+      $openalRuntimes = @(Get-ChildItem -LiteralPath $release -File | Where-Object { $_.Name -in @("OpenAL32.dll", "soft_oal.dll") }) ;
+      $licenses = @(Get-ChildItem -LiteralPath $release -File -Filter "OpenAL-Soft-*.txt" | Sort-Object Name) ;
+      if ($expectedExecutables.Count -eq 0 -or $expectedPk3s.Count -eq 0) {
+        throw "The Windows release must contain at least one executable and one PK3.";
+      } ;
+      if ($fmodRuntimes.Count -ne 1 -or $fmodRuntimes[0].Name -cne ("fmodex${fmodArch}.dll")) {
+        throw "The Windows release FMOD runtime set is missing or substituted.";
+      } ;
+      if ($openalRuntimes.Count -ne 1 -or $openalRuntimes[0].Name -cne "OpenAL32.dll") {
+        throw "The Windows release OpenAL runtime set is missing or substituted.";
+      } ;
+      if (($licenses.Name -join "|") -cne "OpenAL-Soft-COPYING.txt|OpenAL-Soft-SOURCE.txt") {
+        throw "The Windows release OpenAL license/notice set is missing or has extras.";
+      } ;
+      function Get-ManifestRecord {
+        param([System.IO.FileInfo]$File)
+        [ordered]@{
+          path = $File.Name
+          sha256 = (Get-FileHash -LiteralPath $File.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+      } ;
+      foreach ($value in @($env:CI_COMMIT_SHA, $env:CI_PIPELINE_ID, $env:CI_JOB_ID, $env:ARCH, $env:OPENAL_COMMIT)) {
+        if ([string]::IsNullOrWhiteSpace($value)) {
+          throw "The Windows release provenance metadata is incomplete.";
+        }
+      } ;
+      $manifest = [ordered]@{
+        schema = "phase1a-runtime-manifest"
+        schema_version = 1
+        vcs = [ordered]@{ commit = $env:CI_COMMIT_SHA }
+        ci = [ordered]@{
+          provider = "gitlab"
+          run = $env:CI_PIPELINE_ID
+          job = $env:CI_JOB_ID
+        }
+        platform = [ordered]@{
+          os = "windows"
+          arch = if ($env:ARCH -eq "x64") { "x64" } else { "x86" }
+        }
+        sound_enabled = $true
+        openal = [ordered]@{
+          source_commit = $env:OPENAL_COMMIT
+          runtime_commit = $openalRuntimeCommit
+          runtime_sha256 = $packagedOpenalHash
+          resolved_package_version = $null
+        }
+        files = [ordered]@{
+          executables = @($expectedExecutables | ForEach-Object { Get-ManifestRecord $_ })
+          fmod_runtime = @(Get-ManifestRecord $fmodRuntimes[0])
+          openal_runtime = @(Get-ManifestRecord $openalRuntimes[0])
+          pk3s = @($expectedPk3s | ForEach-Object { Get-ManifestRecord $_ })
+          license_notice = @($licenses | ForEach-Object { Get-ManifestRecord $_ })
+        }
+      } ;
+      $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $release "phase1a-runtime-manifest.json") -Encoding utf8
   artifacts:
     paths:
       - build-$CI_JOB_ID/Release/*

@@ -2,6 +2,9 @@ name: Windows build
 
 on: [push, pull_request]
 
+env:
+  OPENAL_COMMIT: b2c48f7718ef3fcf67921a8b6534c4914e328970
+
 jobs:
   build:
     runs-on: windows-2022
@@ -37,7 +40,7 @@ jobs:
         $openalBuild = '${{ github.workspace }}\openal-soft-build-${{ matrix.platform }}'
         $openalRoot = '${{ github.workspace }}\openal-soft-install-${{ matrix.platform }}'
         git clone https://github.com/kcat/openal-soft.git $openalSource
-        git -C $openalSource checkout b2c48f7718ef3fcf67921a8b6534c4914e328970
+        git -C $openalSource checkout $env:OPENAL_COMMIT
         & cmake -S $openalSource -B $openalBuild -A '${{ matrix.platform }}' `
             -DCMAKE_INSTALL_PREFIX=$openalRoot `
             -DALSOFT_UTILS=OFF `
@@ -88,11 +91,162 @@ jobs:
     - name: Create package
       shell: pwsh
       run: |
-        mkdir package
-        cp ${{ steps.strings.outputs.build-output-dir }}\${{ matrix.build_type }}\*.exe package
-        cp ${{ steps.strings.outputs.build-output-dir }}\${{ matrix.build_type }}\*.pdb package
-        cp ${{ steps.strings.outputs.build-output-dir }}\${{ matrix.build_type }}\*.pk3 package
-        cp ${env:FMOD_DLL} package
+          $ErrorActionPreference = 'Stop'
+          $package = Join-Path $PWD 'package'
+          $buildOutput = '${{ steps.strings.outputs.build-output-dir }}\${{ matrix.build_type }}'
+          $openalSource = '${{ github.workspace }}\openal-soft'
+          $openalRoot = '${{ github.workspace }}\openal-soft-install-${{ matrix.platform }}'
+          if (Test-Path -LiteralPath $package) {
+              Remove-Item -LiteralPath $package -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $package | Out-Null
+
+          $expectedExecutables = @(Get-ChildItem -LiteralPath $buildOutput -File -Filter '*.exe' | Sort-Object Name)
+          $expectedPk3s = @(Get-ChildItem -LiteralPath $buildOutput -File -Filter '*.pk3' | Sort-Object Name)
+          if ($expectedExecutables.Count -eq 0 -or $expectedPk3s.Count -eq 0) {
+              throw 'The build output must contain at least one executable and one PK3.'
+          }
+          Copy-Item -LiteralPath $expectedExecutables.FullName -Destination $package
+          Copy-Item -LiteralPath (Get-ChildItem -LiteralPath $buildOutput -File -Filter '*.pdb').FullName -Destination $package
+          Copy-Item -LiteralPath $expectedPk3s.FullName -Destination $package
+
+          if ([string]::IsNullOrWhiteSpace($env:FMOD_DLL) -or !(Test-Path -LiteralPath $env:FMOD_DLL -PathType Leaf)) {
+              throw 'FMOD_DLL must name the configured FMOD runtime file.'
+          }
+          $fmodName = Split-Path -Leaf $env:FMOD_DLL
+          $expectedFmodName = if ('${{ matrix.platform }}' -eq 'x64') { 'fmodex64.dll' } else { 'fmodex.dll' }
+          if ($fmodName -cne $expectedFmodName) {
+              throw "FMOD_DLL must name $expectedFmodName for this package."
+          }
+          Copy-Item -LiteralPath $env:FMOD_DLL -Destination (Join-Path $package $fmodName)
+
+          $openalRuntimeCandidates = @(Get-ChildItem -LiteralPath (Join-Path $openalRoot 'bin') -File -Filter 'soft_oal.dll')
+          if ($openalRuntimeCandidates.Count -ne 1) {
+              throw "Expected exactly one pinned OpenAL Soft runtime at $openalRoot\bin\soft_oal.dll."
+          }
+          if ($env:OPENAL_COMMIT -notmatch '^[0-9a-fA-F]{40}$') {
+              throw 'OPENAL_COMMIT must be a full pinned commit SHA.'
+          }
+          $openalRuntimeHash = (Get-FileHash -LiteralPath $openalRuntimeCandidates[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Copy-Item -LiteralPath $openalRuntimeCandidates[0].FullName -Destination (Join-Path $package 'OpenAL32.dll')
+          $packagedOpenalHash = (Get-FileHash -LiteralPath (Join-Path $package 'OpenAL32.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($packagedOpenalHash -cne $openalRuntimeHash) {
+              throw 'The packaged OpenAL32.dll does not match the pinned OpenAL Soft runtime.'
+          }
+
+          $openalLicense = Join-Path $openalSource 'COPYING'
+          if (!(Test-Path -LiteralPath $openalLicense -PathType Leaf)) {
+              throw "Pinned OpenAL Soft source is missing COPYING: $openalLicense"
+          }
+          Copy-Item -LiteralPath $openalLicense -Destination (Join-Path $package 'OpenAL-Soft-COPYING.txt')
+          $sourceNotice = @(
+              'OpenAL Soft source location'
+              'Repository: https://github.com/kcat/openal-soft'
+              "Commit: $env:OPENAL_COMMIT"
+              'License: LGPL-2.0-or-later (see OpenAL-Soft-COPYING.txt)'
+          ) -join [Environment]::NewLine
+          Set-Content -LiteralPath (Join-Path $package 'OpenAL-Soft-SOURCE.txt') -Value $sourceNotice -Encoding utf8 -NoNewline
+
+          $fmodRuntimes = @(Get-ChildItem -LiteralPath $package -File | Where-Object { $_.Name -like 'fmodex*.dll' } | Sort-Object Name)
+          if ($fmodRuntimes.Count -ne 1 -or $fmodRuntimes[0].Name -cne $fmodName) {
+              throw "Expected exactly the configured FMOD runtime $fmodName in the package."
+          }
+          $openalRuntimes = @(Get-ChildItem -LiteralPath $package -File | Where-Object { $_.Name -in @('OpenAL32.dll', 'soft_oal.dll') })
+          if ($openalRuntimes.Count -ne 1 -or $openalRuntimes[0].Name -cne 'OpenAL32.dll') {
+              throw 'The package must contain exactly one OpenAL32.dll runtime and no substituted soft_oal.dll.'
+          }
+
+          $packagedExecutables = @(Get-ChildItem -LiteralPath $package -File -Filter '*.exe' | Sort-Object Name)
+          $packagedPk3s = @(Get-ChildItem -LiteralPath $package -File -Filter '*.pk3' | Sort-Object Name)
+          if (($packagedExecutables.Name -join '|') -cne ($expectedExecutables.Name -join '|') -or
+              ($packagedPk3s.Name -join '|') -cne ($expectedPk3s.Name -join '|')) {
+              throw 'The package executable or PK3 set differs from the build output set.'
+          }
+
+          $requiredOpenALLicenseNoticeNames = @(
+              'OpenAL-Soft-COPYING.txt'
+              'OpenAL-Soft-SOURCE.txt'
+          )
+          function Get-ExactOpenALLicenseNoticeFiles {
+              param(
+                  [string]$Directory,
+                  [string[]]$ExpectedNames
+              )
+              $actualFiles = @(Get-ChildItem -LiteralPath $Directory -File -Filter 'OpenAL-Soft-*.txt' | Sort-Object Name)
+              if (($actualFiles.Name -join '|') -cne ($ExpectedNames -join '|')) {
+                  $actualNames = if ($actualFiles.Count -eq 0) { '<none>' } else { $actualFiles.Name -join ', ' }
+                  throw "OpenAL Soft license/notice files must be exactly: $($ExpectedNames -join ', '). Actual: $actualNames"
+              }
+              return $actualFiles
+          }
+
+          $fixture = Join-Path $env:RUNNER_TEMP 'openal-license-notice-fixture'
+          if (Test-Path -LiteralPath $fixture) {
+              throw "OpenAL license/notice fixture path already exists: $fixture"
+          }
+          try {
+              New-Item -ItemType Directory -Path $fixture | Out-Null
+              foreach ($name in $requiredOpenALLicenseNoticeNames) {
+                  Set-Content -LiteralPath (Join-Path $fixture $name) -Value 'fixture' -Encoding utf8 -NoNewline
+              }
+              Set-Content -LiteralPath (Join-Path $fixture 'OpenAL-Soft-EXTRA.txt') -Value 'fixture' -Encoding utf8 -NoNewline
+              $fixtureError = $null
+              try {
+                  Get-ExactOpenALLicenseNoticeFiles -Directory $fixture -ExpectedNames $requiredOpenALLicenseNoticeNames | Out-Null
+              } catch {
+                  $fixtureError = $_.Exception.Message
+              }
+              if ([string]::IsNullOrWhiteSpace($fixtureError)) {
+                  throw 'The OpenAL license/notice validation fixture accepted an unexpected extra file.'
+              }
+          } finally {
+              if (Test-Path -LiteralPath $fixture) {
+                  Remove-Item -LiteralPath $fixture -Recurse -Force
+              }
+          }
+
+          $packagedLicenseNotice = @(Get-ExactOpenALLicenseNoticeFiles -Directory $package -ExpectedNames $requiredOpenALLicenseNoticeNames)
+
+          function Get-ManifestRecord {
+              param([System.IO.FileInfo]$File)
+              [ordered]@{
+                  path = $File.Name
+                  sha256 = (Get-FileHash -LiteralPath $File.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              }
+          }
+
+          $manifest = [ordered]@{
+              schema = 'phase1a-runtime-manifest'
+              schema_version = 1
+              vcs = [ordered]@{ commit = '${{ github.sha }}' }
+              ci = [ordered]@{
+                  provider = 'github'
+                  run = '${{ github.run_id }}'
+                  job = '${{ github.job }}'
+              }
+              platform = [ordered]@{
+                  os = 'windows'
+                  arch = if ('${{ matrix.platform }}' -eq 'x64') { 'x64' } else { 'x86' }
+              }
+              sound_enabled = $true
+              openal = [ordered]@{
+                  source_commit = $env:OPENAL_COMMIT
+                  resolved_package_version = $null
+              }
+              files = [ordered]@{
+                  executables = @($packagedExecutables | ForEach-Object { Get-ManifestRecord $_ })
+                  fmod_runtime = @(Get-ManifestRecord $fmodRuntimes[0])
+                  openal_runtime = @(Get-ManifestRecord $openalRuntimes[0])
+                  pk3s = @($packagedPk3s | ForEach-Object { Get-ManifestRecord $_ })
+                  license_notice = @($packagedLicenseNotice | ForEach-Object { Get-ManifestRecord $_ })
+              }
+          }
+          foreach ($value in @('${{ github.sha }}', '${{ github.run_id }}', '${{ github.job }}', $env:OPENAL_COMMIT)) {
+              if ([string]::IsNullOrWhiteSpace($value)) {
+                  throw 'The package provenance metadata is incomplete.'
+              }
+          }
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $package 'phase1a-runtime-manifest.json') -Encoding utf8
 
     - name: Upload artefacts
       uses: actions/upload-artifact@v4

@@ -40,24 +40,50 @@ jobs:
       run: |
         sudo apt update
         sudo apt install g++ make cmake libsdl1.2-dev mercurial zlib1g-dev libbz2-dev libjpeg-dev libfluidsynth-dev libgtk2.0-dev timidity nasm libgl1-mesa-dev libssl-dev tar libglew-dev wget libopus-dev
-        
+
         if [[ "${{ matrix.serveronly }}" == "" ]]; then
-          sudo apt install libopenal-dev
-          dpkg-query -W -f='OpenAL Soft package: ${Package} ${Version}\n' libopenal-dev
+          sudo apt install libopenal1 libopenal-dev
+          dpkg-query -W -f='OpenAL Soft package: ${Package} ${Version}\n' libopenal1
+          openalDevLibrary="$(dpkg -L libopenal-dev | awk '/\/libopenal\.so$/ { print; exit }')"
+          openalRuntimeSource="$(dpkg -L libopenal1 | awk '/\/libopenal\.so\.[0-9]+(\.[0-9]+)*$/ && $0 !~ /\/debug\// { print; exit }')"
+          openalCopyright="$(dpkg -L libopenal1 | awk '/\/usr\/share\/doc\/libopenal1\/copyright$/ { print; exit }')"
+          test -n "$openalDevLibrary" && test -f "$openalDevLibrary"
+          test -n "$openalRuntimeSource" && test -f "$openalRuntimeSource"
+          test -n "$openalCopyright" && test -f "$openalCopyright"
+          openalPackageVersion="$(dpkg-query -W -f='${Version}' libopenal1)"
+          openalArch="$(dpkg --print-architecture)"
+          echo "OPENAL_INCLUDE_DIR=/usr/include" >> "$GITHUB_ENV"
+          echo "OPENAL_LIBRARY=$openalDevLibrary" >> "$GITHUB_ENV"
+          echo "OPENAL_RUNTIME_SOURCE=$openalRuntimeSource" >> "$GITHUB_ENV"
+          echo "OPENAL_COPYRIGHT=$openalCopyright" >> "$GITHUB_ENV"
+          echo "OPENAL_PACKAGE_VERSION=$openalPackageVersion" >> "$GITHUB_ENV"
+          echo "OPENAL_ARCH=$openalArch" >> "$GITHUB_ENV"
           wget https://github.com/DrinkyBird/zan-ci-deps/releases/download/ci-dependencies/fmodapi${FMOD_VER}linux.tar.gz
           tar xf fmodapi${FMOD_VER}linux.tar.gz
-          echo "FMOD_INCLUDE_DIR=${PWD}/fmodapi${FMOD_VER}linux/api/inc" >> $GITHUB_ENV
-          echo "FMOD_LIBRARY=${PWD}/fmodapi${FMOD_VER}linux/api/lib/libfmodex64-${FMOD_SOVER}.so" >> $GITHUB_ENV
+          echo "FMOD_INCLUDE_DIR=${PWD}/fmodapi${FMOD_VER}linux/api/inc" >> "$GITHUB_ENV"
+          echo "FMOD_LIBRARY=${PWD}/fmodapi${FMOD_VER}linux/api/lib/libfmodex64-${FMOD_SOVER}.so" >> "$GITHUB_ENV"
         fi
 
     - name: Configure CMake
-      run: >
-        if [[ "${{ matrix.serveronly }}" == "SERVERONLY" ]]; then export SERVERONLY=ON; fi
-        
-        cmake -B ${{ steps.strings.outputs.build-output-dir }} -S ${{ github.workspace }}
-        -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
-        -DSERVERONLY=${SERVERONLY}
-        -DRELEASE_WITH_DEBUG_FILE=ON
+      shell: bash
+      run: |
+        set -euo pipefail
+        cmake_args=(
+          -B "${{ steps.strings.outputs.build-output-dir }}"
+          -S "${{ github.workspace }}"
+          -DCMAKE_BUILD_TYPE="${{ matrix.build_type }}"
+          -DSERVERONLY="${{ matrix.serveronly == 'SERVERONLY' && 'ON' || 'OFF' }}"
+          -DRELEASE_WITH_DEBUG_FILE=ON
+        )
+        if [[ "${{ matrix.serveronly }}" == "" ]]; then
+          cmake_args+=(
+            -DOPENAL_INCLUDE_DIR="$OPENAL_INCLUDE_DIR"
+            -DOPENAL_LIBRARY="$OPENAL_LIBRARY"
+            -DFMOD_INCLUDE_DIR="$FMOD_INCLUDE_DIR"
+            -DFMOD_LIBRARY="$FMOD_LIBRARY"
+          )
+        fi
+        cmake "${cmake_args[@]}"
 
     - name: Build
       run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config ${{ matrix.build_type }} -j $(nproc)
@@ -65,13 +91,120 @@ jobs:
     - name: Create package
       shell: bash
       run: |
-        mkdir package
-        if [[ "${{ runner.os }}" == 'Linux' ]]; then
-          cp ${{ steps.strings.outputs.build-output-dir }}/zandronum* package
-          cp ${{ steps.strings.outputs.build-output-dir }}/*.pk3 package
-          cp ${{ steps.strings.outputs.build-output-dir }}/*.so package || true
-          cp ${FMOD_LIBRARY} package || true
+        set -euo pipefail
+        package="$PWD/package"
+        build_output="${{ steps.strings.outputs.build-output-dir }}"
+        mkdir -p "$package"
+
+        mapfile -t expected_executables < <(find "$build_output" -maxdepth 1 -type f -name 'zandronum*' -perm /111 -printf '%f\n' | sort)
+        mapfile -t expected_pk3s < <(find "$build_output" -maxdepth 1 -type f -name '*.pk3' -printf '%f\n' | sort)
+        ((${#expected_executables[@]} > 0))
+        ((${#expected_pk3s[@]} > 0))
+        for executable in "${expected_executables[@]}"; do cp "$build_output/$executable" "$package/"; done
+        for pk3 in "${expected_pk3s[@]}"; do cp "$build_output/$pk3" "$package/"; done
+
+        mapfile -t shared_libraries < <(find "$build_output" -maxdepth 1 -type f -name '*.so' -printf '%f\n' | sort)
+        for shared_library in "${shared_libraries[@]}"; do cp "$build_output/$shared_library" "$package/"; done
+
+        sound_enabled=false
+        if [[ "${{ matrix.serveronly }}" == "" ]]; then
+          sound_enabled=true
+          fmod_name="$(basename "$FMOD_LIBRARY")"
+          cp "$FMOD_LIBRARY" "$package/$fmod_name"
+          openal_runtime_name='libopenal.so.1'
+          cp --dereference "$OPENAL_RUNTIME_SOURCE" "$package/$openal_runtime_name"
+          cp --dereference "$OPENAL_COPYRIGHT" "$package/OpenAL-Soft-COPYING.txt"
+          printf '%s\n' \
+            'OpenAL Soft source location' \
+            'Repository: https://github.com/kcat/openal-soft' \
+            "Distribution package: libopenal1 $OPENAL_PACKAGE_VERSION ($OPENAL_ARCH)" \
+            'License: LGPL-2.0-or-later (see OpenAL-Soft-COPYING.txt)' \
+            > "$package/OpenAL-Soft-SOURCE.txt"
+
+          for executable in "${expected_executables[@]}"; do
+            resolved_openal="$(LD_LIBRARY_PATH="$package" ldd "$package/$executable" | awk '$1 == "libopenal.so.1" { print $3; exit }')"
+            test -n "$resolved_openal"
+            test "$(readlink -f "$resolved_openal")" = "$(readlink -f "$package/$openal_runtime_name")"
+          done
         fi
+
+        PACKAGE_ROOT="$package" \
+        SOUND_ENABLED="$sound_enabled" \
+        EXPECTED_FMOD="${fmod_name-}" \
+        EXPECTED_OPENAL="${openal_runtime_name-}" \
+        VCS_COMMIT="${{ github.sha }}" \
+        CI_RUN="${{ github.run_id }}" \
+        CI_JOB="${{ github.job }}" \
+        CI_ARCH="$(dpkg --print-architecture)" \
+        OPENAL_PACKAGE_VERSION="${OPENAL_PACKAGE_VERSION-}" \
+        python3 - <<'PY'
+        import hashlib
+        import json
+        import os
+        from pathlib import Path
+
+        root = Path(os.environ['PACKAGE_ROOT']).resolve()
+        sound_enabled = os.environ['SOUND_ENABLED'] == 'true'
+
+        def matching(pattern):
+            return sorted(path for path in root.glob(pattern) if path.is_file())
+
+        def record(path):
+            relative = path.relative_to(root).as_posix()
+            if Path(relative).is_absolute() or '..' in Path(relative).parts:
+                raise RuntimeError(f'non-relative manifest path: {relative}')
+            return {'path': relative, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+
+        executables = [path for path in matching('zandronum*') if os.access(path, os.X_OK)]
+        pk3s = matching('*.pk3')
+        fmod = matching('libfmodex*.so*')
+        openal = matching('libopenal.so*')
+        licenses = matching('OpenAL-Soft-*.txt')
+        if not executables or not pk3s:
+            raise RuntimeError('the package must contain executable and PK3 inputs')
+        metadata = (
+          os.environ['VCS_COMMIT'],
+          os.environ['CI_RUN'],
+          os.environ['CI_JOB'],
+          os.environ['CI_ARCH'],
+        )
+        if any(not value.strip() for value in metadata):
+          raise RuntimeError('the package provenance metadata is incomplete')
+        if sound_enabled:
+          if not os.environ['OPENAL_PACKAGE_VERSION'].strip():
+            raise RuntimeError('the package OpenAL version is missing')
+          if [path.name for path in fmod] != [os.environ['EXPECTED_FMOD']]:
+            raise RuntimeError('the package FMOD runtime set is missing or substituted')
+          if [path.name for path in openal] != [os.environ['EXPECTED_OPENAL']]:
+            raise RuntimeError('the package OpenAL runtime set is missing or substituted')
+          if [path.name for path in licenses] != ['OpenAL-Soft-COPYING.txt', 'OpenAL-Soft-SOURCE.txt']:
+            raise RuntimeError('the package OpenAL license/notice set is missing or has extras')
+        elif fmod or openal or licenses:
+            raise RuntimeError('server-only package unexpectedly contains sound runtime inputs')
+
+        manifest = {
+            'schema': 'phase1a-runtime-manifest',
+            'schema_version': 1,
+            'vcs': {'commit': os.environ['VCS_COMMIT']},
+            'ci': {'provider': 'github', 'run': os.environ['CI_RUN'], 'job': os.environ['CI_JOB']},
+            'platform': {'os': 'linux', 'arch': os.environ['CI_ARCH']},
+            'sound_enabled': sound_enabled,
+            'openal': {
+                'source_commit': None,
+                'resolved_package_version': os.environ['OPENAL_PACKAGE_VERSION'] or None,
+            },
+            'files': {
+                'executables': [record(path) for path in executables],
+                'fmod_runtime': [record(path) for path in fmod],
+                'openal_runtime': [record(path) for path in openal],
+                'pk3s': [record(path) for path in pk3s],
+                'license_notice': [record(path) for path in licenses],
+            },
+        }
+        (root / 'phase1a-runtime-manifest.json').write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8'
+        )
+        PY
 
     - name: Upload artefacts
       uses: actions/upload-artifact@v4
