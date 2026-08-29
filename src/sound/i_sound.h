@@ -118,6 +118,7 @@ public:
 
 	// Returns position of sound on this channel, in samples.
 	virtual unsigned int GetPosition(FISoundChannel *chan) = 0;
+	virtual bool ResolveEvictedPosition(FISoundChannel *, unsigned int *) { return false; }
 
 	// Gets a channel's audibility (real volume).
 	virtual float GetAudibility(FISoundChannel *chan) = 0;

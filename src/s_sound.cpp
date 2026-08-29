@@ -2013,7 +2013,16 @@ void S_EvictAllChannels()
 	{
 		next = chan->NextChan;
 
-		if (!(chan->ChanFlags & CHAN_EVICTED))
+		if (chan->ChanFlags & CHAN_EVICTED)
+		{
+			unsigned int position;
+			if (!(chan->ChanFlags & CHAN_ABSTIME) && GSnd != NULL && GSnd->ResolveEvictedPosition(chan, &position))
+			{
+				chan->StartTime.AsOne = position;
+				chan->ChanFlags |= CHAN_ABSTIME;
+			}
+		}
+		else
 		{
 			chan->ChanFlags |= CHAN_EVICTED;
 			if (chan->SysChannel != NULL)

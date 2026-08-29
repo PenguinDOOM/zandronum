@@ -2,6 +2,7 @@
 
 #include <AL/al.h>
 #include <chrono>
+#include <limits>
 #include <math.h>
 #include <stdio.h>
 #include <thread>
@@ -11,6 +12,16 @@ OALTestIntCVar snd_channels (1);
 OALTestStringCVar snd_openal_device ("default");
 OALTestFloatCVar snd_sfxvolume (1.f);
 OALTestBoolCVar snd_pitched (true);
+
+namespace
+{
+	unsigned int TestMilliseconds = 0;
+}
+
+unsigned int OALTestMilliseconds ()
+{
+	return TestMilliseconds;
+}
 
 namespace
 {
@@ -28,6 +39,7 @@ namespace
 
 	std::vector<CallbackEvent> Events;
 	int Failures = 0;
+	FISoundChannel *ForcedNextOwner = NULL;
 
 	void Check (bool condition, const char *name)
 	{
@@ -77,6 +89,14 @@ namespace
 		delete owner;
 	}
 
+	void ReleaseOwnerForReuse (FISoundChannel *owner)
+	{
+		owner->SysChannel = NULL;
+		owner->StartTime.AsOne = 0;
+		owner->Priority = 0;
+		ForcedNextOwner = owner;
+	}
+
 	void StopAndDrain (OpenALSoundRenderer &renderer, FISoundChannel *owner)
 	{
 		if (owner != NULL && owner->SysChannel != NULL)
@@ -84,6 +104,289 @@ namespace
 			renderer.StopChannel (owner);
 		}
 		renderer.UpdateSounds ();
+	}
+
+	ALint SourceState (FISoundChannel *owner)
+	{
+		ALint state = AL_STOPPED;
+		OpenALChannel *channel = owner == NULL ? NULL : (OpenALChannel *)owner->SysChannel;
+		if (channel != NULL)
+		{
+			alGetSourcei (channel->Source, AL_SOURCE_STATE, &state);
+		}
+		return state;
+	}
+
+	unsigned int SourceOffset (FISoundChannel *owner)
+	{
+		ALint offset = 0;
+		OpenALChannel *channel = owner == NULL ? NULL : (OpenALChannel *)owner->SysChannel;
+		if (channel != NULL)
+		{
+			alGetSourcei (channel->Source, AL_SAMPLE_OFFSET, &offset);
+		}
+		return offset < 0 ? 0 : (unsigned int)offset;
+	}
+
+	void AdvanceTestClock (OpenALSoundRenderer &renderer, unsigned int milliseconds)
+	{
+		TestMilliseconds += milliseconds;
+		renderer.UpdateSounds ();
+	}
+
+	unsigned int ExpectedLoopPosition (unsigned long long sampleFrame, unsigned int loopStart, unsigned int loopEnd)
+	{
+		return sampleFrame < loopStart ? (unsigned int)sampleFrame :
+			loopStart + (unsigned int)((sampleFrame - loopStart) % (loopEnd - loopStart));
+	}
+
+	void TestPauseReasonsAndClocks (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		FISoundChannel *normal = renderer.StartSound (sound, 0.5f, 128, 80, SNDF_LOOP, NULL);
+		FISoundChannel *noPause = renderer.StartSound (sound, 0.5f, 128, 80, SNDF_LOOP | SNDF_NOPAUSE, NULL);
+		Check (normal != NULL && noPause != NULL, "pause fixture starts normal and NOPAUSE sources");
+		renderer.SetSfxPaused (true, 0);
+		Check (SourceState (normal) == AL_PAUSED && SourceState (noPause) == AL_PLAYING, "gameplay pause affects only pausable source");
+		unsigned long long pausableBefore = renderer.PausableOutputFrames;
+		unsigned long long nonPausableBefore = renderer.NonPausableOutputFrames;
+		AdvanceTestClock (renderer, 2000);
+		Check (renderer.PausableOutputFrames == pausableBefore, "two-second gameplay pause freezes pausable logical clock");
+		Check (renderer.NonPausableOutputFrames == nonPausableBefore + (unsigned long long)renderer.GetOutputRate () * 2, "two-second gameplay pause advances nonpausable logical clock");
+		renderer.Sync (true);
+		Check (SourceState (normal) == AL_PAUSED && SourceState (noPause) == AL_PAUSED, "sync pauses every source");
+		renderer.SetSfxPaused (false, 0);
+		Check (SourceState (normal) == AL_PAUSED && SourceState (noPause) == AL_PAUSED, "sync prevents gameplay resume from restarting either source");
+		renderer.Sync (false);
+		Check (SourceState (normal) == AL_PLAYING && SourceState (noPause) == AL_PLAYING, "sync restore resumes sources with no remaining reason");
+		renderer.SetInactive (INACTIVE_Complete);
+		renderer.Sync (true);
+		renderer.SetInactive (INACTIVE_Active);
+		Check (SourceState (normal) == AL_PAUSED && SourceState (noPause) == AL_PAUSED, "sync retains sources paused after complete inactive reason clears");
+		renderer.Sync (false);
+		Check (SourceState (normal) == AL_PLAYING && SourceState (noPause) == AL_PLAYING, "sync restore resumes sources after nested inactive reason clears");
+		renderer.SetInactive (INACTIVE_Complete);
+		pausableBefore = renderer.PausableOutputFrames;
+		nonPausableBefore = renderer.NonPausableOutputFrames;
+		AdvanceTestClock (renderer, 2000);
+		Check (renderer.PausableOutputFrames == pausableBefore && renderer.NonPausableOutputFrames == nonPausableBefore, "two-second complete inactive pause freezes both logical clocks");
+		renderer.SetInactive (INACTIVE_Active);
+		StopAndDrain (renderer, normal);
+		StopAndDrain (renderer, noPause);
+		ReleaseOwner (normal);
+		ReleaseOwner (noPause);
+	}
+
+	void TestInactiveMuteAndComplete (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		FISoundChannel *channel = renderer.StartSound (sound, 0.75f, 128, 80, SNDF_LOOP, NULL);
+		Check (channel != NULL, "inactive fixture starts a looping source");
+		renderer.SetInactive (INACTIVE_Mute);
+		ALfloat gain = 1.f;
+		OpenALChannel *openalChannel = channel == NULL ? NULL : (OpenALChannel *)channel->SysChannel;
+		if (openalChannel != NULL)
+		{
+			alGetSourcef (openalChannel->Source, AL_GAIN, &gain);
+		}
+		Check (SourceState (channel) == AL_PLAYING && NearlyEqual (gain, 0.f), "inactive mute preserves playback while suppressing effective gain");
+		unsigned int mutedStart = SourceOffset (channel);
+		std::this_thread::sleep_for (std::chrono::milliseconds (30));
+		Check (SourceOffset (channel) > mutedStart, "inactive mute cursor continues advancing");
+		renderer.SetInactive (INACTIVE_Active);
+		renderer.SetInactive (INACTIVE_Complete);
+		unsigned int completeOffset = renderer.GetPosition (channel);
+		std::this_thread::sleep_for (std::chrono::milliseconds (30));
+		Check (SourceState (channel) == AL_PAUSED && renderer.GetPosition (channel) == completeOffset, "inactive complete freezes source state and cursor");
+		renderer.SetInactive (INACTIVE_Active);
+		StopAndDrain (renderer, channel);
+		ReleaseOwner (channel);
+	}
+
+	void TestEarlyClockAbstimeRestart (OpenALSoundRenderer &renderer)
+	{
+		std::vector<BYTE> samples = MakeSamples (8000);
+		SoundHandle loopSound = renderer.LoadSoundRaw (&samples[0], (int)samples.size (), 8000, 1, -16, 100, 500);
+		renderer.PausableOutputFrames = 0;
+		renderer.PausableFrameRemainder = 0;
+		renderer.NonPausableOutputFrames = 0;
+		renderer.NonPausableFrameRemainder = 0;
+		TestMilliseconds = 0;
+		renderer.LastClockMilliseconds = 0;
+		const unsigned int earlySavedFrame = 321;
+		const unsigned int earlyElapsedMilliseconds = 137;
+		FISoundChannel *earlySaved = new FISoundChannel;
+		earlySaved->StartTime.AsOne = earlySavedFrame;
+		FISoundChannel *earlyRestored = renderer.StartSound (loopSound, 0.5f, 128, 80, SNDF_LOOP | SNDF_ABSTIME, earlySaved);
+		Check (earlyRestored == earlySaved && abs ((int)SourceOffset (earlySaved) - (int)earlySavedFrame) <= 1,
+			"early-clock SNDF_ABSTIME directly seeks the saved sample frame");
+		AdvanceTestClock (renderer, earlyElapsedMilliseconds);
+		FISoundChannel *earlyEvictor = renderer.StartSound (loopSound, 0.5f, 128, 81, SNDF_LOOP, NULL);
+		unsigned long long elapsedOutputFramesAtEviction = (unsigned long long)renderer.GetOutputRate () * earlyElapsedMilliseconds / 1000;
+		unsigned long long expectedEarlySamples = earlySavedFrame +
+			(unsigned long long)((long double)elapsedOutputFramesAtEviction * 8000 / renderer.GetOutputRate ());
+		unsigned int expected = ExpectedLoopPosition (expectedEarlySamples, 100, 500);
+		unsigned int zeroOriginExpected = ExpectedLoopPosition (
+			(unsigned long long)((long double)elapsedOutputFramesAtEviction * 8000 / renderer.GetOutputRate ()), 100, 500);
+		Check (earlyEvictor != NULL && earlySaved->SysChannel == NULL, "early-clock ABSTIME source can be re-evicted");
+		StopAndDrain (renderer, earlyEvictor);
+		unsigned int serializedPosition = renderer.GetPosition (earlySaved);
+		Check (abs ((int)serializedPosition - (int)expected) <= 2 && expected != earlySavedFrame && expected != zeroOriginExpected,
+			"early-clock logical phase differs from both saved position and zero-origin phase");
+		earlySaved->StartTime.AsOne = serializedPosition;
+		FISoundChannel *earlyRestoredAgain = renderer.StartSound (loopSound, 0.5f, 128, 80, SNDF_LOOP | SNDF_ABSTIME, earlySaved);
+		Check (earlyRestoredAgain == earlySaved && abs ((int)SourceOffset (earlySaved) - (int)serializedPosition) <= 1,
+			"evicted ABSTIME channel serializes and restores its logical phase");
+		StopAndDrain (renderer, earlySaved);
+		ReleaseOwner (earlySaved);
+		ReleaseOwner (earlyEvictor);
+		renderer.UnloadSound (loopSound);
+	}
+
+	void TestLongClockRestartBounds (OpenALSoundRenderer &renderer)
+	{
+		std::vector<BYTE> samples = MakeSamples (8000);
+		SoundHandle loopSound = renderer.LoadSoundRaw (&samples[0], (int)samples.size (), 8000, 1, -16, 100, 500);
+		renderer.PausableOutputFrames = 1ull << 63;
+		renderer.PausableFrameRemainder = 0;
+		renderer.LastClockMilliseconds = TestMilliseconds;
+		FISoundChannel *boundary = renderer.StartSound (loopSound, 0.5f, 128, 80, SNDF_LOOP, NULL);
+		Check (boundary != NULL && boundary->StartTime.AsOne == (1ull << 63), "bit-63 logical clock remains an ordinary clock value");
+		AdvanceTestClock (renderer, 137);
+		FISoundChannel *evictor = renderer.StartSound (loopSound, 0.5f, 128, 81, SNDF_LOOP, NULL);
+		unsigned long long elapsedOutputFrames = (unsigned long long)renderer.GetOutputRate () * 137 / 1000;
+		unsigned int expected = ExpectedLoopPosition ((unsigned long long)((long double)elapsedOutputFrames * 8000 / renderer.GetOutputRate ()), 100, 500);
+		unsigned int serializedPosition = renderer.GetPosition (boundary);
+		Check (evictor != NULL && boundary->SysChannel == NULL && abs ((int)serializedPosition - (int)expected) <= 2,
+			"bit-63 eviction retains the ordinary logical phase");
+		StopAndDrain (renderer, evictor);
+		FISoundChannel *restarted = renderer.StartSound (loopSound, 0.5f, 128, 80, SNDF_LOOP, boundary);
+		Check (restarted == boundary && abs ((int)SourceOffset (boundary) - (int)expected) <= 2,
+			"bit-63 regular restart does not decode a negative tagged origin");
+		StopAndDrain (renderer, boundary);
+		ReleaseOwner (boundary);
+		ReleaseOwner (evictor);
+		renderer.UnloadSound (loopSound);
+		renderer.PausableOutputFrames = 0;
+		renderer.PausableFrameRemainder = 0;
+		renderer.LastClockMilliseconds = TestMilliseconds;
+	}
+
+	void TestRestartConversionBounds (OpenALSoundRenderer &renderer)
+	{
+		std::vector<BYTE> samples = MakeSamples (8000);
+		SoundHandle sound = renderer.LoadSoundRaw (&samples[0], (int)samples.size (), 8000, 1, -16, -1);
+		OpenALSound *openalSound = (OpenALSound *)sound.data;
+		openalSound->SampleRate = std::numeric_limits<unsigned int>::max ();
+		renderer.PausableOutputFrames = std::numeric_limits<unsigned long long>::max ();
+		renderer.PausableFrameRemainder = 0;
+		renderer.LastClockMilliseconds = TestMilliseconds;
+		FISoundChannel *incumbent = renderer.StartSound (sound, 0.5f, 128, 0, SNDF_LOOP, NULL);
+		FISoundChannel *nonLoop = new FISoundChannel;
+		int activeBefore = (int)renderer.ActiveChannels.size ();
+		Check (renderer.StartSound (sound, 0.5f, std::numeric_limits<int>::max (), 80, 0, nonLoop) == NULL &&
+			incumbent != NULL && incumbent->SysChannel != NULL && (int)renderer.ActiveChannels.size () == activeBefore,
+			"out-of-range restart conversion rejects non-loop sounds before source eviction");
+		StopAndDrain (renderer, incumbent);
+		FISoundChannel *loop = new FISoundChannel;
+		loop->StartTime.AsOne = 0;
+		FISoundChannel *looped = renderer.StartSound (sound, 0.5f, std::numeric_limits<int>::max (), 80, SNDF_LOOP, loop);
+		unsigned int expected = (unsigned int)(std::numeric_limits<unsigned long long>::max () % openalSound->Frames);
+		Check (looped == loop && abs ((int)SourceOffset (loop) - (int)expected) <= 1,
+			"clamped restart conversion preserves looping phase semantics");
+		StopAndDrain (renderer, loop);
+		ReleaseOwner (incumbent);
+		ReleaseOwner (nonLoop);
+		ReleaseOwner (loop);
+		renderer.UnloadSound (sound);
+		renderer.PausableOutputFrames = 0;
+		renderer.PausableFrameRemainder = 0;
+		renderer.LastClockMilliseconds = TestMilliseconds;
+	}
+
+	void TestRestartPositions (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		std::vector<BYTE> samples = MakeSamples (8000);
+		SoundHandle loopSound = renderer.LoadSoundRaw (&samples[0], (int)samples.size (), 8000, 1, -16, 100, 500);
+		AdvanceTestClock (renderer, 1000);
+		FISoundChannel *saved = new FISoundChannel;
+		saved->StartTime.AsOne = 321;
+		FISoundChannel *restored = renderer.StartSound (loopSound, 0.5f, 128, 80, SNDF_LOOP | SNDF_ABSTIME, saved);
+		Check (restored == saved && abs ((int)SourceOffset (saved) - 321) <= 1, "looping SNDF_ABSTIME seeks the direct saved sample frame within one frame");
+		AdvanceTestClock (renderer, 100);
+		FISoundChannel *evictor = renderer.StartSound (loopSound, 0.5f, 128, 81, SNDF_LOOP, NULL);
+		Check (evictor != NULL && saved->SysChannel == NULL && renderer.GetPosition (saved) > 0,
+			"restored ABSTIME channel retains a serializable logical phase after eviction");
+		StopAndDrain (renderer, evictor);
+		FISoundChannel *restoredAgain = renderer.StartSound (loopSound, 0.5f, 128, 80, SNDF_LOOP, saved);
+		unsigned long long elapsed = (unsigned long long)renderer.GetOutputRate () * 100 / 1000;
+		unsigned long long elapsedSamples = 321 + (unsigned long long)((long double)elapsed * 8000 / renderer.GetOutputRate ());
+		unsigned int expected = ExpectedLoopPosition (elapsedSamples, 100, 500);
+		Check (restoredAgain == saved && abs ((int)SourceOffset (saved) - (int)expected) <= 2, "re-evicted ABSTIME loop restarts through elapsed clock semantics");
+		StopAndDrain (renderer, saved);
+		ReleaseOwner (saved);
+		ReleaseOwner (evictor);
+
+		FISoundChannel *evicted = renderer.StartSound (loopSound, 0.5f, 192, 80, SNDF_LOOP, NULL);
+		Check (evicted != NULL, "pitched loop restart fixture starts");
+		AdvanceTestClock (renderer, 101);
+		StopAndDrain (renderer, evicted);
+		unsigned long long clock = renderer.PausableOutputFrames;
+		elapsed = clock - evicted->StartTime.AsOne;
+		elapsedSamples = (unsigned long long)((long double)elapsed * 8000 * 1.5f / renderer.GetOutputRate ());
+		expected = elapsedSamples < 100 ? (unsigned int)elapsedSamples : 100 + (unsigned int)((elapsedSamples - 100) % 400);
+		FISoundChannel *restarted = renderer.StartSound (loopSound, 0.5f, 192, 80, SNDF_LOOP, evicted);
+		int tolerance = (8000 + 34) / 35 + 2;
+		Check (restarted == evicted && abs ((int)SourceOffset (evicted) - (int)expected) <= tolerance, "ordinary pitched loop restart preserves intro then loop phase with pitch conversion");
+		StopAndDrain (renderer, evicted);
+		ReleaseOwner (evicted);
+
+		int outputRate = (int)renderer.GetOutputRate ();
+		std::vector<BYTE> clockSamples = MakeSamples (1000);
+		SoundHandle clockLoop = renderer.LoadSoundRaw (&clockSamples[0], (int)clockSamples.size (), outputRate, 1, -16, 100, 500);
+		AdvanceTestClock (renderer, 1000);
+		unsigned int elapsedCases[] = { 100, 500, 1301 };
+		unsigned int expectedCases[] = { 100, 100, 101 };
+		for (unsigned int index = 0; index < sizeof (elapsedCases) / sizeof (elapsedCases[0]); ++index)
+		{
+			FISoundChannel *loopRestart = new FISoundChannel;
+			loopRestart->StartTime.AsOne = renderer.PausableOutputFrames - elapsedCases[index];
+			FISoundChannel *looped = renderer.StartSound (clockLoop, 0.5f, 128, 80, SNDF_LOOP, loopRestart);
+			Check (looped == loopRestart && abs ((int)SourceOffset (loopRestart) - (int)expectedCases[index]) <= 1, "ordinary custom-loop restart handles loop boundaries and multiple loops");
+			StopAndDrain (renderer, loopRestart);
+			ReleaseOwner (loopRestart);
+		}
+		renderer.UnloadSound (clockLoop);
+
+		FISoundChannel *expired = new FISoundChannel;
+		AdvanceTestClock (renderer, 2000);
+		expired->StartTime.AsOne = 0;
+		Check (renderer.StartSound (sound, 0.5f, 128, 80, 0, expired) == NULL, "ordinary non-loop restart rejects elapsed sounds past their end");
+		ReleaseOwner (expired);
+
+		FISoundChannel *incumbent = renderer.StartSound (loopSound, 0.5f, 128, 0, SNDF_LOOP, NULL);
+		FISoundChannel *invalidRestart = new FISoundChannel;
+		invalidRestart->StartTime.AsOne = 0;
+		int activeBefore = (int)renderer.ActiveChannels.size ();
+		int freeBefore = renderer.AllocatedSources - activeBefore;
+		Check (renderer.StartSound (sound, 0.5f, 128, 80, 0, invalidRestart) == NULL && incumbent != NULL && incumbent->SysChannel != NULL &&
+			(int)renderer.ActiveChannels.size () == activeBefore && renderer.AllocatedSources - (int)renderer.ActiveChannels.size () == freeBefore,
+			"invalid full-pool restart preserves the active candidate and source accounting");
+		StopAndDrain (renderer, incumbent);
+		ReleaseOwner (incumbent);
+		ReleaseOwner (invalidRestart);
+		renderer.UnloadSound (loopSound);
+	}
+
+	void TestClockWrap (OpenALSoundRenderer &renderer)
+	{
+		unsigned long long pausableBefore = renderer.PausableOutputFrames;
+		unsigned long long nonPausableBefore = renderer.NonPausableOutputFrames;
+		renderer.PausableFrameRemainder = 0;
+		renderer.NonPausableFrameRemainder = 0;
+		renderer.LastClockMilliseconds = 0xfffffff0u;
+		TestMilliseconds = 0x00000010u;
+		renderer.UpdateSounds ();
+		unsigned long long expectedFrames = (unsigned long long)renderer.GetOutputRate () * 32 / 1000;
+		Check (renderer.PausableOutputFrames == pausableBefore + expectedFrames && renderer.NonPausableOutputFrames == nonPausableBefore + expectedFrames, "wrapping host milliseconds advances both logical clocks by the unsigned delta");
 	}
 
 	void TestEqualPriorityOrdering (OpenALSoundRenderer &renderer, SoundHandle sound)
@@ -305,6 +608,43 @@ namespace
 		ReleaseOwner (stopped);
 		ReleaseOwner (replacement);
 	}
+
+	void TestEvictedOwnerReuseAfterFailedStart (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		FISoundChannel *evicted = renderer.StartSound (sound, 0.1f, 128, 0, SNDF_LOOP, NULL);
+		AdvanceTestClock (renderer, 100);
+		FISoundChannel *evictor = renderer.StartSound (sound, 0.9f, 128, 80, SNDF_LOOP, NULL);
+		unsigned int savedPosition = renderer.GetPosition (evicted);
+		Check (evicted != NULL && evictor != NULL && evicted->SysChannel == NULL && savedPosition > 0,
+			"evicted looping owner retains a nonzero logical phase for saving");
+		StopAndDrain (renderer, evictor);
+		FISoundChannel *restored = renderer.StartSound (sound, 0.1f, 128, 0, SNDF_LOOP, evicted);
+		Check (restored == evicted && abs ((int)SourceOffset (restored) - (int)savedPosition) <= 2,
+			"valid evicted owner restarts at its saved logical phase");
+
+		FISoundChannel *replacement = renderer.StartSound (sound, 0.9f, 128, 80, SNDF_LOOP, NULL);
+		Check (replacement != NULL && evicted->SysChannel == NULL, "restart owner can be evicted again before logical replacement");
+		ReleaseOwner (evictor);
+		ReleaseOwnerForReuse (evicted);
+		renderer.InjectStartFailureForTest ();
+		Check (renderer.StartSound (sound, 0.5f, 128, 81, SNDF_LOOP, NULL) == NULL,
+			"injected physical start failure reaches high-level looping fallback");
+		FISoundChannel *reused = S_GetChannel (NULL);
+		Check (reused == evicted && reused->SysChannel == NULL && renderer.GetPosition (reused) == 0,
+			"deserialize-style owner reuse cannot serialize the old logical phase before MarkStartTime");
+		reused->StartTime.AsOne = 321;
+		renderer.InjectStartFailureForTest ();
+		Check (renderer.StartSound (sound, 0.5f, 128, 81, SNDF_LOOP | SNDF_ABSTIME, reused) == NULL &&
+			reused->SysChannel == NULL && renderer.GetPosition (reused) == 0,
+			"failed deserialize-style ABSTIME restart keeps the old logical phase hidden before retry");
+		FISoundChannel *retried = renderer.StartSound (sound, 0.5f, 128, 81, SNDF_LOOP | SNDF_ABSTIME, reused);
+		Check (retried == reused && abs ((int)SourceOffset (retried) - 321) <= 1 &&
+			abs ((int)renderer.GetPosition (retried) - 321) <= 1,
+			"retried deserialize-style ABSTIME restart uses its direct saved position");
+		StopAndDrain (renderer, reused);
+		ReleaseOwner (reused);
+		ReleaseOwner (replacement);
+	}
 }
 	void TestFailedStartDoesNotPublish (OpenALSoundRenderer &renderer, SoundHandle sound)
 	{
@@ -317,6 +657,112 @@ namespace
 		Check (Events.size () == eventCount, "injected OpenAL start failure does not notify high-level channel end");
 		Check (renderer.ActiveChannels.empty () && renderer.AllocatedSources - (int)renderer.ActiveChannels.size () == freeSources, "injected OpenAL start failure recovers source baseline");
 		Check (openalSound->References == 0, "injected OpenAL start failure does not retain sound reference");
+		renderer.SetSfxPaused (true, 1);
+		AdvanceTestClock (renderer, 100);
+		renderer.InjectStartFailureForTest ();
+		FISoundChannel *failedNoPause = renderer.StartSound (sound, 0.5f, 128, 0, SNDF_LOOP | SNDF_NOPAUSE, NULL);
+		FISoundChannel *evictedLoop = new FISoundChannel;
+		renderer.MarkStartTime (evictedLoop);
+		Check (failedNoPause == NULL && evictedLoop->StartTime.AsOne == renderer.NonPausableOutputFrames, "failed NOPAUSE start records the immediate nonpausable clock class");
+		renderer.SetSfxPaused (false, 1);
+		ReleaseOwner (evictedLoop);
+	}
+
+	static bool TestDelayedLoopHandoff (std::vector<BYTE> &loopSamples)
+	{
+		FISoundChannel *loopOwner = NULL;
+		unsigned int loopCursor = 0;
+		{
+			OpenALSoundRenderer oldRenderer;
+			Check (oldRenderer.IsValid (), "old renderer initializes for cross-renderer reset handoff");
+			if (!oldRenderer.IsValid ())
+			{
+				return false;
+			}
+			SoundHandle loopSound = oldRenderer.LoadSoundRaw (&loopSamples[0], (int)loopSamples.size (), 8000, 1, -16, 100, 500);
+			loopOwner = oldRenderer.StartSound (loopSound, 0.5f, 192, 0, SNDF_LOOP, NULL);
+			TestMilliseconds += 137;
+			FISoundChannel *loopEvictor = oldRenderer.StartSound (loopSound, 0.5f, 128, 80, SNDF_LOOP, NULL);
+			Check (loopOwner != NULL && loopEvictor != NULL && loopOwner->SysChannel == NULL,
+				"pool eviction leaves the pitched loop resolver owner detached");
+			TestMilliseconds += 25;
+			unsigned long long delayedOutputFrames = (unsigned long long)oldRenderer.GetOutputRate () * 162 / 1000;
+			unsigned long long delayedSampleFrames = delayedOutputFrames * 8000 * 3 / (2 * (unsigned int)oldRenderer.GetOutputRate ());
+			unsigned int expectedLoopCursor = ExpectedLoopPosition (delayedSampleFrames, 100, 500);
+			Check (oldRenderer.ResolveEvictedPosition (loopOwner, &loopCursor) && abs ((int)loopCursor - (int)expectedLoopCursor) <= 2,
+				"old renderer resolves the delayed pitched custom-loop cursor");
+			StopAndDrain (oldRenderer, loopEvictor);
+			ReleaseOwner (loopEvictor);
+			oldRenderer.UnloadSound (loopSound);
+		}
+		if (loopOwner != NULL)
+		{
+			OpenALSoundRenderer freshRenderer;
+			Check (freshRenderer.IsValid (), "fresh renderer initializes for cross-renderer loop restore");
+			if (freshRenderer.IsValid ())
+			{
+				SoundHandle loopSound = freshRenderer.LoadSoundRaw (&loopSamples[0], (int)loopSamples.size (), 8000, 1, -16, 100, 500);
+				loopOwner->StartTime.AsOne = loopCursor;
+				FISoundChannel *restored = freshRenderer.StartSound (loopSound, 0.5f, 192, 80, SNDF_LOOP | SNDF_ABSTIME, loopOwner);
+				Check (restored == loopOwner && abs ((int)SourceOffset (loopOwner) - (int)loopCursor) <= 2,
+					"fresh renderer restores the durable loop cursor within two source frames");
+				StopAndDrain (freshRenderer, loopOwner);
+				freshRenderer.UnloadSound (loopSound);
+			}
+			ReleaseOwner (loopOwner);
+		}
+		return true;
+	}
+
+	static void TestDelayedOneShotHandoff (std::vector<BYTE> &oneShotSamples)
+	{
+		FISoundChannel *oneShotOwner = NULL;
+		unsigned int expiredPosition = 0;
+		{
+			OpenALSoundRenderer oldRenderer;
+			Check (oldRenderer.IsValid (), "old renderer initializes for expired one-shot handoff");
+			if (!oldRenderer.IsValid ())
+			{
+				return;
+			}
+			SoundHandle oneShotSound = oldRenderer.LoadSoundRaw (&oneShotSamples[0], (int)oneShotSamples.size (), 8000, 1, -16, -1);
+			oneShotOwner = oldRenderer.StartSound (oneShotSound, 0.5f, 128, 0, 0, NULL);
+			TestMilliseconds += 10;
+			FISoundChannel *oneShotEvictor = oldRenderer.StartSound (oneShotSound, 0.5f, 128, 80, SNDF_LOOP, NULL);
+			Check (oneShotOwner != NULL && oneShotEvictor != NULL && oneShotOwner->SysChannel == NULL,
+				"pool eviction leaves the expired one-shot resolver owner detached");
+			TestMilliseconds += 20;
+			Check (oldRenderer.ResolveEvictedPosition (oneShotOwner, &expiredPosition) && expiredPosition == 160,
+				"old renderer resolves the delayed expired one-shot sample-frame sentinel");
+			StopAndDrain (oldRenderer, oneShotEvictor);
+			ReleaseOwner (oneShotEvictor);
+			oldRenderer.UnloadSound (oneShotSound);
+		}
+		if (oneShotOwner != NULL)
+		{
+			OpenALSoundRenderer freshRenderer;
+			Check (freshRenderer.IsValid (), "fresh renderer initializes for expired one-shot restore");
+			if (freshRenderer.IsValid ())
+			{
+				SoundHandle oneShotSound = freshRenderer.LoadSoundRaw (&oneShotSamples[0], (int)oneShotSamples.size (), 8000, 1, -16, -1);
+				oneShotOwner->StartTime.AsOne = expiredPosition;
+				Check (freshRenderer.StartSound (oneShotSound, 0.5f, 128, 80, SNDF_ABSTIME, oneShotOwner) == NULL,
+					"fresh renderer rejects the expired one-shot sample-frame sentinel");
+				freshRenderer.UnloadSound (oneShotSound);
+			}
+			ReleaseOwner (oneShotOwner);
+		}
+	}
+
+	void TestCrossRendererResetHandoff ()
+	{
+		std::vector<BYTE> loopSamples = MakeSamples (8000);
+		std::vector<BYTE> oneShotSamples = MakeSamples (160);
+		if (!TestDelayedLoopHandoff (loopSamples))
+		{
+			return;
+		}
+		TestDelayedOneShotHandoff (oneShotSamples);
 	}
 
 
@@ -343,7 +789,12 @@ float S_GetRolloff (FRolloffInfo *rolloff, float distance, bool)
 
 FISoundChannel *S_GetChannel (void *syschan)
 {
-	FISoundChannel *channel = new FISoundChannel;
+	FISoundChannel *channel = ForcedNextOwner;
+	ForcedNextOwner = NULL;
+	if (channel == NULL)
+	{
+		channel = new FISoundChannel;
+	}
 	channel->SysChannel = syschan;
 	return channel;
 }
@@ -384,6 +835,7 @@ int main ()
 		}
 		TestPriorityOrdering (priorityRenderer, prioritySound);
 		TestEffectiveGainOrdering (priorityRenderer, prioritySound);
+		TestPauseReasonsAndClocks (priorityRenderer, prioritySound);
 		priorityRenderer.UnloadSound (prioritySound);
 	}
 	snd_channels.Value = 1;
@@ -413,8 +865,16 @@ int main ()
 	TestExplicitStop (renderer, longSound);
 	TestNaturalFinish (renderer, shortSound);
 	TestImmediateReuseAfterExplicitStop (renderer, longSound, shortSound);
+	TestEvictedOwnerReuseAfterFailedStart (renderer, longSound);
 	TestFailedStartDoesNotPublish (renderer, longSound);
 	Test3DState (renderer, stereoSound);
+	TestInactiveMuteAndComplete (renderer, longSound);
+	TestRestartPositions (renderer, longSound);
+	TestEarlyClockAbstimeRestart (renderer);
+	TestLongClockRestartBounds (renderer);
+	TestRestartConversionBounds (renderer);
+	TestClockWrap (renderer);
+	TestCrossRendererResetHandoff ();
 
 	renderer.UnloadSound (longSound);
 	renderer.UnloadSound (shortSound);

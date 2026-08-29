@@ -14,6 +14,7 @@
 #else
 #include "c_cvars.h"
 #include "c_console.h"
+#include "i_system.h"
 #include "s_sound.h"
 #include "v_text.h"
 #endif
@@ -30,6 +31,74 @@ EXTERN_CVAR (Int, snd_channels)
 EXTERN_CVAR (String, snd_openal_device)
 EXTERN_CVAR (Float, snd_sfxvolume)
 EXTERN_CVAR (Bool, snd_pitched)
+
+enum
+{
+	OALPAUSE_Gameplay = 1,
+	OALPAUSE_Inactive = 2,
+	OALPAUSE_Sync = 4
+};
+
+static unsigned long long SaturatingAdd (unsigned long long left, unsigned long long right)
+{
+	return std::numeric_limits<unsigned long long>::max () - left < right ?
+		std::numeric_limits<unsigned long long>::max () : left + right;
+}
+
+static bool ConvertOutputFramesToSampleFrames (unsigned long long outputFrames, unsigned int sampleRate, float pitch, int outputRate, unsigned long long *sampleFrames)
+{
+	long double converted;
+	if (sampleRate == 0 || outputRate <= 0 || pitch != pitch || pitch <= 0.f || pitch > std::numeric_limits<float>::max ())
+	{
+		return false;
+	}
+	converted = ((long double)outputFrames * sampleRate * pitch) / outputRate;
+	if (converted != converted || converted >= (long double)std::numeric_limits<unsigned long long>::max ())
+	{
+		*sampleFrames = std::numeric_limits<unsigned long long>::max ();
+	}
+	else
+	{
+		*sampleFrames = (unsigned long long)converted;
+	}
+	return true;
+}
+
+static bool CalculateRestartPosition (unsigned long long startPosition, unsigned long long elapsedOutputFrames, unsigned int sampleRate, float pitch, int outputRate, bool looping, unsigned int frames, unsigned int loopStart, unsigned int loopEnd, unsigned int *position)
+{
+	unsigned long long elapsedSampleFrames;
+	unsigned long long sampleFrame;
+	if (!ConvertOutputFramesToSampleFrames (elapsedOutputFrames, sampleRate, pitch, outputRate, &elapsedSampleFrames))
+	{
+		return false;
+	}
+	sampleFrame = SaturatingAdd (startPosition, elapsedSampleFrames);
+	if (!looping)
+	{
+		if (sampleFrame >= frames)
+		{
+			return false;
+		}
+		*position = (unsigned int)sampleFrame;
+		return true;
+	}
+	if (loopEnd <= loopStart)
+	{
+		return false;
+	}
+	*position = sampleFrame < loopStart ? (unsigned int)sampleFrame :
+		loopStart + (unsigned int)((sampleFrame - loopStart) % (loopEnd - loopStart));
+	return true;
+}
+
+static unsigned int GetHostMilliseconds ()
+{
+#ifdef OAL_LIFECYCLE_TEST
+	return OALTestMilliseconds ();
+#else
+	return I_MSTime ();
+#endif
+}
 
 static FVector3 ToOpenALCoordinates (const FVector3 &vector)
 {
@@ -49,7 +118,8 @@ OpenALSound::OpenALSound ()
 OpenALChannel::OpenALChannel ()
 	: Source (0), Sound (NULL), Owner (NULL), Gain (0.f), Pitch (1.f), Priority (0),
 	  RolloffGain (1.f), EffectiveGain (0.f), Distance (0.f), DistanceScale (1.f),
-	  CachedPosition (0), AllocationSerial (0), Looping (false), Is3D (false), IsArea (false), Rolloff (), EndReason (OALEND_None),
+	  CachedPosition (0), LogicalStartFrame (0), AllocationSerial (0), Looping (false), NoPause (false), Is3D (false), IsArea (false),
+	  WasPlayingBeforePause (false), PauseReasons (0), Rolloff (), EndReason (OALEND_None),
 	  FinalizeState (OALFINAL_Active)
 {
 }
@@ -57,12 +127,16 @@ OpenALChannel::OpenALChannel ()
 OpenALSoundRenderer::OpenALSoundRenderer ()
 	: Device (NULL), Context (NULL), Sources (NULL), RequestedSources (0),
 	  AllocatedSources (0), OutputRate (0), InitSuccess (false), SfxVolume (1.f),
-	  MusicVolume (1.f), NextAllocationSerial (0)
+		MusicVolume (1.f), NextAllocationSerial (0), NextLogicalPositionToken (~0ull), PausableOutputFrames (0),
+	  NonPausableOutputFrames (0), PausableFrameRemainder (0), NonPausableFrameRemainder (0),
+	  LastClockMilliseconds (0), SfxPaused (0), InactiveState (INACTIVE_Active),
+	  SyncPaused (false), PendingStartNoPause (false)
 #ifdef OAL_LIFECYCLE_TEST
 	  , FailNextStart (false)
 #endif
 {
 	InitSuccess = Init ();
+	LastClockMilliseconds = GetHostMilliseconds ();
 }
 
 OpenALSoundRenderer::~OpenALSoundRenderer ()
@@ -390,6 +464,272 @@ bool OpenALSoundRenderer::IsSourceReserved (unsigned int source) const
 	return std::find (RetiringSources.begin (), RetiringSources.end (), source) != RetiringSources.end ();
 }
 
+void OpenALSoundRenderer::AdvanceClocks ()
+{
+	unsigned int now = GetHostMilliseconds ();
+	unsigned int elapsed = now - LastClockMilliseconds;
+	LastClockMilliseconds = now;
+	if (elapsed == 0 || OutputRate <= 0)
+	{
+		return;
+	}
+	if (SfxPaused == 0 && InactiveState != INACTIVE_Complete && !SyncPaused)
+	{
+		unsigned long long frames = (unsigned long long)elapsed * OutputRate + PausableFrameRemainder;
+		PausableFrameRemainder = (unsigned int)(frames % 1000);
+		frames /= 1000;
+		PausableOutputFrames = std::numeric_limits<unsigned long long>::max () - PausableOutputFrames < frames ?
+			std::numeric_limits<unsigned long long>::max () : PausableOutputFrames + frames;
+	}
+	if (InactiveState != INACTIVE_Complete && !SyncPaused)
+	{
+		unsigned long long frames = (unsigned long long)elapsed * OutputRate + NonPausableFrameRemainder;
+		NonPausableFrameRemainder = (unsigned int)(frames % 1000);
+		frames /= 1000;
+		NonPausableOutputFrames = std::numeric_limits<unsigned long long>::max () - NonPausableOutputFrames < frames ?
+			std::numeric_limits<unsigned long long>::max () : NonPausableOutputFrames + frames;
+	}
+}
+
+void OpenALSoundRenderer::InitializePauseState (OpenALChannel *channel)
+{
+	channel->PauseReasons = (!channel->NoPause && SfxPaused != 0 ? OALPAUSE_Gameplay : 0) |
+		(InactiveState == INACTIVE_Complete ? OALPAUSE_Inactive : 0) | (SyncPaused ? OALPAUSE_Sync : 0);
+}
+
+void OpenALSoundRenderer::ApplyChannelPauseState (OpenALChannel *channel)
+{
+	ALint state = AL_STOPPED;
+	if (channel == NULL || channel->FinalizeState != OALFINAL_Active)
+	{
+		return;
+	}
+	if (channel->PauseReasons != 0)
+	{
+		alGetSourcei (channel->Source, AL_SOURCE_STATE, &state);
+		if (state == AL_PLAYING)
+		{
+			channel->WasPlayingBeforePause = true;
+			alSourcePause (channel->Source);
+		}
+	}
+	else if (channel->WasPlayingBeforePause)
+	{
+		channel->WasPlayingBeforePause = false;
+		alSourcePlay (channel->Source);
+	}
+}
+
+unsigned long long OpenALSoundRenderer::GetChannelClock (bool noPause) const
+{
+	return noPause ? NonPausableOutputFrames : PausableOutputFrames;
+}
+
+bool OpenALSoundRenderer::PrepareRestart (OpenALSound *sound, float pitch, bool looping, bool noPause, FISoundChannel *reuseChan, int flags, RestartState *restart) const
+{
+	unsigned long long selectedClock = GetChannelClock (noPause);
+	unsigned long long elapsedOutputFrames;
+	unsigned long long savedPosition;
+	const LogicalPosition *logicalPosition;
+	unsigned int loopStart = sound->HasLoop ? sound->LoopStart : 0;
+	unsigned int loopEnd = sound->HasLoop ? sound->LoopEnd : sound->Frames;
+	restart->Position = 0;
+	restart->ClockFrame = selectedClock;
+	if (reuseChan == NULL)
+	{
+		return true;
+	}
+	if (OutputRate <= 0 || sound->SampleRate == 0 || pitch <= 0.f)
+	{
+		return false;
+	}
+	if (flags & SNDF_ABSTIME)
+	{
+		savedPosition = reuseChan->StartTime.AsOne;
+		if (savedPosition >= sound->Frames)
+		{
+			return false;
+		}
+		restart->Position = (unsigned int)savedPosition;
+		return true;
+	}
+	logicalPosition = FindLogicalPosition (reuseChan);
+	if (logicalPosition != NULL && logicalPosition->OwnerToken != 0 && logicalPosition->Sound == sound &&
+		reuseChan->StartTime.AsOne == logicalPosition->OwnerToken)
+	{
+		elapsedOutputFrames = selectedClock >= logicalPosition->StartClock ? selectedClock - logicalPosition->StartClock : 0;
+		return CalculateRestartPosition (logicalPosition->StartPosition, elapsedOutputFrames, logicalPosition->SampleRate,
+			logicalPosition->Pitch, OutputRate, logicalPosition->Looping, logicalPosition->Frames,
+			logicalPosition->LoopStart, logicalPosition->LoopEnd, &restart->Position);
+	}
+	elapsedOutputFrames = selectedClock >= reuseChan->StartTime.AsOne ? selectedClock - reuseChan->StartTime.AsOne : 0;
+	return CalculateRestartPosition (0, elapsedOutputFrames, sound->SampleRate, pitch, OutputRate, looping,
+		sound->Frames, loopStart, loopEnd, &restart->Position);
+}
+
+OpenALChannel *OpenALSoundRenderer::CreateChannel (unsigned int source, OpenALSound *sound, float volume, float pitch, int priority, int flags)
+{
+	OpenALChannel *channel = new OpenALChannel;
+	channel->Source = source;
+	channel->Sound = sound;
+	channel->Gain = volume;
+	channel->Pitch = pitch;
+	channel->Priority = priority;
+	channel->Looping = (flags & SNDF_LOOP) != 0;
+	channel->NoPause = (flags & SNDF_NOPAUSE) != 0;
+	channel->AllocationSerial = ++NextAllocationSerial;
+	InitializePauseState (channel);
+	return channel;
+}
+
+unsigned int OpenALSoundRenderer::AcquireSource (int priority, float effectiveGain)
+{
+	unsigned int source = FindFreeSource ();
+	OpenALChannel *candidate;
+	if (source == 0 && FinalizePendingStopForReuse ())
+	{
+		source = FindFreeSource ();
+	}
+	if (source != 0)
+	{
+		return source;
+	}
+	candidate = FindEvictionCandidate ();
+	if (!IncomingWins (candidate, priority, effectiveGain))
+	{
+		return 0;
+	}
+	FinalizeChannel (candidate, OALEND_PoolEviction);
+	return FindFreeSource ();
+}
+
+unsigned long long OpenALSoundRenderer::AllocateLogicalPositionToken ()
+{
+	if (NextLogicalPositionToken <= 0xffffffffull)
+	{
+		NextLogicalPositionToken = ~0ull;
+	}
+	return NextLogicalPositionToken--;
+}
+
+bool OpenALSoundRenderer::ApplyRestartPosition (OpenALChannel *channel, const RestartState &restart)
+{
+	alSourcei (channel->Source, AL_SAMPLE_OFFSET, (ALint)restart.Position);
+	if (alGetError () != AL_NO_ERROR)
+	{
+		return false;
+	}
+	channel->CachedPosition = restart.Position;
+	channel->LogicalStartFrame = restart.ClockFrame;
+	return true;
+}
+
+const OpenALSoundRenderer::LogicalPosition *OpenALSoundRenderer::FindLogicalPosition (FISoundChannel *owner) const
+{
+	for (size_t index = 0; index < LogicalPositions.size (); ++index)
+	{
+		if (LogicalPositions[index].Owner == owner)
+		{
+			return &LogicalPositions[index];
+		}
+	}
+	return NULL;
+}
+
+void OpenALSoundRenderer::RememberLogicalPosition (FISoundChannel *owner, OpenALChannel *channel, const RestartState &restart)
+{
+	LogicalPosition *logicalPosition = const_cast<LogicalPosition *> (FindLogicalPosition (owner));
+	if (logicalPosition == NULL)
+	{
+		LogicalPositions.push_back (LogicalPosition ());
+		logicalPosition = &LogicalPositions.back ();
+	}
+	logicalPosition->Owner = owner;
+	logicalPosition->Sound = channel->Sound;
+	logicalPosition->StartClock = restart.ClockFrame;
+	logicalPosition->StartPosition = restart.Position;
+	logicalPosition->OwnerToken = 0;
+	logicalPosition->SampleRate = channel->Sound->SampleRate;
+	logicalPosition->Frames = channel->Sound->Frames;
+	logicalPosition->LoopStart = channel->Sound->HasLoop ? channel->Sound->LoopStart : 0;
+	logicalPosition->LoopEnd = channel->Sound->HasLoop ? channel->Sound->LoopEnd : channel->Sound->Frames;
+	logicalPosition->Pitch = channel->Pitch;
+	logicalPosition->Looping = channel->Looping;
+	logicalPosition->NoPause = channel->NoPause;
+}
+
+void OpenALSoundRenderer::ForgetLogicalPosition (FISoundChannel *owner)
+{
+	for (size_t index = 0; index < LogicalPositions.size (); ++index)
+	{
+		if (LogicalPositions[index].Owner == owner)
+		{
+			LogicalPositions.erase (LogicalPositions.begin () + index);
+			return;
+		}
+	}
+}
+
+bool OpenALSoundRenderer::GetLogicalPosition (FISoundChannel *owner, unsigned int *position) const
+{
+	const LogicalPosition *logicalPosition = FindLogicalPosition (owner);
+	unsigned long long clock;
+	if (logicalPosition == NULL || logicalPosition->OwnerToken == 0 || owner == NULL ||
+		owner->StartTime.AsOne != logicalPosition->OwnerToken)
+	{
+		return false;
+	}
+	clock = GetChannelClock (logicalPosition->NoPause);
+	return CalculateRestartPosition (logicalPosition->StartPosition,
+		clock >= logicalPosition->StartClock ? clock - logicalPosition->StartClock : 0,
+		logicalPosition->SampleRate, logicalPosition->Pitch, OutputRate, logicalPosition->Looping,
+		logicalPosition->Frames, logicalPosition->LoopStart, logicalPosition->LoopEnd, position);
+}
+
+FISoundChannel *OpenALSoundRenderer::PublishChannel (OpenALChannel *channel, FISoundChannel *reuseChan, const RestartState &restart)
+{
+	FISoundChannel *owner;
+	if (!ApplyRestartPosition (channel, restart))
+	{
+		alSourceStop (channel->Source);
+		alSourcei (channel->Source, AL_BUFFER, 0);
+		delete channel;
+		return NULL;
+	}
+	alSourcePlay (channel->Source);
+#ifdef OAL_LIFECYCLE_TEST
+	if (FailNextStart)
+	{
+		FailNextStart = false;
+		alSourcei (channel->Source, 0, 0);
+	}
+#endif
+	if (alGetError () != AL_NO_ERROR)
+	{
+		alSourceStop (channel->Source);
+		alSourcei (channel->Source, AL_BUFFER, 0);
+		delete channel;
+		return NULL;
+	}
+	owner = reuseChan != NULL ? reuseChan : S_GetChannel (channel);
+	if (owner == NULL)
+	{
+		alSourceStop (channel->Source);
+		alSourcei (channel->Source, AL_BUFFER, 0);
+		delete channel;
+		return NULL;
+	}
+	channel->Owner = owner;
+	owner->SysChannel = channel;
+	owner->StartTime.AsOne = restart.ClockFrame;
+	RememberLogicalPosition (owner, channel, restart);
+	PendingStartNoPause = false;
+	++channel->Sound->References;
+	ActiveChannels.push_back (channel);
+	ApplyChannelPauseState (channel);
+	return owner;
+}
+
 #ifdef OAL_LIFECYCLE_TEST
 void OpenALSoundRenderer::InjectStartFailureForTest ()
 {
@@ -479,7 +819,7 @@ unsigned int OpenALSoundRenderer::CachePosition (OpenALChannel *channel)
 
 void OpenALSoundRenderer::ApplyChannelGain (OpenALChannel *channel)
 {
-	channel->EffectiveGain = channel->Gain * SfxVolume * channel->RolloffGain;
+	channel->EffectiveGain = InactiveState == INACTIVE_Mute ? 0.f : channel->Gain * SfxVolume * channel->RolloffGain;
 	alSourcef (channel->Source, AL_GAIN, channel->EffectiveGain);
 }
 
@@ -549,6 +889,19 @@ void OpenALSoundRenderer::FinalizeChannel (OpenALChannel *channel, OpenALEndReas
 	RetiringSources.push_back (channel->Source);
 	if (channel->Owner != NULL)
 	{
+		if (reason == OALEND_PoolEviction)
+		{
+			LogicalPosition *logicalPosition = const_cast<LogicalPosition *> (FindLogicalPosition (channel->Owner));
+			if (logicalPosition != NULL)
+			{
+				logicalPosition->OwnerToken = AllocateLogicalPositionToken ();
+				channel->Owner->StartTime.AsOne = logicalPosition->OwnerToken;
+			}
+		}
+		else
+		{
+			ForgetLogicalPosition (channel->Owner);
+		}
 		S_ChannelEnded (channel->Owner);
 	}
 	alSourceStop (channel->Source);
@@ -573,40 +926,26 @@ FISoundChannel *OpenALSoundRenderer::Start2D (SoundHandle sfx, float volume, int
 {
 	OpenALSound *sound = (OpenALSound *)sfx.data;
 	OpenALChannel *channel;
-	FISoundChannel *owner = NULL;
+	RestartState restart;
+	float pitchRatio;
 	unsigned int source;
+	AdvanceClocks ();
+	PendingStartNoPause = (flags & SNDF_NOPAUSE) != 0;
 	if (!InitSuccess || sound == NULL || sound->DeferredDelete || reuseChan != NULL && reuseChan->SysChannel != NULL)
 	{
 		return NULL;
 	}
-	source = FindFreeSource ();
-	if (source == 0 && FinalizePendingStopForReuse ())
+	pitchRatio = snd_pitched ? pitch / 128.f : 1.f;
+	if (!PrepareRestart (sound, pitchRatio, (flags & SNDF_LOOP) != 0, (flags & SNDF_NOPAUSE) != 0, reuseChan, flags, &restart))
 	{
-		source = FindFreeSource ();
+		return NULL;
 	}
+	source = AcquireSource (priority, volume * SfxVolume);
 	if (source == 0)
 	{
-		OpenALChannel *candidate = FindEvictionCandidate ();
-		if (!IncomingWins (candidate, priority, volume * SfxVolume))
-		{
-			return NULL;
-		}
-		FinalizeChannel (candidate, OALEND_PoolEviction);
-		source = FindFreeSource ();
-		if (source == 0)
-		{
-			return NULL;
-		}
+		return NULL;
 	}
-	channel = new OpenALChannel;
-	channel->Source = source;
-	channel->Sound = sound;
-	channel->Owner = owner;
-	channel->Gain = volume;
-	channel->Pitch = snd_pitched ? pitch / 128.f : 1.f;
-	channel->Priority = priority;
-	channel->Looping = (flags & SNDF_LOOP) != 0;
-	channel->AllocationSerial = ++NextAllocationSerial;
+	channel = CreateChannel (source, sound, volume, pitchRatio, priority, flags);
 
 	alGetError ();
 	alSourceStop (source);
@@ -617,34 +956,7 @@ FISoundChannel *OpenALSoundRenderer::Start2D (SoundHandle sfx, float volume, int
 	alSourcei (source, AL_LOOPING, channel->Looping ? AL_TRUE : AL_FALSE);
 	alSourcef (source, AL_PITCH, channel->Pitch);
 	ApplyChannelGain (channel);
-	alSourcePlay (source);
-#ifdef OAL_LIFECYCLE_TEST
-	if (FailNextStart)
-	{
-		FailNextStart = false;
-		alSourcei (source, 0, 0);
-	}
-#endif
-	if (alGetError () != AL_NO_ERROR)
-	{
-		alSourceStop (source);
-		alSourcei (source, AL_BUFFER, 0);
-		delete channel;
-		return NULL;
-	}
-	owner = reuseChan != NULL ? reuseChan : S_GetChannel (channel);
-	if (owner == NULL)
-	{
-		alSourceStop (source);
-		alSourcei (source, AL_BUFFER, 0);
-		delete channel;
-		return NULL;
-	}
-	channel->Owner = owner;
-	owner->SysChannel = channel;
-	++sound->References;
-	ActiveChannels.push_back (channel);
-	return owner;
+	return PublishChannel (channel, reuseChan, restart);
 }
 
 FISoundChannel *OpenALSoundRenderer::StartSound (SoundHandle sfx, float volume, int pitch, int priority, int flags, FISoundChannel *reuseChan)
@@ -656,52 +968,38 @@ FISoundChannel *OpenALSoundRenderer::StartSound3D (SoundHandle sfx, SoundListene
 {
 	OpenALSound *sound = (OpenALSound *)sfx.data;
 	OpenALChannel *channel;
-	FISoundChannel *owner = NULL;
+	RestartState restart;
 	float distance;
 	float rolloffGain;
 	float effectiveGain;
+	float pitchRatio;
 	unsigned int source;
+	AdvanceClocks ();
+	PendingStartNoPause = (flags & SNDF_NOPAUSE) != 0;
 	if (!InitSuccess || sound == NULL || sound->DeferredDelete || rolloff == NULL || reuseChan != NULL && reuseChan->SysChannel != NULL)
 	{
 		return NULL;
 	}
 	rolloffGain = CalculateRolloffGain (*rolloff, distscale, listener, pos, &distance);
 	effectiveGain = volume * SfxVolume * rolloffGain;
-	source = FindFreeSource ();
-	if (source == 0 && FinalizePendingStopForReuse ())
+	pitchRatio = snd_pitched ? pitch / 128.f : 1.f;
+	if (!PrepareRestart (sound, pitchRatio, (flags & SNDF_LOOP) != 0, (flags & SNDF_NOPAUSE) != 0, reuseChan, flags, &restart))
 	{
-		source = FindFreeSource ();
+		return NULL;
 	}
+	source = AcquireSource (priority, effectiveGain);
 	if (source == 0)
 	{
-		OpenALChannel *candidate = FindEvictionCandidate ();
-		if (!IncomingWins (candidate, priority, effectiveGain))
-		{
-			return NULL;
-		}
-		FinalizeChannel (candidate, OALEND_PoolEviction);
-		source = FindFreeSource ();
-		if (source == 0)
-		{
-			return NULL;
-		}
+		return NULL;
 	}
-	channel = new OpenALChannel;
-	channel->Source = source;
-	channel->Sound = sound;
-	channel->Owner = owner;
-	channel->Gain = volume;
+	channel = CreateChannel (source, sound, volume, pitchRatio, priority, flags);
 	channel->RolloffGain = rolloffGain;
 	channel->EffectiveGain = effectiveGain;
 	channel->Distance = distance;
 	channel->DistanceScale = distscale;
-	channel->Pitch = snd_pitched ? pitch / 128.f : 1.f;
-	channel->Priority = priority;
-	channel->Looping = (flags & SNDF_LOOP) != 0;
 	channel->Is3D = true;
 	channel->IsArea = (flags & SNDF_AREA) != 0;
 	channel->Rolloff = *rolloff;
-	channel->AllocationSerial = ++NextAllocationSerial;
 
 	alGetError ();
 	alSourceStop (source);
@@ -709,27 +1007,7 @@ FISoundChannel *OpenALSoundRenderer::StartSound3D (SoundHandle sfx, SoundListene
 	alSourcei (source, AL_LOOPING, channel->Looping ? AL_TRUE : AL_FALSE);
 	alSourcef (source, AL_PITCH, channel->Pitch);
 	ApplySpatialState (channel, listener, pos, vel);
-	alSourcePlay (source);
-	if (alGetError () != AL_NO_ERROR)
-	{
-		alSourceStop (source);
-		alSourcei (source, AL_BUFFER, 0);
-		delete channel;
-		return NULL;
-	}
-	owner = reuseChan != NULL ? reuseChan : S_GetChannel (channel);
-	if (owner == NULL)
-	{
-		alSourceStop (source);
-		alSourcei (source, AL_BUFFER, 0);
-		delete channel;
-		return NULL;
-	}
-	channel->Owner = owner;
-	owner->SysChannel = channel;
-	++sound->References;
-	ActiveChannels.push_back (channel);
-	return owner;
+	return PublishChannel (channel, reuseChan, restart);
 }
 
 void OpenALSoundRenderer::StopChannel (FISoundChannel *owner)
@@ -754,14 +1032,53 @@ void OpenALSoundRenderer::ChannelVolume (FISoundChannel *owner, float volume)
 	}
 }
 
-void OpenALSoundRenderer::MarkStartTime (FISoundChannel *)
+void OpenALSoundRenderer::MarkStartTime (FISoundChannel *channel)
 {
+	AdvanceClocks ();
+	if (channel != NULL)
+	{
+		ForgetLogicalPosition (channel);
+		channel->StartTime.AsOne = GetChannelClock (PendingStartNoPause);
+	}
+	PendingStartNoPause = false;
 }
 
 unsigned int OpenALSoundRenderer::GetPosition (FISoundChannel *owner)
 {
 	OpenALChannel *channel = owner == NULL ? NULL : (OpenALChannel *)owner->SysChannel;
-	return channel == NULL ? 0 : CachePosition (channel);
+	unsigned int position = 0;
+	AdvanceClocks ();
+	if (channel != NULL)
+	{
+		return CachePosition (channel);
+	}
+	return GetLogicalPosition (owner, &position) ? position : 0;
+}
+
+bool OpenALSoundRenderer::ResolveEvictedPosition (FISoundChannel *owner, unsigned int *position)
+{
+	const LogicalPosition *logicalPosition;
+	if (owner == NULL || position == NULL || owner->SysChannel != NULL)
+	{
+		return false;
+	}
+	AdvanceClocks ();
+	logicalPosition = FindLogicalPosition (owner);
+	if (logicalPosition == NULL || logicalPosition->OwnerToken == 0 ||
+		owner->StartTime.AsOne != logicalPosition->OwnerToken)
+	{
+		return false;
+	}
+	if (GetLogicalPosition (owner, position))
+	{
+		return true;
+	}
+	if (!logicalPosition->Looping && OutputRate > 0 && logicalPosition->SampleRate > 0 && logicalPosition->Pitch > 0.f)
+	{
+		*position = logicalPosition->Frames;
+		return true;
+	}
+	return false;
 }
 
 float OpenALSoundRenderer::GetAudibility (FISoundChannel *owner)
@@ -770,16 +1087,89 @@ float OpenALSoundRenderer::GetAudibility (FISoundChannel *owner)
 	return channel == NULL ? 0.f : channel->EffectiveGain;
 }
 
-void OpenALSoundRenderer::Sync (bool)
+void OpenALSoundRenderer::Sync (bool sync)
 {
+	AdvanceClocks ();
+	if (SyncPaused == sync)
+	{
+		return;
+	}
+	if (sync)
+	{
+		for (size_t index = 0; index < ActiveChannels.size (); ++index)
+		{
+			CachePosition (ActiveChannels[index]);
+		}
+	}
+	SyncPaused = sync;
+	for (size_t index = 0; index < ActiveChannels.size (); ++index)
+	{
+		OpenALChannel *channel = ActiveChannels[index];
+		if (sync)
+		{
+			channel->PauseReasons |= OALPAUSE_Sync;
+		}
+		else
+		{
+			channel->PauseReasons &= ~OALPAUSE_Sync;
+		}
+		ApplyChannelPauseState (channel);
+	}
 }
 
-void OpenALSoundRenderer::SetSfxPaused (bool, int)
+void OpenALSoundRenderer::SetSfxPaused (bool paused, int slot)
 {
+	unsigned int bit;
+	if (slot < 0 || slot >= 32)
+	{
+		return;
+	}
+	AdvanceClocks ();
+	bit = 1u << slot;
+	if (paused)
+	{
+		SfxPaused |= bit;
+	}
+	else
+	{
+		SfxPaused &= ~bit;
+	}
+	for (size_t index = 0; index < ActiveChannels.size (); ++index)
+	{
+		OpenALChannel *channel = ActiveChannels[index];
+		if (!channel->NoPause)
+		{
+			if (SfxPaused != 0)
+			{
+				channel->PauseReasons |= OALPAUSE_Gameplay;
+			}
+			else
+			{
+				channel->PauseReasons &= ~OALPAUSE_Gameplay;
+			}
+			ApplyChannelPauseState (channel);
+		}
+	}
 }
 
-void OpenALSoundRenderer::SetInactive (EInactiveState)
+void OpenALSoundRenderer::SetInactive (EInactiveState inactive)
 {
+	AdvanceClocks ();
+	InactiveState = inactive;
+	for (size_t index = 0; index < ActiveChannels.size (); ++index)
+	{
+		OpenALChannel *channel = ActiveChannels[index];
+		if (inactive == INACTIVE_Complete)
+		{
+			channel->PauseReasons |= OALPAUSE_Inactive;
+		}
+		else
+		{
+			channel->PauseReasons &= ~OALPAUSE_Inactive;
+		}
+		ApplyChannelGain (channel);
+		ApplyChannelPauseState (channel);
+	}
 }
 
 void OpenALSoundRenderer::UpdateSoundParams3D (SoundListener *listener, FISoundChannel *owner, bool areasound, const FVector3 &pos, const FVector3 &vel)
@@ -814,6 +1204,7 @@ void OpenALSoundRenderer::UpdateListener (SoundListener *listener)
 
 void OpenALSoundRenderer::UpdateSounds ()
 {
+	AdvanceClocks ();
 	for (size_t index = 0; index < ActiveChannels.size (); )
 	{
 		OpenALChannel *channel = ActiveChannels[index];

@@ -61,10 +61,14 @@ public:
 	float Pitch;
 	int Priority;
 	unsigned int CachedPosition;
+	unsigned long long LogicalStartFrame;
 	unsigned long long AllocationSerial;
 	bool Looping;
+	bool NoPause;
 	bool Is3D;
 	bool IsArea;
+	bool WasPlayingBeforePause;
+	unsigned int PauseReasons;
 	FRolloffInfo Rolloff;
 	OpenALEndReason EndReason;
 	OpenALFinalizeState FinalizeState;
@@ -94,6 +98,7 @@ public:
 	void ChannelVolume (FISoundChannel *chan, float volume);
 	void MarkStartTime (FISoundChannel *chan);
 	unsigned int GetPosition (FISoundChannel *chan);
+	bool ResolveEvictedPosition (FISoundChannel *chan, unsigned int *position);
 	float GetAudibility (FISoundChannel *chan);
 	void Sync (bool sync);
 	void SetSfxPaused (bool paused, int slot);
@@ -112,6 +117,28 @@ public:
 #else
 private:
 #endif
+	struct RestartState
+	{
+		unsigned int Position;
+		unsigned long long ClockFrame;
+	};
+
+	struct LogicalPosition
+	{
+		FISoundChannel *Owner;
+		OpenALSound *Sound;
+		unsigned long long StartClock;
+		unsigned long long StartPosition;
+		unsigned long long OwnerToken;
+		unsigned int SampleRate;
+		unsigned int Frames;
+		unsigned int LoopStart;
+		unsigned int LoopEnd;
+		float Pitch;
+		bool Looping;
+		bool NoPause;
+	};
+
 	bool Init ();
 	void Shutdown ();
 	const char *FindDeviceName (const char *name) const;
@@ -129,6 +156,20 @@ private:
 	void ApplySpatialState (OpenALChannel *channel, SoundListener *listener, const FVector3 &position, const FVector3 &velocity);
 	void DestroySound (OpenALSound *sound);
 	bool IsSourceReserved (unsigned int source) const;
+	void AdvanceClocks ();
+	bool PrepareRestart (OpenALSound *sound, float pitch, bool looping, bool noPause, FISoundChannel *reuseChan, int flags, RestartState *restart) const;
+	OpenALChannel *CreateChannel (unsigned int source, OpenALSound *sound, float volume, float pitch, int priority, int flags);
+	unsigned int AcquireSource (int priority, float effectiveGain);
+	bool ApplyRestartPosition (OpenALChannel *channel, const RestartState &restart);
+	FISoundChannel *PublishChannel (OpenALChannel *channel, FISoundChannel *reuseChan, const RestartState &restart);
+	unsigned long long AllocateLogicalPositionToken ();
+	const LogicalPosition *FindLogicalPosition (FISoundChannel *owner) const;
+	void RememberLogicalPosition (FISoundChannel *owner, OpenALChannel *channel, const RestartState &restart);
+	void ForgetLogicalPosition (FISoundChannel *owner);
+	bool GetLogicalPosition (FISoundChannel *owner, unsigned int *position) const;
+	void InitializePauseState (OpenALChannel *channel);
+	void ApplyChannelPauseState (OpenALChannel *channel);
+	unsigned long long GetChannelClock (bool noPause) const;
 
 #ifdef OAL_LIFECYCLE_TEST
 	void InjectStartFailureForTest ();
@@ -145,7 +186,18 @@ private:
 	float SfxVolume;
 	float MusicVolume;
 	unsigned long long NextAllocationSerial;
+	unsigned long long NextLogicalPositionToken;
+	unsigned long long PausableOutputFrames;
+	unsigned long long NonPausableOutputFrames;
+	unsigned int PausableFrameRemainder;
+	unsigned int NonPausableFrameRemainder;
+	unsigned int LastClockMilliseconds;
+	unsigned int SfxPaused;
+	EInactiveState InactiveState;
+	bool SyncPaused;
+	bool PendingStartNoPause;
 	std::vector<OpenALChannel *> ActiveChannels;
+	std::vector<LogicalPosition> LogicalPositions;
 	std::vector<unsigned int> RetiringSources;
 #ifdef OAL_LIFECYCLE_TEST
 	bool FailNextStart;

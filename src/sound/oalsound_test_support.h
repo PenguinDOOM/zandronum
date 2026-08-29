@@ -7,6 +7,12 @@
 
 typedef unsigned char BYTE;
 
+union OALTestQwordUnion
+{
+	struct { unsigned int Lo, Hi; };
+	unsigned long long AsOne;
+};
+
 class FString
 {
 public:
@@ -47,11 +53,13 @@ struct SoundHandle
 struct FISoundChannel
 {
 	FISoundChannel ()
-		: SysChannel (NULL), Priority (0)
+		: SysChannel (NULL), StartTime (), Priority (0)
 	{
+		StartTime.AsOne = 0;
 	}
 
 	void *SysChannel;
+	OALTestQwordUnion StartTime;
 	int Priority;
 };
 
@@ -111,7 +119,9 @@ enum
 
 enum EInactiveState
 {
-	INACTIVE_Complete
+	INACTIVE_Active,
+	INACTIVE_Complete,
+	INACTIVE_Mute
 };
 
 class SoundRenderer
@@ -134,6 +144,7 @@ public:
 	virtual void ChannelVolume (FISoundChannel *, float) = 0;
 	virtual void MarkStartTime (FISoundChannel *) = 0;
 	virtual unsigned int GetPosition (FISoundChannel *) = 0;
+	virtual bool ResolveEvictedPosition (FISoundChannel *, unsigned int *) { return false; }
 	virtual float GetAudibility (FISoundChannel *) = 0;
 	virtual void Sync (bool) = 0;
 	virtual void SetSfxPaused (bool, int) = 0;
@@ -181,7 +192,9 @@ public:
 
 #define EXTERN_CVAR(type, name) extern OALTest ## type ## CVar name;
 #define SNDF_LOOP 1
+#define SNDF_NOPAUSE 2
 #define SNDF_AREA 4
+#define SNDF_ABSTIME 8
 #define TEXTCOLOR_RED ""
 #define TEXTCOLOR_GREEN ""
 
@@ -203,6 +216,7 @@ inline int stricmp (const char *left, const char *right)
 
 void Printf (const char *format, ...);
 void DPrintf (const char *format, ...);
+unsigned int OALTestMilliseconds ();
 FISoundChannel *S_GetChannel (void *syschan);
 void S_ChannelEnded (FISoundChannel *channel);
 float S_GetRolloff (FRolloffInfo *rolloff, float distance, bool logarithmic);
