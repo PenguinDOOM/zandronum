@@ -1,5 +1,56 @@
 #!/bin/sh
-powershell.exe -NoProfile -ExecutionPolicy Bypass \
-    -File scripts/lint.ps1
+set -eu
 
-exit $?
+zero_oid="0000000000000000000000000000000000000000"
+
+while read -r local_ref local_oid remote_ref remote_oid
+do
+    # Ignore tag pushes and other non-branch refs.
+    case "$local_ref" in
+        refs/heads/*)
+            ;;
+        *)
+            continue
+            ;;
+    esac
+
+    # Deleted remote branch.
+    if [ "$local_oid" = "$zero_oid" ]; then
+        continue
+    fi
+
+    if [ "$remote_oid" = "$zero_oid" ]; then
+        # New remote branch.
+        #
+        # Find the oldest commit reachable from this branch that is not
+        # already reachable from any remote ref. Its parent is the base
+        # for the push delta.
+        first_new_commit="$(
+            git rev-list --reverse --topo-order "$local_oid" --not --remotes |
+            head -n 1
+        )"
+
+        if [ -z "$first_new_commit" ]; then
+            echo "No new commits require Cppcheck."
+            continue
+        fi
+
+        if base_oid="$(git rev-parse "${first_new_commit}^" 2>/dev/null)"; then
+            :
+        else
+            # Root commit: compare against an empty tree.
+            base_oid="$(git hash-object -t tree /dev/null)"
+        fi
+    else
+        # Existing remote branch: this is the exact range being pushed.
+        base_oid="$remote_oid"
+    fi
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass \
+        -File scripts/lint.ps1 \
+        -BaseSha "$base_oid" \
+        -HeadSha "$local_oid" ||
+        exit $?
+done
+
+exit 0
