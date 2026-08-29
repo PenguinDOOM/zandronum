@@ -54,11 +54,18 @@ public:
 	OpenALSound *Sound;
 	FISoundChannel *Owner;
 	float Gain;
+	float RolloffGain;
+	float EffectiveGain;
+	float Distance;
+	float DistanceScale;
 	float Pitch;
 	int Priority;
 	unsigned int CachedPosition;
 	unsigned long long AllocationSerial;
 	bool Looping;
+	bool Is3D;
+	bool IsArea;
+	FRolloffInfo Rolloff;
 	OpenALEndReason EndReason;
 	OpenALFinalizeState FinalizeState;
 };
@@ -112,12 +119,14 @@ private:
 	FISoundChannel *Start2D (SoundHandle sfx, float volume, int pitch, int flags, int priority, FISoundChannel *reuseChan);
 	unsigned int FindFreeSource () const;
 	OpenALChannel *FindEvictionCandidate () const;
-	bool IncomingWins (const OpenALChannel *candidate, int priority, float gain) const;
+	bool IncomingWins (const OpenALChannel *candidate, int priority, float effectiveGain) const;
 	bool FinalizePendingStopForReuse ();
 	void RemoveActiveChannel (OpenALChannel *channel);
 	void FinalizeChannel (OpenALChannel *channel, OpenALEndReason reason);
 	unsigned int CachePosition (OpenALChannel *channel);
 	void ApplyChannelGain (OpenALChannel *channel);
+	float CalculateRolloffGain (FRolloffInfo &rolloff, float distanceScale, SoundListener *listener, const FVector3 &position, float *distance) const;
+	void ApplySpatialState (OpenALChannel *channel, SoundListener *listener, const FVector3 &position, const FVector3 &velocity);
 	void DestroySound (OpenALSound *sound);
 	bool IsSourceReserved (unsigned int source) const;
 

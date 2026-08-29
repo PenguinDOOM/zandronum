@@ -1,6 +1,8 @@
 #include "oalsound.h"
 
+#include <AL/al.h>
 #include <chrono>
+#include <math.h>
 #include <stdio.h>
 #include <thread>
 #include <vector>
@@ -39,6 +41,30 @@ namespace
 	std::vector<BYTE> MakeSamples (unsigned int frames)
 	{
 		return std::vector<BYTE> ((size_t)frames * 2, 0);
+	}
+
+	std::vector<BYTE> MakeStereoSamples (unsigned int frames)
+	{
+		return std::vector<BYTE> ((size_t)frames * 4, 0);
+	}
+
+	bool NearlyEqual (float actual, float expected)
+	{
+		return fabsf (actual - expected) < 0.001f;
+	}
+
+	void CheckVector (const ALfloat *actual, float x, float y, float z, const char *name)
+	{
+		Check (NearlyEqual (actual[0], x) && NearlyEqual (actual[1], y) && NearlyEqual (actual[2], z), name);
+	}
+
+	FRolloffInfo MakeLinearRolloff (float minDistance, float maxDistance)
+	{
+		FRolloffInfo rolloff;
+		rolloff.RolloffType = ROLLOFF_Linear;
+		rolloff.MinDistance = minDistance;
+		rolloff.MaxDistance = maxDistance;
+		return rolloff;
 	}
 
 	bool IsExpectedEvent (size_t index, OpenALEndReason reason)
@@ -127,6 +153,87 @@ namespace
 		ReleaseOwner (restartVictim);
 		ReleaseOwner (restartBlocker);
 		ReleaseOwner (restartOwner);
+	}
+
+	void TestEffectiveGainOrdering (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		SoundListener listener;
+		FRolloffInfo rolloff = MakeLinearRolloff (0.f, 100.f);
+		FVector3 position (90.f, 0.f, 0.f);
+		FVector3 velocity;
+		listener.position = FVector3 (0.f, 0.f, 0.f);
+		listener.valid = true;
+		renderer.SetSfxVolume (0.5f);
+		FISoundChannel *spatial = renderer.StartSound3D (sound, &listener, 0.8f, &rolloff, 1.f, 128, 80, position, velocity, 0, SNDF_LOOP, NULL);
+		FISoundChannel *blocker = renderer.StartSound (sound, 0.9f, 128, 80, SNDF_LOOP, NULL);
+		FISoundChannel *incoming = renderer.StartSound (sound, 0.2f, 128, 80, SNDF_LOOP, NULL);
+		Check (spatial != NULL && blocker != NULL && incoming != NULL, "equal-priority incoming compares against 3D effective gain");
+		Check (spatial != NULL && spatial->SysChannel == NULL, "3D lower effective gain loses despite higher raw gain");
+		StopAndDrain (renderer, blocker);
+		StopAndDrain (renderer, incoming);
+		ReleaseOwner (spatial);
+		ReleaseOwner (blocker);
+		ReleaseOwner (incoming);
+		renderer.SetSfxVolume (1.f);
+	}
+
+	void Test3DState (OpenALSoundRenderer &renderer, SoundHandle stereoSound)
+	{
+		SoundListener listener;
+		FRolloffInfo rolloff = MakeLinearRolloff (0.f, 100.f);
+		FVector3 sourcePosition (50.f, 7.f, 9.f);
+		FVector3 sourceVelocity (1.f, 2.f, 3.f);
+		ALfloat values[6];
+		ALint relative;
+		ALint buffer;
+		ALfloat gain;
+		OpenALSound *sound = (OpenALSound *)stereoSound.data;
+		listener.position = FVector3 (10.f, 20.f, 30.f);
+		listener.velocity = FVector3 (4.f, 5.f, 6.f);
+		listener.angle = 1.57079632679f;
+		listener.valid = true;
+		renderer.UpdateListener (&listener);
+		alGetListenerfv (AL_POSITION, values);
+		CheckVector (values, 10.f, 20.f, -30.f, "listener position uses OpenAL handedness");
+		alGetListenerfv (AL_VELOCITY, values);
+		CheckVector (values, 0.f, 0.f, 0.f, "listener velocity remains zero");
+		alGetListenerfv (AL_ORIENTATION, values);
+		CheckVector (values, 0.f, 0.f, -1.f, "listener forward uses OpenAL handedness");
+		CheckVector (values + 3, 0.f, 1.f, 0.f, "listener up remains world up");
+
+		FISoundChannel *channel = renderer.StartSound3D (stereoSound, &listener, 0.8f, &rolloff, 2.f, 128, 0, sourcePosition, sourceVelocity, 0, SNDF_LOOP | SNDF_AREA, NULL);
+		Check (channel != NULL, "stereo 3D sound starts on an actual OpenAL source");
+		if (channel != NULL)
+		{
+			OpenALChannel *openalChannel = (OpenALChannel *)channel->SysChannel;
+			alGetSourcei (openalChannel->Source, AL_BUFFER, &buffer);
+			Check (sound->BufferMono != 0 && (unsigned int)buffer == sound->BufferMono && sound->BufferMono != sound->Buffer2D, "stereo 3D sound selects its mono spatial buffer");
+			alGetSourcei (openalChannel->Source, AL_SOURCE_RELATIVE, &relative);
+			Check (relative == AL_FALSE, "non-coincident 3D source remains world relative");
+			alGetSourcefv (openalChannel->Source, AL_POSITION, values);
+			CheckVector (values, 50.f, 7.f, -9.f, "source position uses OpenAL handedness");
+			alGetSourcefv (openalChannel->Source, AL_VELOCITY, values);
+			CheckVector (values, 1.f, 2.f, -3.f, "source velocity uses OpenAL handedness");
+			alGetSourcef (openalChannel->Source, AL_GAIN, &gain);
+			Check (NearlyEqual (gain, 0.8f * (1.f - (sqrtf (2210.f) * 2.f) / 100.f)), "manual rolloff applies distance scale to AL gain");
+
+			renderer.UpdateSoundParams3D (&listener, channel, false, listener.position, FVector3 ());
+			alGetSourcei (openalChannel->Source, AL_SOURCE_RELATIVE, &relative);
+			alGetSourcefv (openalChannel->Source, AL_POSITION, values);
+			Check (relative == AL_TRUE, "listener-coincident source is head relative");
+			CheckVector (values, 0.f, 0.f, 0.f, "listener-coincident source uses relative origin");
+
+			renderer.UpdateSoundParams3D (&listener, channel, true, FVector3 (42.f, 20.f, 30.f), FVector3 ());
+			alGetSourcei (openalChannel->Source, AL_SOURCE_RELATIVE, &relative);
+			Check (relative == AL_TRUE, "area sound inside 32 units remains centered");
+			renderer.UpdateSoundParams3D (&listener, channel, true, FVector3 (43.f, 20.f, 30.f), FVector3 ());
+			alGetSourcei (openalChannel->Source, AL_SOURCE_RELATIVE, &relative);
+			alGetSourcefv (openalChannel->Source, AL_POSITION, values);
+			Check (relative == AL_FALSE, "area sound outside 32 units becomes positional");
+			CheckVector (values, 43.f, 20.f, -30.f, "area sound outside 32 units uses world position");
+			StopAndDrain (renderer, channel);
+		}
+		ReleaseOwner (channel);
 	}
 
 	void TestEviction (OpenALSoundRenderer &renderer, SoundHandle sound)
@@ -221,6 +328,19 @@ void DPrintf (const char *, ...)
 {
 }
 
+float S_GetRolloff (FRolloffInfo *rolloff, float distance, bool)
+{
+	if (rolloff == NULL || distance >= rolloff->MaxDistance)
+	{
+		return 0.f;
+	}
+	if (distance <= rolloff->MinDistance)
+	{
+		return 1.f;
+	}
+	return (rolloff->MaxDistance - distance) / (rolloff->MaxDistance - rolloff->MinDistance);
+}
+
 FISoundChannel *S_GetChannel (void *syschan)
 {
 	FISoundChannel *channel = new FISoundChannel;
@@ -263,6 +383,7 @@ int main ()
 			return 1;
 		}
 		TestPriorityOrdering (priorityRenderer, prioritySound);
+		TestEffectiveGainOrdering (priorityRenderer, prioritySound);
 		priorityRenderer.UnloadSound (prioritySound);
 	}
 	snd_channels.Value = 1;
@@ -280,7 +401,9 @@ int main ()
 
 	SoundHandle longSound = renderer.LoadSoundRaw (&longSamples[0], (int)longSamples.size (), 8000, 1, -16, -1);
 	SoundHandle shortSound = renderer.LoadSoundRaw (&shortSamples[0], (int)shortSamples.size (), 8000, 1, -16, -1);
-	if (longSound.data == NULL || shortSound.data == NULL)
+	std::vector<BYTE> stereoSamples = MakeStereoSamples (8000);
+	SoundHandle stereoSound = renderer.LoadSoundRaw (&stereoSamples[0], (int)stereoSamples.size (), 8000, 2, -16, -1);
+	if (longSound.data == NULL || shortSound.data == NULL || stereoSound.data == NULL)
 	{
 		fprintf (stderr, "FAILED: OpenAL PCM buffers could not initialize\n");
 		return 1;
@@ -291,8 +414,10 @@ int main ()
 	TestNaturalFinish (renderer, shortSound);
 	TestImmediateReuseAfterExplicitStop (renderer, longSound, shortSound);
 	TestFailedStartDoesNotPublish (renderer, longSound);
+	Test3DState (renderer, stereoSound);
 
 	renderer.UnloadSound (longSound);
 	renderer.UnloadSound (shortSound);
+	renderer.UnloadSound (stereoSound);
 	return Failures == 0 ? 0 : 1;
 }

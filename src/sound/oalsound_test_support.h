@@ -61,16 +61,52 @@ class SoundStream
 
 typedef void (*SoundStreamCallback) ();
 
+class FVector3
+{
+public:
+	FVector3 () : X (0.f), Y (0.f), Z (0.f) {}
+	FVector3 (float x, float y, float z) : X (x), Y (y), Z (z) {}
+
+	FVector3 operator- (const FVector3 &other) const
+	{
+		return FVector3 (X - other.X, Y - other.Y, Z - other.Z);
+	}
+
+	float LengthSquared () const
+	{
+		return X * X + Y * Y + Z * Z;
+	}
+
+	float X;
+	float Y;
+	float Z;
+};
+
 class SoundListener
 {
+public:
+	SoundListener () : position (), velocity (), angle (0.f), underwater (false), valid (false) {}
+
+	FVector3 position;
+	FVector3 velocity;
+	float angle;
+	bool underwater;
+	bool valid;
 };
 
 struct FRolloffInfo
 {
+	int RolloffType;
+	float MinDistance;
+	union { float MaxDistance; float RolloffFactor; };
 };
 
-class FVector3
+enum
 {
+	ROLLOFF_Doom,
+	ROLLOFF_Linear,
+	ROLLOFF_Log,
+	ROLLOFF_Custom
 };
 
 enum EInactiveState
@@ -145,6 +181,7 @@ public:
 
 #define EXTERN_CVAR(type, name) extern OALTest ## type ## CVar name;
 #define SNDF_LOOP 1
+#define SNDF_AREA 4
 #define TEXTCOLOR_RED ""
 #define TEXTCOLOR_GREEN ""
 
@@ -168,5 +205,6 @@ void Printf (const char *format, ...);
 void DPrintf (const char *format, ...);
 FISoundChannel *S_GetChannel (void *syschan);
 void S_ChannelEnded (FISoundChannel *channel);
+float S_GetRolloff (FRolloffInfo *rolloff, float distance, bool logarithmic);
 
 #endif

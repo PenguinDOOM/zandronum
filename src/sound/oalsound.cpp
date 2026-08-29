@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <math.h>
 
 #ifdef OAL_LIFECYCLE_TEST
 #include "oalsound_test_support.h"
@@ -30,6 +31,15 @@ EXTERN_CVAR (String, snd_openal_device)
 EXTERN_CVAR (Float, snd_sfxvolume)
 EXTERN_CVAR (Bool, snd_pitched)
 
+static FVector3 ToOpenALCoordinates (const FVector3 &vector)
+{
+	FVector3 converted;
+	converted.X = vector.X;
+	converted.Y = vector.Y;
+	converted.Z = -vector.Z;
+	return converted;
+}
+
 OpenALSound::OpenALSound ()
 	: Buffer2D (0), BufferMono (0), SampleRate (0), Frames (0), Channels (0),
 	  HasLoop (false), LoopStart (0), LoopEnd (0), References (0), DeferredDelete (false)
@@ -38,7 +48,8 @@ OpenALSound::OpenALSound ()
 
 OpenALChannel::OpenALChannel ()
 	: Source (0), Sound (NULL), Owner (NULL), Gain (0.f), Pitch (1.f), Priority (0),
-	  CachedPosition (0), AllocationSerial (0), Looping (false), EndReason (OALEND_None),
+	  RolloffGain (1.f), EffectiveGain (0.f), Distance (0.f), DistanceScale (1.f),
+	  CachedPosition (0), AllocationSerial (0), Looping (false), Is3D (false), IsArea (false), Rolloff (), EndReason (OALEND_None),
 	  FinalizeState (OALFINAL_Active)
 {
 }
@@ -414,8 +425,8 @@ OpenALChannel *OpenALSoundRenderer::FindEvictionCandidate () const
 			continue;
 		}
 		if (candidate == NULL || channel->Priority < candidate->Priority ||
-			(channel->Priority == candidate->Priority && (channel->Gain < candidate->Gain ||
-			(channel->Gain == candidate->Gain && channel->AllocationSerial < candidate->AllocationSerial))))
+			(channel->Priority == candidate->Priority && (channel->EffectiveGain < candidate->EffectiveGain ||
+			(channel->EffectiveGain == candidate->EffectiveGain && channel->AllocationSerial < candidate->AllocationSerial))))
 		{
 			candidate = channel;
 		}
@@ -437,10 +448,10 @@ bool OpenALSoundRenderer::FinalizePendingStopForReuse ()
 	return false;
 }
 
-bool OpenALSoundRenderer::IncomingWins (const OpenALChannel *candidate, int priority, float gain) const
+bool OpenALSoundRenderer::IncomingWins (const OpenALChannel *candidate, int priority, float effectiveGain) const
 {
 	return candidate != NULL && (priority > candidate->Priority ||
-		(priority == candidate->Priority && gain > candidate->Gain));
+		(priority == candidate->Priority && effectiveGain > candidate->EffectiveGain));
 }
 
 void OpenALSoundRenderer::RemoveActiveChannel (OpenALChannel *channel)
@@ -468,7 +479,49 @@ unsigned int OpenALSoundRenderer::CachePosition (OpenALChannel *channel)
 
 void OpenALSoundRenderer::ApplyChannelGain (OpenALChannel *channel)
 {
-	alSourcef (channel->Source, AL_GAIN, channel->Gain * SfxVolume);
+	channel->EffectiveGain = channel->Gain * SfxVolume * channel->RolloffGain;
+	alSourcef (channel->Source, AL_GAIN, channel->EffectiveGain);
+}
+
+float OpenALSoundRenderer::CalculateRolloffGain (FRolloffInfo &rolloff, float distanceScale, SoundListener *listener, const FVector3 &position, float *distance) const
+{
+	if (listener == NULL || !listener->valid)
+	{
+		*distance = 0.f;
+		return S_GetRolloff (&rolloff, 0.f, true);
+	}
+	*distance = sqrtf ((float)(listener->position - position).LengthSquared ());
+	return S_GetRolloff (&rolloff, *distance * distanceScale, true);
+}
+
+void OpenALSoundRenderer::ApplySpatialState (OpenALChannel *channel, SoundListener *listener, const FVector3 &position, const FVector3 &velocity)
+{
+	float distance;
+	bool headRelative;
+	FVector3 convertedPosition;
+	FVector3 convertedVelocity;
+
+	channel->RolloffGain = CalculateRolloffGain (channel->Rolloff, channel->DistanceScale, listener, position, &distance);
+	channel->Distance = distance;
+	// Center nearby area sounds as a bounded Phase 1A panning approximation.
+	headRelative = listener != NULL && listener->valid &&
+		(distance == 0.f || (channel->IsArea && distance <= 32.f));
+
+	if (headRelative)
+	{
+		alSourcei (channel->Source, AL_SOURCE_RELATIVE, AL_TRUE);
+		alSource3f (channel->Source, AL_POSITION, 0.f, 0.f, 0.f);
+		alSource3f (channel->Source, AL_VELOCITY, 0.f, 0.f, 0.f);
+	}
+	else
+	{
+		convertedPosition = ToOpenALCoordinates (position);
+		convertedVelocity = ToOpenALCoordinates (velocity);
+		alSourcei (channel->Source, AL_SOURCE_RELATIVE, AL_FALSE);
+		alSource3f (channel->Source, AL_POSITION, convertedPosition.X, convertedPosition.Y, convertedPosition.Z);
+		alSource3f (channel->Source, AL_VELOCITY, convertedVelocity.X, convertedVelocity.Y, convertedVelocity.Z);
+	}
+	ApplyChannelGain (channel);
 }
 
 void OpenALSoundRenderer::FinalizeChannel (OpenALChannel *channel, OpenALEndReason reason)
@@ -534,7 +587,7 @@ FISoundChannel *OpenALSoundRenderer::Start2D (SoundHandle sfx, float volume, int
 	if (source == 0)
 	{
 		OpenALChannel *candidate = FindEvictionCandidate ();
-		if (!IncomingWins (candidate, priority, volume))
+		if (!IncomingWins (candidate, priority, volume * SfxVolume))
 		{
 			return NULL;
 		}
@@ -599,9 +652,84 @@ FISoundChannel *OpenALSoundRenderer::StartSound (SoundHandle sfx, float volume, 
 	return Start2D (sfx, volume, pitch, flags, priority, reuseChan);
 }
 
-FISoundChannel *OpenALSoundRenderer::StartSound3D (SoundHandle, SoundListener *, float, FRolloffInfo *, float, int, int, const FVector3 &, const FVector3 &, int, int, FISoundChannel *)
+FISoundChannel *OpenALSoundRenderer::StartSound3D (SoundHandle sfx, SoundListener *listener, float volume, FRolloffInfo *rolloff, float distscale, int pitch, int priority, const FVector3 &pos, const FVector3 &vel, int, int flags, FISoundChannel *reuseChan)
 {
-	return NULL;
+	OpenALSound *sound = (OpenALSound *)sfx.data;
+	OpenALChannel *channel;
+	FISoundChannel *owner = NULL;
+	float distance;
+	float rolloffGain;
+	float effectiveGain;
+	unsigned int source;
+	if (!InitSuccess || sound == NULL || sound->DeferredDelete || rolloff == NULL || reuseChan != NULL && reuseChan->SysChannel != NULL)
+	{
+		return NULL;
+	}
+	rolloffGain = CalculateRolloffGain (*rolloff, distscale, listener, pos, &distance);
+	effectiveGain = volume * SfxVolume * rolloffGain;
+	source = FindFreeSource ();
+	if (source == 0 && FinalizePendingStopForReuse ())
+	{
+		source = FindFreeSource ();
+	}
+	if (source == 0)
+	{
+		OpenALChannel *candidate = FindEvictionCandidate ();
+		if (!IncomingWins (candidate, priority, effectiveGain))
+		{
+			return NULL;
+		}
+		FinalizeChannel (candidate, OALEND_PoolEviction);
+		source = FindFreeSource ();
+		if (source == 0)
+		{
+			return NULL;
+		}
+	}
+	channel = new OpenALChannel;
+	channel->Source = source;
+	channel->Sound = sound;
+	channel->Owner = owner;
+	channel->Gain = volume;
+	channel->RolloffGain = rolloffGain;
+	channel->EffectiveGain = effectiveGain;
+	channel->Distance = distance;
+	channel->DistanceScale = distscale;
+	channel->Pitch = snd_pitched ? pitch / 128.f : 1.f;
+	channel->Priority = priority;
+	channel->Looping = (flags & SNDF_LOOP) != 0;
+	channel->Is3D = true;
+	channel->IsArea = (flags & SNDF_AREA) != 0;
+	channel->Rolloff = *rolloff;
+	channel->AllocationSerial = ++NextAllocationSerial;
+
+	alGetError ();
+	alSourceStop (source);
+	alSourcei (source, AL_BUFFER, (ALint)(sound->BufferMono != 0 ? sound->BufferMono : sound->Buffer2D));
+	alSourcei (source, AL_LOOPING, channel->Looping ? AL_TRUE : AL_FALSE);
+	alSourcef (source, AL_PITCH, channel->Pitch);
+	ApplySpatialState (channel, listener, pos, vel);
+	alSourcePlay (source);
+	if (alGetError () != AL_NO_ERROR)
+	{
+		alSourceStop (source);
+		alSourcei (source, AL_BUFFER, 0);
+		delete channel;
+		return NULL;
+	}
+	owner = reuseChan != NULL ? reuseChan : S_GetChannel (channel);
+	if (owner == NULL)
+	{
+		alSourceStop (source);
+		alSourcei (source, AL_BUFFER, 0);
+		delete channel;
+		return NULL;
+	}
+	channel->Owner = owner;
+	owner->SysChannel = channel;
+	++sound->References;
+	ActiveChannels.push_back (channel);
+	return owner;
 }
 
 void OpenALSoundRenderer::StopChannel (FISoundChannel *owner)
@@ -639,7 +767,7 @@ unsigned int OpenALSoundRenderer::GetPosition (FISoundChannel *owner)
 float OpenALSoundRenderer::GetAudibility (FISoundChannel *owner)
 {
 	OpenALChannel *channel = owner == NULL ? NULL : (OpenALChannel *)owner->SysChannel;
-	return channel == NULL ? 0.f : channel->Gain * SfxVolume;
+	return channel == NULL ? 0.f : channel->EffectiveGain;
 }
 
 void OpenALSoundRenderer::Sync (bool)
@@ -654,12 +782,34 @@ void OpenALSoundRenderer::SetInactive (EInactiveState)
 {
 }
 
-void OpenALSoundRenderer::UpdateSoundParams3D (SoundListener *, FISoundChannel *, bool, const FVector3 &, const FVector3 &)
+void OpenALSoundRenderer::UpdateSoundParams3D (SoundListener *listener, FISoundChannel *owner, bool areasound, const FVector3 &pos, const FVector3 &vel)
 {
+	OpenALChannel *channel = owner == NULL ? NULL : (OpenALChannel *)owner->SysChannel;
+	if (channel != NULL && channel->FinalizeState == OALFINAL_Active && channel->Is3D)
+	{
+		channel->IsArea = areasound;
+		ApplySpatialState (channel, listener, pos, vel);
+	}
 }
 
-void OpenALSoundRenderer::UpdateListener (SoundListener *)
+void OpenALSoundRenderer::UpdateListener (SoundListener *listener)
 {
+	ALfloat orientation[6];
+	FVector3 position;
+	if (listener == NULL || !listener->valid)
+	{
+		return;
+	}
+	orientation[0] = cosf (listener->angle);
+	orientation[1] = 0.f;
+	orientation[2] = -sinf (listener->angle);
+	orientation[3] = 0.f;
+	orientation[4] = 1.f;
+	orientation[5] = 0.f;
+	position = ToOpenALCoordinates (listener->position);
+	alListener3f (AL_POSITION, position.X, position.Y, position.Z);
+	alListener3f (AL_VELOCITY, 0.f, 0.f, 0.f);
+	alListenerfv (AL_ORIENTATION, orientation);
 }
 
 void OpenALSoundRenderer::UpdateSounds ()
