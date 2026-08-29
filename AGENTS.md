@@ -280,5 +280,6 @@ Agents should avoid without explicit justification:
 * Modifying authenticated PK3 content
 * Broad warning suppressions
 * Disabling lint or tests to obtain a passing result
+* Stage files included in .gitignore
 
 When a task reveals a pre-existing defect outside its scope, document it rather than silently expanding the task.
