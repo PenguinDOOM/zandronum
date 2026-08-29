@@ -10,6 +10,13 @@ stages:
   image: registry.heptapod.net/zandronum/ci-images/zandronum-build-ubuntu:latest
   script:
     - mkdir -p build && cd build
+    - |
+      if [[ "$SERVERONLY" != "ON" ]]; then
+        dpkg-query -W -f='OpenAL Soft package: ${Package} ${Version}\n' libopenal-dev;
+        test -f /usr/include/AL/al.h;
+        OPENAL_LIBRARY="$(dpkg -L libopenal-dev | grep '/libopenal\.so$' | head -n 1)";
+        test -n "$OPENAL_LIBRARY";
+      fi
     - cmake
         -GNinja
         -DCMAKE_BUILD_TYPE=Release
@@ -17,6 +24,8 @@ stages:
         -DSERVERONLY=${SERVERONLY}
         -DFMOD_LIBRARY=${FMOD_DIR_PATH}/api/lib/libfmodex64-${FMOD_SO_VERSION}.so
         -DFMOD_INCLUDE_DIR=${FMOD_DIR_PATH}/api/inc
+        -DOPENAL_INCLUDE_DIR=/usr/include
+        -DOPENAL_LIBRARY=${OPENAL_LIBRARY}
         ..
     - ninja
     - if [[ "$SERVERONLY" != "ON" ]]; then
@@ -82,6 +91,8 @@ appimage:
 #   ZA_NASM_PATH              path to nasm.exe
 #   ZA_OPUS_ROOT              libopus root directory
 #   ZA_FMOD_DIR               FMOD Ex root directory
+#   ZA_OPENAL_WIN32_ROOT      32-bit OpenAL Soft install root with include, lib, and bin directories
+#   ZA_OPENAL_X64_ROOT        64-bit OpenAL Soft install root with include, lib, and bin directories
 # Ensure your runner uses PowerShell 7 or later. (_not_ Windows PowerShell!) 
 
 .windows: &windows
@@ -96,6 +107,22 @@ appimage:
         $fmodArch = "64" ;
         $opensslArch = "x64" ;
         $opensslRoot = $env:ZA_OPENSSL_X64_ROOT ;
+      } ;
+      $openalRoot = $env:ZA_OPENAL_WIN32_ROOT ;
+      $openalRootVariable = "ZA_OPENAL_WIN32_ROOT" ;
+      if ($env:ARCH -eq "x64") {
+        $openalRoot = $env:ZA_OPENAL_X64_ROOT ;
+        $openalRootVariable = "ZA_OPENAL_X64_ROOT" ;
+      } ;
+      if ([string]::IsNullOrWhiteSpace($openalRoot)) {
+        throw "$openalRootVariable must name the OpenAL Soft install tree for ARCH=$env:ARCH.";
+      } ;
+      $openalInclude = Join-Path $openalRoot "include" ;
+      $openalHeader = Join-Path $openalInclude "AL\al.h" ;
+      $openalLibrary = Join-Path $openalRoot "lib\OpenAL32.lib" ;
+      $openalRuntime = Join-Path $openalRoot "bin\OpenAL32.dll" ;
+      if (!(Test-Path $openalHeader) -or !(Test-Path $openalLibrary) -or !(Test-Path $openalRuntime)) {
+        throw "$openalRootVariable for ARCH=$env:ARCH must contain include\AL\al.h, lib\OpenAL32.lib, and bin\OpenAL32.dll.";
       } ;
 
       mkdir build-$env:CI_JOB_ID &&
@@ -112,6 +139,8 @@ appimage:
         -DNASM_PATH="$env:ZA_NASM_PATH"
         -DFMOD_INCLUDE_DIR="$env:ZA_FMOD_ROOT\api\inc"
         -DFMOD_LIBRARY="$env:ZA_FMOD_ROOT\api\lib\fmodex${fmodArch}_vc.lib"
+        -DOPENAL_INCLUDE_DIR="$openalInclude"
+        -DOPENAL_LIBRARY="$openalLibrary"
         -DOPUS_INCLUDE_DIR="$env:ZA_OPUS_ROOT\include"
         -DOPUS_LIBRARIES="$env:ZA_OPUS_ROOT\win32\VS2015\${env:ARCH}\Release\opus.lib"
         -DZSTD_INCLUDE_DIR="$env:ZA_ZSTD_ROOT\include"

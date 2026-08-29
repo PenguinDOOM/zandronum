@@ -62,6 +62,7 @@ extern HINSTANCE g_hInst;
 
 #ifndef NO_SOUND
 #include "fmodsound.h"
+#include "oalsound.h"
 #endif
 
 #include "m_swap.h"
@@ -86,6 +87,8 @@ EXTERN_CVAR (Float, snd_sfxvolume)
 CVAR (Int, snd_samplerate, 0, CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
 CVAR (Int, snd_buffersize, 0, CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
 CVAR (String, snd_output, "default", CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
+CVAR (String, snd_backend, "fmod", CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
+CVAR (String, snd_openal_device, "default", CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
 
 // killough 2/21/98: optionally use varying pitched sounds
 CVAR (Bool, snd_pitched, false, CVAR_ARCHIVE)
@@ -263,11 +266,30 @@ void I_InitSound ()
 		return;
 	}
 
-	GSnd = new FMODSoundRenderer;
+	if (stricmp (*snd_backend, "openal") == 0)
+	{
+		GSnd = new OpenALSoundRenderer;
+		if (!GSnd->IsValid ())
+		{
+			delete GSnd;
+			GSnd = NULL;
+			Printf (TEXTCOLOR_ORANGE "OpenAL initialization failed. Trying FMOD.\n");
+		}
+	}
+	else if (stricmp (*snd_backend, "fmod") != 0)
+	{
+		Printf (TEXTCOLOR_ORANGE "Unknown snd_backend '%s'. Using FMOD.\n", *snd_backend);
+	}
+
+	if (GSnd == NULL)
+	{
+		GSnd = new FMODSoundRenderer;
+	}
 
 	if (!GSnd->IsValid ())
 	{
-		I_CloseSound();
+		delete GSnd;
+		GSnd = NULL;
 		GSnd = new NullSoundRenderer;
 		Printf (TEXTCOLOR_RED"Sound init failed. Using nosound.\n");
 	}

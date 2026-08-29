@@ -30,6 +30,23 @@ jobs:
         Invoke-WebRequest -Outfile 'deps.zip' 'https://github.com/DrinkyBird/zan-ci-deps/releases/download/ci-dependencies/zan-windows-deps.zip'
         Expand-Archive 'deps.zip' -DestinationPath '${{ steps.strings.outputs.deps-dir }}'
 
+    - name: Build pinned OpenAL Soft
+      shell: pwsh
+      run: |
+        $openalSource = '${{ github.workspace }}\openal-soft'
+        $openalBuild = '${{ github.workspace }}\openal-soft-build-${{ matrix.platform }}'
+        $openalRoot = '${{ github.workspace }}\openal-soft-install-${{ matrix.platform }}'
+        git clone https://github.com/kcat/openal-soft.git $openalSource
+        git -C $openalSource checkout b2c48f7718ef3fcf67921a8b6534c4914e328970
+        & cmake -S $openalSource -B $openalBuild -A '${{ matrix.platform }}' `
+            -DCMAKE_INSTALL_PREFIX=$openalRoot `
+            -DALSOFT_UTILS=OFF `
+            -DALSOFT_EXAMPLES=OFF
+        & cmake --build $openalBuild --config '${{ matrix.build_type }}'
+        & cmake --install $openalBuild --config '${{ matrix.build_type }}'
+        echo "OPENAL_INCLUDE_DIR=$openalRoot\include" >> $env:GITHUB_ENV
+        echo "OPENAL_LIBRARY=$openalRoot\lib\OpenAL32.lib" >> $env:GITHUB_ENV
+
     - name: Configure CMake
       shell: pwsh
       run: |
@@ -61,6 +78,8 @@ jobs:
             -DSSL_EAY_RELEASE="${{ steps.strings.outputs.deps-dir }}\openssl${bits}\lib\VC\${sslArch}\MT\libssl_static.lib" `
             -DFMOD_INCLUDE_DIR="${{ steps.strings.outputs.deps-dir }}\fmod\api\inc" `
             -DFMOD_LIBRARY="${{ steps.strings.outputs.deps-dir }}\fmod\api\lib\fmodex${fmodArch}_vc.lib" `
+            -DOPENAL_INCLUDE_DIR="${env:OPENAL_INCLUDE_DIR}" `
+            -DOPENAL_LIBRARY="${env:OPENAL_LIBRARY}" `
             -DNASM_PATH="${{ steps.strings.outputs.deps-dir }}\nasm\nasm.exe"
 
     - name: Build

@@ -42,6 +42,8 @@ jobs:
         sudo apt install g++ make cmake libsdl1.2-dev mercurial zlib1g-dev libbz2-dev libjpeg-dev libfluidsynth-dev libgtk2.0-dev timidity nasm libgl1-mesa-dev libssl-dev tar libglew-dev wget libopus-dev
         
         if [[ "${{ matrix.serveronly }}" == "" ]]; then
+          sudo apt install libopenal-dev
+          dpkg-query -W -f='OpenAL Soft package: ${Package} ${Version}\n' libopenal-dev
           wget https://github.com/DrinkyBird/zan-ci-deps/releases/download/ci-dependencies/fmodapi${FMOD_VER}linux.tar.gz
           tar xf fmodapi${FMOD_VER}linux.tar.gz
           echo "FMOD_INCLUDE_DIR=${PWD}/fmodapi${FMOD_VER}linux/api/inc" >> $GITHUB_ENV

@@ -365,6 +365,16 @@ else( FMOD_LIBRARY )
 	endif ( NOT NO_SOUND )
 endif( FMOD_LIBRARY )
 
+if( NOT NO_SOUND )
+	find_package( OpenAL )
+	if( OPENAL_FOUND )
+		message( STATUS "OpenAL include files found at ${OPENAL_INCLUDE_DIR}" )
+		message( STATUS "OpenAL library found at ${OPENAL_LIBRARY}" )
+	else( OPENAL_FOUND )
+		message( SEND_ERROR "Could not find OpenAL headers and library" )
+	endif( OPENAL_FOUND )
+endif( NOT NO_SOUND )
+
 
 # Search for FluidSynth
 
@@ -675,8 +685,12 @@ message( STATUS "Fluid synth libs: ${FLUIDSYNTH_LIBRARIES}" )
 set( ZDOOM_LIBS ${ZDOOM_LIBS} "${ZLIB_LIBRARIES}" "${JPEG_LIBRARIES}" "${BZIP2_LIBRARIES}" "${GME_LIBRARIES}" )
 # [BB] Without sound, we don't need FMOD.
 if ( NOT NO_SOUND )
-	set( ZDOOM_LIBS ${ZDOOM_LIBS} "${FMOD_LIBRARY}" )
-	include_directories( "${ZLIB_INCLUDE_DIR}" "${FMOD_INCLUDE_DIR}" "${BZIP2_INCLUDE_DIR}" "${LZMA_INCLUDE_DIR}" "${JPEG_INCLUDE_DIR}" "${GME_INCLUDE_DIR}" )
+	set( ZDOOM_LIBS ${ZDOOM_LIBS} "${FMOD_LIBRARY}" "${OPENAL_LIBRARY}" )
+	include_directories( "${ZLIB_INCLUDE_DIR}" "${FMOD_INCLUDE_DIR}" "${OPENAL_INCLUDE_DIR}" "${BZIP2_INCLUDE_DIR}" "${LZMA_INCLUDE_DIR}" "${JPEG_INCLUDE_DIR}" "${GME_INCLUDE_DIR}" )
+	set( SOUND_SOURCES
+		sound/fmodsound.cpp
+		sound/oalsound.cpp
+	)
 else ( NOT NO_SOUND )
 	include_directories( "${ZLIB_INCLUDE_DIR}" "${BZIP2_INCLUDE_DIR}" "${LZMA_INCLUDE_DIR}" "${JPEG_INCLUDE_DIR}" "${GME_INCLUDE_DIR}" )
 endif ( NOT NO_SOUND )
@@ -1372,7 +1386,7 @@ add_executable( zdoom WIN32
 	resourcefiles/file_directory.cpp
 	resourcefiles/resourcefile.cpp
 	sfmt/SFMT.cpp
-	sound/fmodsound.cpp
+	${SOUND_SOURCES}
 	sound/i_music.cpp
 	sound/i_sound.cpp
 	sound/music_cd.cpp
