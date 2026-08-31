@@ -13,7 +13,7 @@ include( FindOpenGL )
 # [BL] I can't seem to find where ZDoom gets this
 include( CheckLibraryExists )
 # [TP] For the code generator
-find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 if( NOT APPLE )
 	option( NO_ASM "Disable assembly code" OFF )

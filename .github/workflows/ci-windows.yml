@@ -3,7 +3,8 @@ name: Windows build
 on: [push, pull_request]
 
 env:
-  OPENAL_COMMIT: b2c48f7718ef3fcf67921a8b6534c4914e328970
+    OPENAL_COMMIT: b2c48f7718ef3fcf67921a8b6534c4914e328970
+    ZSTD_COMMIT: f8745da6ff1ad1e7bab384bd1f9d742439278e99
 
 jobs:
   build:
@@ -64,6 +65,27 @@ jobs:
         
         # see src/CMakeLists.txt, it takes an env variable hint for finding DirectX
         $env:DXSDK_DIR = "${{ steps.strings.outputs.deps-dir }}\dxsdk" ;
+
+        $zstdSource = '${{ github.workspace }}\zstd'
+        $zstdBuild = '${{ github.workspace }}\zstd-build-${{ matrix.platform }}'
+        $zstdRoot = '${{ github.workspace }}\zstd-install-${{ matrix.platform }}'
+        git clone https://github.com/facebook/zstd.git $zstdSource
+        git -C $zstdSource checkout $env:ZSTD_COMMIT
+        & cmake -S "$zstdSource\build\cmake" -B $zstdBuild -A '${{ matrix.platform }}' `
+            -DCMAKE_INSTALL_PREFIX=$zstdRoot `
+            -DZSTD_BUILD_SHARED=OFF `
+            -DZSTD_BUILD_PROGRAMS=OFF `
+            -DZSTD_BUILD_TESTS=OFF `
+            -DZSTD_BUILD_CONTRIB=OFF
+        & cmake --build $zstdBuild --config '${{ matrix.build_type }}'
+        & cmake --install $zstdBuild --config '${{ matrix.build_type }}'
+        $zstdInclude = Join-Path $zstdRoot 'include'
+        $zstdHeader = Join-Path $zstdInclude 'zstd.h'
+        $zstdLibrary = Join-Path $zstdRoot 'lib\zstd_static.lib'
+        if (!(Test-Path -LiteralPath $zstdHeader -PathType Leaf) -or
+            !(Test-Path -LiteralPath $zstdLibrary -PathType Leaf)) {
+            throw "Pinned ZStd install for ${{ matrix.platform }} must contain include\zstd.h and lib\zstd_static.lib."
+        }
         
         # We need it for the artefacts later
         echo "FMOD_DLL=${{ steps.strings.outputs.deps-dir }}\fmod\api\fmodex${fmodArch}.dll" >> $env:GITHUB_ENV ;
@@ -81,6 +103,8 @@ jobs:
             -DSSL_EAY_RELEASE="${{ steps.strings.outputs.deps-dir }}\openssl${bits}\lib\VC\${sslArch}\MT\libssl_static.lib" `
             -DFMOD_INCLUDE_DIR="${{ steps.strings.outputs.deps-dir }}\fmod\api\inc" `
             -DFMOD_LIBRARY="${{ steps.strings.outputs.deps-dir }}\fmod\api\lib\fmodex${fmodArch}_vc.lib" `
+            -DZSTD_INCLUDE_DIR="$zstdInclude" `
+            -DZSTD_LIBRARY="$zstdLibrary" `
             -DOPENAL_INCLUDE_DIR="${env:OPENAL_INCLUDE_DIR}" `
             -DOPENAL_LIBRARY="${env:OPENAL_LIBRARY}" `
             -DNASM_PATH="${{ steps.strings.outputs.deps-dir }}\nasm\nasm.exe"

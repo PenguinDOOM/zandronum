@@ -13,7 +13,7 @@ if( BUILD_TESTING )
 	target_include_directories( openal_pcm_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/sound )
 	add_test( NAME openal_pcm COMMAND openal_pcm_tests )
 
-	if( NOT NO_SOUND )
+	if( NOT NO_SOUND AND NOT SERVERONLY )
 		find_package( OpenAL REQUIRED )
 		add_executable( openal_lifecycle_tests
 			openal_renderer_lifecycle_tests.cpp
@@ -24,7 +24,7 @@ if( BUILD_TESTING )
 		target_link_libraries( openal_lifecycle_tests ${OPENAL_LIBRARY} )
 		add_test( NAME openal_lifecycle COMMAND openal_lifecycle_tests )
 		set_tests_properties( openal_lifecycle PROPERTIES SKIP_RETURN_CODE 77 )
-	endif( NOT NO_SOUND )
+	endif( NOT NO_SOUND AND NOT SERVERONLY )
 endif( BUILD_TESTING )
 
 set( CROSS_EXPORTS ${CROSS_EXPORTS} PARENT_SCOPE )

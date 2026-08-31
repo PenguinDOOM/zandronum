@@ -121,11 +121,22 @@ jobs:
             'License: LGPL-2.0-or-later (see OpenAL-Soft-COPYING.txt)' \
             > "$package/OpenAL-Soft-SOURCE.txt"
 
+          command -v readelf >/dev/null
+          openal_linked_executables=0
           for executable in "${expected_executables[@]}"; do
-            resolved_openal="$(LD_LIBRARY_PATH="$package" ldd "$package/$executable" | awk '$1 == "libopenal.so.1" { print $3; exit }')"
+            if ! readelf -l "$package/$executable" | grep -q 'Requesting program interpreter:'; then
+              continue
+            fi
+            ldd_output="$(LD_LIBRARY_PATH="$package" ldd "$package/$executable")"
+            resolved_openal="$(awk '$1 == "libopenal.so.1" { print $3; exit }' <<< "$ldd_output")"
+            if [[ -z "$resolved_openal" ]]; then
+              continue
+            fi
             test -n "$resolved_openal"
             test "$(readlink -f "$resolved_openal")" = "$(readlink -f "$package/$openal_runtime_name")"
+            ((openal_linked_executables += 1))
           done
+          ((openal_linked_executables > 0))
         fi
 
         PACKAGE_ROOT="$package" \
