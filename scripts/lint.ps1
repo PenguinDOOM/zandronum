@@ -265,9 +265,14 @@ function Get-VerifiedGeneratedBundle {
 
     foreach ($relativePath in $RelativePaths) {
         foreach ($commit in @($BaseCommit, $HeadCommit)) {
-            & git cat-file -e ($commit + ':' + $relativePath) 2>$null
+            $trackedPaths = @(& git ls-tree --full-tree --name-only $commit -- $relativePath 2>&1)
 
-            if ($LASTEXITCODE -eq 0) {
+            if ($LASTEXITCODE -ne 0) {
+                $details = ($trackedPaths -join [Environment]::NewLine).Trim()
+                throw "Could not inspect generated bundle path '$relativePath' in Git tree '$commit': $details"
+            }
+
+            if ($trackedPaths.Count -ne 0) {
                 throw "Generated bundle path '$relativePath' is tracked by a Git input tree."
             }
         }
