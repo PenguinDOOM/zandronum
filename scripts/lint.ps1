@@ -295,14 +295,32 @@ function Get-VerifiedGeneratedBundle {
             throw "Generated bundle path '$relativePath' must be ignored by Git."
         }
 
-        & git ls-files --error-unmatch -- $relativePath 2>$null
+        $previousNativeCommandUseErrorActionPreference = $PSNativeCommandUseErrorActionPreference
 
-        if ($LASTEXITCODE -eq 0) {
+        try {
+            $PSNativeCommandUseErrorActionPreference = $false
+            $trackingProbeOutput = @(& git ls-files --error-unmatch -- $relativePath 2>&1 | ForEach-Object { $_.ToString() })
+            $trackingProbeExitCode = $LASTEXITCODE
+        }
+        finally {
+            $PSNativeCommandUseErrorActionPreference = $previousNativeCommandUseErrorActionPreference
+        }
+
+        if ($trackingProbeExitCode -eq 0) {
             throw "Generated bundle path '$relativePath' must remain untracked by Git."
         }
 
-        if ($LASTEXITCODE -ne 1) {
-            throw "Could not verify the Git tracking contract for generated bundle path '$relativePath'."
+        if ($trackingProbeExitCode -ne 1) {
+            $details = ($trackingProbeOutput -join [Environment]::NewLine).Trim()
+
+            if ([string]::IsNullOrWhiteSpace($details)) {
+                $details = '<no Git diagnostic output>'
+            }
+            elseif ($details.Length -gt 512) {
+                $details = $details.Substring(0, 512) + '...'
+            }
+
+            throw "Could not verify the Git tracking contract for generated bundle path '$relativePath' (Git exit code $trackingProbeExitCode): $details"
         }
     }
 

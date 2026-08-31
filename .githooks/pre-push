@@ -3,6 +3,56 @@ set -eu
 
 zero_oid="0000000000000000000000000000000000000000"
 
+if ! pwsh_path="$(command -v pwsh 2>/dev/null)" || [ -z "$pwsh_path" ]; then
+    echo "pre-push: PowerShell 7.3 or later is required; 'pwsh' was not found on PATH." >&2
+    exit 1
+fi
+
+if ! pwsh_version="$(
+    "$pwsh_path" -NoLogo -NoProfile -NonInteractive \
+        -Command '$PSVersionTable.PSVersion.ToString()' </dev/null 2>/dev/null
+)"; then
+    echo "pre-push: PowerShell 7.3 or later is required; could not query '$pwsh_path'." >&2
+    exit 1
+fi
+
+case "$pwsh_version" in
+    ''|*[!0-9.]*|.*|*.|*..*)
+        echo "pre-push: PowerShell 7.3 or later is required; '$pwsh_path' returned invalid version '$pwsh_version'." >&2
+        exit 1
+        ;;
+    *.*)
+        ;;
+    *)
+        echo "pre-push: PowerShell 7.3 or later is required; '$pwsh_path' returned invalid version '$pwsh_version'." >&2
+        exit 1
+        ;;
+esac
+
+pwsh_major="${pwsh_version%%.*}"
+pwsh_minor="${pwsh_version#*.}"
+pwsh_minor="${pwsh_minor%%.*}"
+case "$pwsh_major" in
+    ''|*[!0-9]*)
+        echo "pre-push: PowerShell 7.3 or later is required; '$pwsh_path' returned invalid version '$pwsh_version'." >&2
+        exit 1
+        ;;
+esac
+
+case "$pwsh_minor" in
+    ''|*[!0-9]*)
+        echo "pre-push: PowerShell 7.3 or later is required; '$pwsh_path' returned invalid version '$pwsh_version'." >&2
+        exit 1
+        ;;
+esac
+
+if [ "$pwsh_major" -lt 7 ] ||
+    { [ "$pwsh_major" -eq 7 ] && [ "$pwsh_minor" -lt 3 ]; }
+then
+    echo "pre-push: PowerShell 7.3 or later is required; found $pwsh_version." >&2
+    exit 1
+fi
+
 while read -r local_ref local_oid remote_ref remote_oid
 do
     # Ignore tag pushes and other non-branch refs.
@@ -46,7 +96,7 @@ do
         base_oid="$remote_oid"
     fi
 
-    powershell.exe -NoProfile -ExecutionPolicy Bypass \
+    "$pwsh_path" -NoProfile -ExecutionPolicy Bypass \
         -File scripts/lint.ps1 \
         -BaseSha "$base_oid" \
         -HeadSha "$local_oid" ||
