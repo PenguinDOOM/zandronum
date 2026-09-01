@@ -1489,6 +1489,9 @@ endif(${CMAKE_SYSTEM_NAME} STREQUAL "SunOS")
 
 # [BB] Added GeoIP, huffman & sqlite
 target_link_libraries( zdoom ${ZDOOM_LIBS} gdtoa dumb lzma GeoIP sqlite3 )
+if ( NOT NO_SOUND AND OPENAL_FOUND )
+	target_include_directories( zdoom PRIVATE "${OPENAL_INCLUDE_DIR}" )
+endif ( NOT NO_SOUND AND OPENAL_FOUND )
 include_directories( .
 	g_doom
 	g_heretic
@@ -1593,7 +1596,7 @@ endif ( RELEASE_WITH_DEBUG_FILE )
 # [TP] Generate the servercommands.cpp and servercommands.h files.
 include_directories(${CMAKE_BINARY_DIR})
 add_custom_target( protocolspec ALL
-	COMMAND ${PYTHON_EXECUTABLE}
+	COMMAND ${Python3_EXECUTABLE}
 		"${CMAKE_SOURCE_DIR}/protocolspec/generator/codegenerator.py"
 		--spec "${CMAKE_SOURCE_DIR}/protocolspec/spec.txt"
 		--source "${CMAKE_SOURCE_DIR}/src/network/servercommands.cpp"

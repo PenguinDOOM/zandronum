@@ -93,3 +93,19 @@ Subject: fix: expand Windows ZStd prefix
 Body:
 - Pass the ZStd install root as an expanded CMake argument.
 - Verify workflow syntax and PowerShell argument expansion.
+
+### Windows Clean-Build Repair (Reopened Phase 6)
+
+Repaired the two CMake build-graph inputs that blocked clean Windows compilation after Configure succeeded. The `zdoom` target now receives the discovered OpenAL include directory only in sound-enabled OpenAL configurations, and `protocolspec` invokes the interpreter guaranteed by `FindPython3` before producing its ignored generated protocol sources.
+
+**Files:** `src/CMakeLists.txt`, `completes/native-openal-soft-phase-1a-phase-6-complete.md`
+**Implementation model:** Windows clean-build repair -> `GPT-5.6 Terra Threadline (customendpoint)`
+**Functions / Assets:** `zdoom` OpenAL target include propagation; `protocolspec` host Python interpreter invocation
+**Tests / Validations:** x64 Visual Studio CMake reconfigure passed; generated `protocolspec.vcxproj` contains the Python 3 interpreter; generated `zdoom.vcxproj` contains the resolved OpenAL include directory and `zdoom -> protocolspec` dependency; local `zdoom` build passed; `NO_SOUND=ON` probe passed and excludes OpenAL source/link inputs; editor diagnostics and `git diff --check` passed.
+**Review:** APPROVED
+**Repository finalization:** Atlas stages only this record and the reviewed CMake file before creating a separate commit.
+**Commit message:**
+Subject: fix: repair clean Windows audio build
+Body:
+- Propagate the discovered OpenAL headers to sound-enabled zdoom builds.
+- Run the protocol generator through the required Python 3 interpreter.
