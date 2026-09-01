@@ -72,7 +72,7 @@ jobs:
         git clone https://github.com/facebook/zstd.git $zstdSource
         git -C $zstdSource checkout $env:ZSTD_COMMIT
         & cmake -S "$zstdSource\build\cmake" -B $zstdBuild -A '${{ matrix.platform }}' `
-            -DCMAKE_INSTALL_PREFIX=$zstdRoot `
+            "-DCMAKE_INSTALL_PREFIX=$zstdRoot" `
             -DZSTD_BUILD_SHARED=OFF `
             -DZSTD_BUILD_PROGRAMS=OFF `
             -DZSTD_BUILD_TESTS=OFF `

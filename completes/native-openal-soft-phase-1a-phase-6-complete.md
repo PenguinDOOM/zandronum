@@ -77,3 +77,19 @@ Subject: fix: repair OpenAL CI packages
 Body:
 - Restore Windows and Linux package artifact configuration.
 - Validate CMake conditions and workflow syntax before CI rerun.
+
+### Windows ZStd Argument Repair (Reopened Phase 6)
+
+Repaired the PowerShell native-command argument that left `$zstdRoot` literal in the Windows ZStd install prefix. The workflow now passes the expanded architecture-specific prefix as one CMake argument, allowing the existing header/library assertion and main configure hints to use the installed dependency.
+
+**Files:** `.github/workflows/ci-windows.yml`
+**Implementation models:** Phase 6R-W Windows ZStd argument repair -> `GPT-5.6 Luna Threadline (customendpoint)`
+**Functions / Assets:** Windows pinned ZStd CMake install-prefix argument
+**Tests / Validations:** Win32/x64 PowerShell native argument-expansion probe passed without literal `$zstdRoot`; workflow parsed with `yq`; targeted `git diff --check` passed. Hosted Windows artifact jobs remain pending post-commit CI evidence.
+**Review:** APPROVED
+**Repository finalization:** Atlas will stage only this record and the reviewed Windows workflow before creating a separate commit.
+**Commit message:**
+Subject: fix: expand Windows ZStd prefix
+Body:
+- Pass the ZStd install root as an expanded CMake argument.
+- Verify workflow syntax and PowerShell argument expansion.
