@@ -43,11 +43,17 @@ jobs:
         git clone https://github.com/kcat/openal-soft.git $openalSource
         git -C $openalSource checkout $env:OPENAL_COMMIT
         & cmake -S $openalSource -B $openalBuild -A '${{ matrix.platform }}' `
-            -DCMAKE_INSTALL_PREFIX=$openalRoot `
+            "-DCMAKE_INSTALL_PREFIX=$openalRoot" `
             -DALSOFT_UTILS=OFF `
             -DALSOFT_EXAMPLES=OFF
         & cmake --build $openalBuild --config '${{ matrix.build_type }}'
         & cmake --install $openalBuild --config '${{ matrix.build_type }}'
+        $openalHeader = Join-Path $openalRoot 'include\AL\al.h'
+        $openalLibrary = Join-Path $openalRoot 'lib\OpenAL32.lib'
+        if (!(Test-Path -LiteralPath $openalHeader -PathType Leaf) -or
+            !(Test-Path -LiteralPath $openalLibrary -PathType Leaf)) {
+            throw "Pinned OpenAL Soft install for ${{ matrix.platform }} must contain include\AL\al.h and lib\OpenAL32.lib."
+        }
         echo "OPENAL_INCLUDE_DIR=$openalRoot\include" >> $env:GITHUB_ENV
         echo "OPENAL_LIBRARY=$openalRoot\lib\OpenAL32.lib" >> $env:GITHUB_ENV
 

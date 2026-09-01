@@ -109,3 +109,19 @@ Subject: fix: repair clean Windows audio build
 Body:
 - Propagate the discovered OpenAL headers to sound-enabled zdoom builds.
 - Run the protocol generator through the required Python 3 interpreter.
+
+### Windows OpenAL Install-Prefix Repair (Reopened Phase 6)
+
+Repaired the OpenAL Soft CMake install-prefix argument so PowerShell expands the selected architecture's install root before invoking CMake. The workflow now verifies the installed OpenAL header and import library before exposing the same root to Zandronum's Configure step, preventing an invalid include hint from reaching compilation.
+
+**Files:** `.github/workflows/ci-windows.yml`, `completes/native-openal-soft-phase-1a-phase-6-complete.md`
+**Implementation model:** Windows OpenAL install-prefix repair -> `GPT-5.6 Luna Threadline (customendpoint)`
+**Functions / Assets:** OpenAL Soft Windows install-prefix argument; installed header/library precondition
+**Tests / Validations:** PowerShell native argument-expansion probe passed with an expanded OpenAL install root; workflow YAML parsed with `yq`; targeted `git diff --check` passed. Hosted Win32/x64 build, package, and artifact upload remain pending post-commit CI evidence.
+**Review:** APPROVED
+**Repository finalization:** Atlas stages only this record and the reviewed Windows workflow before creating a separate commit.
+**Commit message:**
+Subject: fix: expand Windows OpenAL prefix
+Body:
+- Expand the OpenAL Soft CMake install root before configuration.
+- Verify the installed OpenAL header and import library before building Zandronum.
