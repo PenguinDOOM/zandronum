@@ -81,6 +81,9 @@ jobs:
             -DOPENAL_LIBRARY="$OPENAL_LIBRARY"
             -DFMOD_INCLUDE_DIR="$FMOD_INCLUDE_DIR"
             -DFMOD_LIBRARY="$FMOD_LIBRARY"
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+            '-DCMAKE_INSTALL_RPATH=$ORIGIN'
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=FALSE
           )
         fi
         cmake "${cmake_args[@]}"
@@ -122,21 +125,25 @@ jobs:
             > "$package/OpenAL-Soft-SOURCE.txt"
 
           command -v readelf >/dev/null
-          openal_linked_executables=0
+          sound_runtime_linked_executables=0
           for executable in "${expected_executables[@]}"; do
             if ! readelf -l "$package/$executable" | grep -q 'Requesting program interpreter:'; then
               continue
             fi
-            ldd_output="$(LD_LIBRARY_PATH="$package" ldd "$package/$executable")"
-            resolved_openal="$(awk '$1 == "libopenal.so.1" { print $3; exit }' <<< "$ldd_output")"
-            if [[ -z "$resolved_openal" ]]; then
-              continue
-            fi
+
+            runtime_search_path="$(readelf -d "$package/$executable" | awk -F'[][]' '/Library (rpath|runpath):/ { print $2 }')"
+            test "$runtime_search_path" = '$ORIGIN'
+
+            loader_trace="$(env -u LD_LIBRARY_PATH LD_TRACE_LOADED_OBJECTS=1 "$package/$executable")"
+            resolved_openal="$(awk '$1 == "libopenal.so.1" { print $3; exit }' <<< "$loader_trace")"
+            resolved_fmod="$(awk -v library="$fmod_name" '$1 == library { print $3; exit }' <<< "$loader_trace")"
             test -n "$resolved_openal"
+            test -n "$resolved_fmod"
             test "$(readlink -f "$resolved_openal")" = "$(readlink -f "$package/$openal_runtime_name")"
-            ((openal_linked_executables += 1))
+            test "$(readlink -f "$resolved_fmod")" = "$(readlink -f "$package/$fmod_name")"
+            ((sound_runtime_linked_executables += 1))
           done
-          ((openal_linked_executables > 0))
+          ((sound_runtime_linked_executables > 0))
         fi
 
         PACKAGE_ROOT="$package" \
