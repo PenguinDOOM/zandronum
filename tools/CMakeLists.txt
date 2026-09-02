@@ -7,6 +7,12 @@ add_subdirectory( updaterevision )
 add_subdirectory( zipdir )
 
 if( BUILD_TESTING )
+	add_executable( audio_decoder_tests
+		audio_decoder_tests.cpp
+		${CMAKE_SOURCE_DIR}/src/sound/audio_decoder.cpp )
+	target_include_directories( audio_decoder_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/sound )
+	add_test( NAME audio_decoder COMMAND audio_decoder_tests )
+
 	add_executable( openal_pcm_tests
 		openal_pcm_tests.cpp
 		${CMAKE_SOURCE_DIR}/src/sound/oaldata.cpp )

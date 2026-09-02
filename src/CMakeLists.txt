@@ -688,6 +688,7 @@ if ( NOT NO_SOUND )
 	set( ZDOOM_LIBS ${ZDOOM_LIBS} "${FMOD_LIBRARY}" "${OPENAL_LIBRARY}" )
 	include_directories( "${ZLIB_INCLUDE_DIR}" "${FMOD_INCLUDE_DIR}" "${OPENAL_INCLUDE_DIR}" "${BZIP2_INCLUDE_DIR}" "${LZMA_INCLUDE_DIR}" "${JPEG_INCLUDE_DIR}" "${GME_INCLUDE_DIR}" )
 	set( SOUND_SOURCES
+		sound/audio_decoder.cpp
 		sound/fmodsound.cpp
 		sound/oalsound.cpp
 	)
