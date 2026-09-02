@@ -145,6 +145,15 @@ struct AudioFrameRange
 	unsigned long long End;
 };
 
+struct AudioDecodedPCM16
+{
+	AudioDecodedPCM16 ();
+
+	unsigned int SampleRate;
+	unsigned int Channels;
+	std::vector<short> Samples;
+};
+
 class AudioDecoder
 {
 public:
@@ -180,5 +189,20 @@ public:
 };
 
 AudioDecodeStatus CreateAudioDecoder (AudioDataSource &source, const AudioProbeResult &probe, AudioDecoder **decoder);
+AudioDecodeStatus DecodeAudioToPCM16 (AudioDataSource &source, const AudioProbeResult &probe, AudioDecodedPCM16 *decoded);
+
+// Decoder adapters use this to take an independent, bounded copy of a logical source.
+AudioDecodeStatus CopyAudioDecoderSource (AudioDataSource &source, std::vector<unsigned char> *data);
+
+#ifdef AUDIO_DECODER_TESTING
+bool AudioDecoderTestSupportsVorbisChannels (unsigned int channels);
+bool AudioDecoderTestSupportsVorbisTotalFrames (unsigned int frames);
+bool AudioDecoderTestVorbisCanReadFrames (unsigned int totalFrames, unsigned long long position, unsigned int frames);
+bool AudioDecoderTestVorbisCanSeekFrame (unsigned int totalFrames, unsigned long long frame);
+bool AudioDecoderTestVorbisIsLogicalEOF (unsigned int totalFrames, unsigned long long frame);
+bool AudioDecoderTestVorbisCanUseLoopEndpoint (unsigned int totalFrames, unsigned long long endpoint);
+bool AudioDecoderTestParseVorbisLoopComments (const char *const *comments, int commentCount, bool totalFramesKnown, unsigned long long totalFrames, unsigned int sampleRate, AudioFrameRange *range, int *diagnosticCode);
+const char *AudioDecoderTestVorbisLoopDiagnosticString ();
+#endif
 
 #endif

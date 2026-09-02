@@ -38,6 +38,7 @@
 #include "actor.h"
 #include "a_sharedglobal.h"
 #include "s_sound.h"
+#include "sound/audio_timetag.h"
 #include "c_dispatch.h"
 #include "w_wad.h"
 #include "sc_man.h"
@@ -1872,77 +1873,7 @@ int S_FindSkinnedSoundEx (AActor *actor, const char *name, const char *extendedn
 
 bool S_ParseTimeTag(const char *tag, bool *as_samples, unsigned int *time)
 {
-	const char *bit = tag;
-	char ms[3] = { 0 };
-	unsigned int times[3] = { 0 };
-	int ms_pos = 0, time_pos = 0;
-	bool pcm = true, in_ms = false;
-
-	for (bit = tag; *bit != '\0'; ++bit)
-	{
-		if (*bit >= '0' && *bit <= '9')
-		{
-			if (in_ms)
-			{
-				// Ignore anything past three fractional digits.
-				if (ms_pos < 3)
-				{
-					ms[ms_pos++] = *bit - '0';
-				}
-			}
-			else
-			{
-				times[time_pos] = times[time_pos] * 10 + *bit - '0';
-			}
-		}
-		else if (*bit == ':')
-		{
-			if (in_ms)
-			{ // If we already specified milliseconds, we can't take any more parts.
-				return false;
-			}
-			pcm = false;
-			if (++time_pos == countof(times))
-			{ // Time too long. (Seriously, starting the loop days in?)
-				return false;
-			}
-		}
-		else if (*bit == '.')
-		{
-			if (pcm || in_ms)
-			{ // It doesn't make sense to have fractional PCM values.
-			  // It also doesn't make sense to have more than one dot.
-				return false;
-			}
-			in_ms = true;
-		}
-		else
-		{ // Anything else: We don't understand this.
-			return false;
-		}
-	}
-	if (pcm)
-	{
-		*as_samples = true;
-		*time = times[0];
-	}
-	else
-	{
-		unsigned int mytime = 0;
-
-		// Add in hours, minutes, and seconds
-		for (int i = 0; i <= time_pos; ++i)
-		{
-			mytime = mytime * 60 + times[i];
-		}
-
-		// Add in milliseconds
-		mytime = mytime * 1000 + ms[0] * 100 + ms[1] * 10 + ms[2];
-
-		*as_samples = false;
-		*time = mytime;
-	}
-	return true;
+	return ParseAudioTimeTagToUInt (tag, as_samples, time);
 }
 
 //==========================================================================

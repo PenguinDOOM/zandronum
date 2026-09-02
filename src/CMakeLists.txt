@@ -689,6 +689,9 @@ if ( NOT NO_SOUND )
 	include_directories( "${ZLIB_INCLUDE_DIR}" "${FMOD_INCLUDE_DIR}" "${OPENAL_INCLUDE_DIR}" "${BZIP2_INCLUDE_DIR}" "${LZMA_INCLUDE_DIR}" "${JPEG_INCLUDE_DIR}" "${GME_INCLUDE_DIR}" )
 	set( SOUND_SOURCES
 		sound/audio_decoder.cpp
+			sound/audio_decoder_miniaudio.cpp
+			sound/audio_decoder_vorbis.cpp
+			sound/thirdparty/stb/stb_vorbis.c
 		sound/fmodsound.cpp
 		sound/oalsound.cpp
 	)
@@ -1254,6 +1257,7 @@ add_executable( zdoom WIN32
 	r_sky.cpp
 	r_things.cpp
 	s_advsound.cpp
+	 sound/audio_timetag.cpp
 	s_environment.cpp
 	s_playlist.cpp
 	s_sndseq.cpp

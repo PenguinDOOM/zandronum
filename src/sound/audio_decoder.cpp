@@ -8,6 +8,8 @@ namespace
 	const std::size_t ProbeLimit = 4096;
 	const std::size_t MaxId3TagBytes = 1024 * 1024;
 	const std::size_t MaxId3ProbeBytes = MaxId3TagBytes + 20 + 4096;
+	const std::size_t MaxEncodedBytes = 64 * 1024 * 1024;
+	const std::size_t MaxPCMBytes = (std::size_t)std::numeric_limits<int>::max ();
 
 	bool HasBytes (std::size_t offset, std::size_t count, std::size_t length)
 	{
@@ -421,6 +423,9 @@ namespace
 	}
 }
 
+AudioDecodeStatus CreateMiniaudioDecoder (AudioDataSource &source, const AudioProbeResult &probe, AudioDecoder **decoder);
+AudioDecodeStatus CreateVorbisDecoder (AudioDataSource &source, const AudioProbeResult &probe, AudioDecoder **decoder);
+
 AudioDataSource::~AudioDataSource ()
 {
 }
@@ -656,6 +661,11 @@ AudioFrameRange::AudioFrameRange ()
 {
 }
 
+AudioDecodedPCM16::AudioDecodedPCM16 ()
+	: SampleRate (0), Channels (0)
+{
+}
+
 AudioProbeResult::AudioProbeResult ()
 	: Status (AUDIO_PROBE_UNKNOWN), Format (AUDIO_FORMAT_UNKNOWN)
 {
@@ -726,12 +736,148 @@ AudioDecoderFactory::~AudioDecoderFactory ()
 
 AudioDecodeStatus CreateAudioDecoder (AudioDataSource &source, const AudioProbeResult &probe, AudioDecoder **decoder)
 {
-	(void)source;
-	(void)probe;
 	if (decoder == NULL)
 	{
 		return AUDIO_DECODE_INVALID_SOURCE;
 	}
 	*decoder = NULL;
+	if (probe.Status != AUDIO_PROBE_RECOGNIZED)
+	{
+		return AUDIO_DECODE_INVALID_SOURCE;
+	}
+	if (probe.Format == AUDIO_FORMAT_OGG_VORBIS)
+	{
+		return CreateVorbisDecoder (source, probe, decoder);
+	}
+	if (probe.Format == AUDIO_FORMAT_WAVE_PCM || probe.Format == AUDIO_FORMAT_WAVE_FLOAT ||
+		probe.Format == AUDIO_FORMAT_FLAC || probe.Format == AUDIO_FORMAT_MPEG)
+	{
+		return CreateMiniaudioDecoder (source, probe, decoder);
+	}
 	return AUDIO_DECODE_UNSUPPORTED;
+}
+
+AudioDecodeStatus CopyAudioDecoderSource (AudioDataSource &source, std::vector<unsigned char> *data)
+{
+	std::size_t originalPosition;
+	std::size_t length;
+	std::size_t offset = 0;
+	AudioDecodeStatus result = AUDIO_DECODE_OK;
+	if (data == NULL)
+	{
+		return AUDIO_DECODE_INVALID_SOURCE;
+	}
+	originalPosition = source.Tell ();
+	length = source.GetLength ();
+	if (originalPosition > length || length > MaxEncodedBytes || source.Seek (AUDIO_SEEK_BEGIN, 0) != AUDIO_SOURCE_OK)
+	{
+		return AUDIO_DECODE_INVALID_SOURCE;
+	}
+	try
+	{
+		data->assign (length, 0);
+	}
+	catch (...)
+	{
+		return AUDIO_DECODE_INVALID_SOURCE;
+	}
+	while (offset < length)
+	{
+		std::size_t bytesRead = 0;
+		AudioSourceStatus status = source.Read (&(*data)[offset], length - offset, &bytesRead);
+		if (bytesRead > length - offset || (status != AUDIO_SOURCE_OK && status != AUDIO_SOURCE_EOF))
+		{
+			result = AUDIO_DECODE_IO_ERROR;
+			break;
+		}
+		offset += bytesRead;
+		if (offset != length && (status == AUDIO_SOURCE_EOF || bytesRead == 0))
+		{
+			result = AUDIO_DECODE_INVALID_SOURCE;
+			break;
+		}
+	}
+	if (source.Seek (AUDIO_SEEK_BEGIN, (long long)originalPosition) != AUDIO_SOURCE_OK)
+	{
+		data->clear ();
+		return AUDIO_DECODE_IO_ERROR;
+	}
+	if (result != AUDIO_DECODE_OK)
+	{
+		data->clear ();
+	}
+	return result;
+}
+
+AudioDecodeStatus DecodeAudioToPCM16 (AudioDataSource &source, const AudioProbeResult &probe, AudioDecodedPCM16 *decoded)
+{
+	AudioDecoder *decoder = NULL;
+	AudioDecodeStatus status;
+	unsigned long long totalFrames;
+	std::size_t maxSamples = MaxPCMBytes / sizeof (short);
+	if (decoded == NULL)
+	{
+		return AUDIO_DECODE_INVALID_SOURCE;
+	}
+	*decoded = AudioDecodedPCM16 ();
+	status = CreateAudioDecoder (source, probe, &decoder);
+	if (status != AUDIO_DECODE_OK)
+	{
+		return status;
+	}
+	decoded->SampleRate = decoder->GetNativeSampleRate ();
+	decoded->Channels = decoder->GetOutputChannels ();
+	if (decoded->SampleRate == 0 || decoded->Channels == 0 || decoded->Channels > 2 ||
+		(decoder->GetTotalFrames (&totalFrames) && (totalFrames > maxSamples / decoded->Channels)))
+	{
+		delete decoder;
+		*decoded = AudioDecodedPCM16 ();
+		return AUDIO_DECODE_INVALID_SOURCE;
+	}
+	try
+	{
+		if (decoder->GetTotalFrames (&totalFrames))
+		{
+			decoded->Samples.reserve ((std::size_t)totalFrames * decoded->Channels);
+		}
+		for (;;)
+		{
+			short frames[8192];
+			std::size_t framesRead = 0;
+			std::size_t capacity = 8192 / decoded->Channels;
+			AudioDecoderReadStatus readStatus = decoder->ReadFrames (frames, capacity, &framesRead);
+			if (readStatus == AUDIO_DECODER_ERROR || framesRead > capacity ||
+				framesRead > (maxSamples - decoded->Samples.size ()) / decoded->Channels)
+			{
+				delete decoder;
+				*decoded = AudioDecodedPCM16 ();
+				return AUDIO_DECODE_INVALID_SOURCE;
+			}
+			decoded->Samples.insert (decoded->Samples.end (), frames, frames + framesRead * decoded->Channels);
+			if (readStatus == AUDIO_DECODER_EOF)
+			{
+				break;
+			}
+			if (framesRead == 0)
+			{
+				delete decoder;
+				*decoded = AudioDecodedPCM16 ();
+				return AUDIO_DECODE_INVALID_SOURCE;
+			}
+		}
+	}
+	catch (...)
+	{
+		delete decoder;
+		*decoded = AudioDecodedPCM16 ();
+		return AUDIO_DECODE_INVALID_SOURCE;
+	}
+	if (decoder->GetTotalFrames (&totalFrames) && decoded->Samples.size () / decoded->Channels != totalFrames)
+	{
+		delete decoder;
+		*decoded = AudioDecodedPCM16 ();
+		return AUDIO_DECODE_INVALID_SOURCE;
+	}
+	delete decoder;
+	return AUDIO_DECODE_OK;
 }

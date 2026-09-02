@@ -9,8 +9,13 @@ add_subdirectory( zipdir )
 if( BUILD_TESTING )
 	add_executable( audio_decoder_tests
 		audio_decoder_tests.cpp
-		${CMAKE_SOURCE_DIR}/src/sound/audio_decoder.cpp )
+		${CMAKE_SOURCE_DIR}/src/sound/audio_decoder.cpp
+		${CMAKE_SOURCE_DIR}/src/sound/audio_decoder_miniaudio.cpp
+		${CMAKE_SOURCE_DIR}/src/sound/audio_decoder_vorbis.cpp
+		${CMAKE_SOURCE_DIR}/src/sound/audio_timetag.cpp
+		${CMAKE_SOURCE_DIR}/src/sound/thirdparty/stb/stb_vorbis.c )
 	target_include_directories( audio_decoder_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/sound )
+	target_compile_definitions( audio_decoder_tests PRIVATE AUDIO_DECODER_TESTING AUDIO_DECODER_TESTDATA_DIR="${CMAKE_SOURCE_DIR}/tools/testdata/audio" )
 	add_test( NAME audio_decoder COMMAND audio_decoder_tests )
 
 	add_executable( openal_pcm_tests

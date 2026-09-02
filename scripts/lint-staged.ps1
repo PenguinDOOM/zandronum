@@ -7,6 +7,11 @@ $ErrorActionPreference = "Stop"
 $MaxCCN = 20
 $MaxNLOC = 80
 
+$immutablePinnedThirdPartyPaths = @(
+    "src/sound/thirdparty/miniaudio/miniaudio.h",
+    "src/sound/thirdparty/stb/stb_vorbis.c"
+)
+
 $lizard = Get-Command lizard -ErrorAction SilentlyContinue
 
 if (-not $lizard) {
@@ -53,6 +58,11 @@ foreach ($line in $changes) {
     }
 
     if ($newPath -notmatch '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$') {
+        continue
+    }
+
+    if ($immutablePinnedThirdPartyPaths -contains $newPath) {
+        Write-Host "Skipping ${newPath}: immutable pinned third-party source."
         continue
     }
 
