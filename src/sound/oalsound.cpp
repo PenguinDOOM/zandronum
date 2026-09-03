@@ -1,5 +1,6 @@
 #include "oalsound.h"
 
+#include "audio_decoder.h"
 #include "oaldata.h"
 
 #include <AL/al.h>
@@ -9,6 +10,7 @@
 #include <stdint.h>
 #include <limits>
 #include <math.h>
+#include <new>
 #include <string.h>
 
 #ifdef OAL_LIFECYCLE_TEST
@@ -53,6 +55,258 @@ enum
 	OALSTREAM_Bits32 = 4,
 	OALSTREAM_Float = 8
 };
+
+enum
+{
+	OALAL_SourceQuery = 1,
+	OALAL_SourcePlay,
+	OALAL_SourcePause,
+	OALAL_BufferUpload,
+	OALAL_BufferQueue,
+	OALAL_BufferUnqueue,
+	OALAL_SourceStop,
+	OALAL_SourceGain,
+	OALAL_SourcePositionQuery
+};
+
+enum OpenALProducerReadStatus
+{
+	OALPRODUCER_Data,
+	OALPRODUCER_EOF,
+	OALPRODUCER_Error
+};
+
+class OpenALStreamProducer
+{
+public:
+	virtual ~OpenALStreamProducer () {}
+	virtual OpenALProducerReadStatus ReadFrames (OpenALSoundStream *stream, BYTE *data, unsigned int frameCount, unsigned int bytesPerFrame, unsigned int *framesRead) = 0;
+	virtual bool GetTotalFrames (unsigned long long *frames) const = 0;
+	virtual unsigned long long TellFrame () const = 0;
+	virtual bool GetLoopRange (AudioFrameRange *range) const = 0;
+	virtual AudioDecoderSeekStatus SeekFrame (unsigned long long frame) = 0;
+#ifdef OAL_LIFECYCLE_TEST
+	virtual void SetTestAllowArbitrarySeek () {}
+#endif
+};
+
+class CallbackStreamProducer : public OpenALStreamProducer
+{
+public:
+	CallbackStreamProducer (SoundStreamCallback callback, void *userData)
+		: Callback (callback), UserData (userData), Position (0)
+#ifdef OAL_LIFECYCLE_TEST
+		, TestAllowArbitrarySeek (false)
+#endif
+	{
+	}
+
+	OpenALProducerReadStatus ReadFrames (OpenALSoundStream *stream, BYTE *data, unsigned int frameCount, unsigned int bytesPerFrame, unsigned int *framesRead)
+	{
+		bool hasData;
+		if (framesRead == NULL || Callback == NULL)
+		{
+			return OALPRODUCER_Error;
+		}
+#ifdef OAL_LIFECYCLE_TEST
+		hasData = ((bool (*)(SoundStream *, void *, int, void *))Callback) (stream, data, (int)(frameCount * bytesPerFrame), UserData);
+#else
+		hasData = Callback (stream, data, (int)(frameCount * bytesPerFrame), UserData);
+#endif
+		if (!hasData)
+		{
+			*framesRead = 0;
+			return OALPRODUCER_EOF;
+		}
+		*framesRead = frameCount;
+		Position = std::numeric_limits<unsigned long long>::max () - Position < frameCount ?
+			std::numeric_limits<unsigned long long>::max () : Position + frameCount;
+		return OALPRODUCER_Data;
+	}
+
+	bool GetTotalFrames (unsigned long long *) const { return false; }
+	unsigned long long TellFrame () const { return Position; }
+	bool GetLoopRange (AudioFrameRange *) const { return false; }
+	AudioDecoderSeekStatus SeekFrame (unsigned long long frame)
+	{
+		if (frame != 0
+#ifdef OAL_LIFECYCLE_TEST
+			&& !TestAllowArbitrarySeek
+#endif
+			)
+		{
+			return AUDIO_DECODER_SEEK_ERROR;
+		}
+		Position = frame;
+		return AUDIO_DECODER_SEEK_OK;
+	}
+
+#ifdef OAL_LIFECYCLE_TEST
+	void SetTestAllowArbitrarySeek ()
+	{
+		TestAllowArbitrarySeek = true;
+	}
+#endif
+
+private:
+	SoundStreamCallback Callback;
+	void *UserData;
+	unsigned long long Position;
+#ifdef OAL_LIFECYCLE_TEST
+	bool TestAllowArbitrarySeek;
+#endif
+};
+
+class DecoderStreamProducer : public OpenALStreamProducer
+{
+public:
+	explicit DecoderStreamProducer (AudioDecoder *decoder) : Decoder (decoder) {}
+	~DecoderStreamProducer () { delete Decoder; }
+
+	OpenALProducerReadStatus ReadFrames (OpenALSoundStream *, BYTE *data, unsigned int frameCount, unsigned int, unsigned int *framesRead)
+	{
+		std::size_t read = 0;
+		AudioDecoderReadStatus status;
+		if (Decoder == NULL || framesRead == NULL)
+		{
+			return OALPRODUCER_Error;
+		}
+		status = Decoder->ReadFrames ((short *)data, frameCount, &read);
+		if (read > frameCount)
+		{
+			return OALPRODUCER_Error;
+		}
+		*framesRead = (unsigned int)read;
+		return status == AUDIO_DECODER_DATA ? OALPRODUCER_Data :
+			status == AUDIO_DECODER_EOF ? OALPRODUCER_EOF : OALPRODUCER_Error;
+	}
+
+	bool GetTotalFrames (unsigned long long *frames) const { return Decoder != NULL && Decoder->GetTotalFrames (frames); }
+	unsigned long long TellFrame () const { return Decoder == NULL ? 0 : Decoder->TellFrame (); }
+	bool GetLoopRange (AudioFrameRange *range) const { return Decoder != NULL && Decoder->GetLoopRange (range); }
+	AudioDecoderSeekStatus SeekFrame (unsigned long long frame) { return Decoder == NULL ? AUDIO_DECODER_SEEK_TERMINAL_ERROR : Decoder->SeekFrame (frame); }
+
+private:
+	AudioDecoder *Decoder;
+};
+
+#ifdef OAL_LIFECYCLE_TEST
+class PatternStreamProducer : public OpenALStreamProducer
+{
+public:
+	PatternStreamProducer (unsigned int totalFrames, unsigned int loopStart, unsigned int loopEnd)
+		: TotalFrames (totalFrames), LoopStart (loopStart), LoopEnd (loopEnd), Position (0)
+	{
+	}
+
+	OpenALProducerReadStatus ReadFrames (OpenALSoundStream *, BYTE *data, unsigned int frameCount, unsigned int, unsigned int *framesRead)
+	{
+		unsigned int available;
+		unsigned int count;
+		short *samples;
+		if (data == NULL || framesRead == NULL)
+		{
+			return OALPRODUCER_Error;
+		}
+		if (Position >= TotalFrames)
+		{
+			*framesRead = 0;
+			return OALPRODUCER_EOF;
+		}
+		available = TotalFrames - Position;
+		count = frameCount < available ? frameCount : available;
+		samples = (short *)data;
+		for (unsigned int index = 0; index < count; ++index)
+		{
+			samples[index] = (short)(Position + index);
+		}
+		Position += count;
+		*framesRead = count;
+		return OALPRODUCER_Data;
+	}
+
+	bool GetTotalFrames (unsigned long long *frames) const
+	{
+		if (frames == NULL)
+		{
+			return false;
+		}
+		*frames = TotalFrames;
+		return true;
+	}
+
+	unsigned long long TellFrame () const { return Position; }
+	bool GetLoopRange (AudioFrameRange *range) const
+	{
+		if (range == NULL || LoopStart >= LoopEnd || LoopEnd > TotalFrames)
+		{
+			return false;
+		}
+		range->Start = LoopStart;
+		range->End = LoopEnd;
+		return true;
+	}
+
+	AudioDecoderSeekStatus SeekFrame (unsigned long long frame)
+	{
+		if (frame > TotalFrames)
+		{
+			return AUDIO_DECODER_SEEK_ERROR;
+		}
+		Position = (unsigned int)frame;
+		return AUDIO_DECODER_SEEK_OK;
+	}
+
+private:
+	unsigned int TotalFrames;
+	unsigned int LoopStart;
+	unsigned int LoopEnd;
+	unsigned int Position;
+};
+#endif
+
+static AudioDataSource *OpenEncodedMusicSource (const char *filename, int offset, int length, AudioFileSource *file, AudioMemorySource *memory)
+{
+	if (offset == -1)
+	{
+		if (length == 0 || memory->Assign (filename, (size_t)length) != AUDIO_SOURCE_OK)
+		{
+			Printf (TEXTCOLOR_RED "OpenAL could not read encoded music data.\n");
+			return NULL;
+		}
+		return memory;
+	}
+	if ((offset == 0 && length == 0 && file->Open (filename) == AUDIO_SOURCE_OK) ||
+		(length > 0 && file->OpenSlice (filename, (size_t)offset, (size_t)length) == AUDIO_SOURCE_OK))
+	{
+		return file;
+	}
+	Printf (TEXTCOLOR_RED "OpenAL could not open encoded music data.\n");
+	return NULL;
+}
+
+static DecoderStreamProducer *CreateEncodedMusicProducer (AudioDataSource *source, unsigned int *channels, unsigned int *sampleRate)
+{
+	AudioProbeResult probe = ProbeAudioFormat (*source);
+	AudioDecoder *decoder = NULL;
+	AudioDecodeStatus status = CreateAudioDecoder (*source, probe, &decoder);
+	DecoderStreamProducer *producer;
+	if (status != AUDIO_DECODE_OK || decoder == NULL || decoder->GetNativeSampleRate () == 0 ||
+		(decoder->GetOutputChannels () != 1 && decoder->GetOutputChannels () != 2))
+	{
+		delete decoder;
+		Printf (TEXTCOLOR_RED "OpenAL does not support this encoded music stream.\n");
+		return NULL;
+	}
+	*channels = decoder->GetOutputChannels ();
+	*sampleRate = decoder->GetNativeSampleRate ();
+	producer = new (std::nothrow) DecoderStreamProducer (decoder);
+	if (producer == NULL)
+	{
+		delete decoder;
+	}
+	return producer;
+}
 
 static unsigned long long SaturatingAdd (unsigned long long left, unsigned long long right)
 {
@@ -140,14 +394,35 @@ OpenALChannel::OpenALChannel ()
 }
 
 OpenALSoundStream::OpenALSoundStream (OpenALSoundRenderer *owner, SoundStreamCallback callback, int bufferBytes, int flags, int sampleRate, void *userData)
-	: Source (0), Owner (owner), Callback (callback), UserData (userData), SampleRate ((unsigned int)sampleRate),
+	: Source (0), Owner (owner), Producer (new (std::nothrow) CallbackStreamProducer (callback, userData)), SampleRate ((unsigned int)sampleRate),
 	  StreamChannels ((flags & OALSTREAM_Mono) ? 1 : 2), InputBits ((flags & OALSTREAM_Float) ? 32 : (flags & OALSTREAM_Bits32) ? 32 : (flags & OALSTREAM_Bits8) ? 8 : 16),
-	  OutputBits (0), OutputFormat (0), ProcessedFrames (0), Volume (1.f), EndOfInput (false), Failed (false), Ended (false),
-	  Playing (false), UserPaused (false), InactivePaused (false), InputIsFloat ((flags & OALSTREAM_Float) != 0), ResourcesReleased (false)
+	  OutputBits (0), OutputFormat (0), MediaFrame (0), LoopStart (0), LoopEnd (0), Volume (1.f), EndOfInput (false), Looping (false), HasLoopRange (false),
+	  UserPaused (false), InactivePaused (false), InputIsFloat ((flags & OALSTREAM_Float) != 0), ResourcesReleased (false), State (OALSTREAM_Stopped)
+#ifdef OAL_LIFECYCLE_TEST
+	  , TestFailNextRewind (false), TestRewindTerminal (false), TestFailNextBufferUpload (false), TestFailNextALOperation (0)
+#endif
+{
+	InitializeBuffers (bufferBytes, flags);
+}
+
+OpenALSoundStream::OpenALSoundStream (OpenALSoundRenderer *owner, OpenALStreamProducer *producer, int bufferBytes, int flags, int sampleRate)
+	: Source (0), Owner (owner), Producer (producer), SampleRate ((unsigned int)sampleRate),
+	  StreamChannels ((flags & OALSTREAM_Mono) ? 1 : 2), InputBits (16), OutputBits (0), OutputFormat (0), MediaFrame (0), LoopStart (0), LoopEnd (0),
+	  Volume (1.f), EndOfInput (false), Looping (false), HasLoopRange (false), UserPaused (false), InactivePaused (false), InputIsFloat (false),
+	  ResourcesReleased (false), State (OALSTREAM_Stopped)
+#ifdef OAL_LIFECYCLE_TEST
+	  , TestFailNextRewind (false), TestRewindTerminal (false), TestFailNextBufferUpload (false), TestFailNextALOperation (0)
+#endif
+{
+	InitializeBuffers (bufferBytes, flags);
+}
+
+void OpenALSoundStream::InitializeBuffers (int bufferBytes, int flags)
 {
 	unsigned int bytesPerInputFrame = StreamChannels * (InputBits / 8);
 	memset (Buffers, 0, sizeof (Buffers));
 	memset (BufferFrames, 0, sizeof (BufferFrames));
+	memset (BufferMediaStart, 0, sizeof (BufferMediaStart));
 	InputBuffer.resize ((size_t)bufferBytes);
 	if (flags & OALSTREAM_Float)
 	{
@@ -175,18 +450,20 @@ OpenALSoundStream::OpenALSoundStream (OpenALSoundRenderer *owner, SoundStreamCal
 OpenALSoundStream::~OpenALSoundStream ()
 {
 	ReleaseResources ();
+	delete Producer;
+	Producer = NULL;
 	if (Owner != NULL)
 	{
 		Owner->DestroyStream (this);
 	}
 }
 
-bool OpenALSoundStream::ConvertBuffer ()
+bool OpenALSoundStream::ConvertBuffer (unsigned int frames)
 {
-	size_t samples = (size_t)InputBuffer.size () / (InputBits / 8);
+	size_t samples = (size_t)frames * StreamChannels;
 	if (InputBits == OutputBits && InputBits != 8)
 	{
-		OutputBuffer = InputBuffer;
+		memcpy (&OutputBuffer[0], &InputBuffer[0], samples * (InputBits / 8));
 		return true;
 	}
 	if (InputBits == 8)
@@ -230,45 +507,358 @@ bool OpenALSoundStream::ConvertBuffer ()
 
 bool OpenALSoundStream::QueueBuffer (unsigned int buffer)
 {
-	bool hasData;
 	unsigned int bufferIndex = 0;
 	unsigned int bytesPerFrame = StreamChannels * (InputBits / 8);
-	for (; bufferIndex < 4 && Buffers[bufferIndex] != buffer; ++bufferIndex)
+	unsigned int framesRead = 0;
+	unsigned int requestedFrames = (unsigned int)(InputBuffer.size () / bytesPerFrame);
+	unsigned long long mediaStart;
+	if (!FindBufferIndex (buffer, &bufferIndex) || Producer == NULL || EndOfInput || State == OALSTREAM_Failed)
+	{
+		return false;
+	}
+	if (!ReadBufferFrames (requestedFrames, bytesPerFrame, &mediaStart, &framesRead))
+	{
+		return false;
+	}
+	if (!ConvertBuffer (framesRead))
+	{
+		SetFailed ();
+		return false;
+	}
+	return SubmitBuffer (buffer, bufferIndex, mediaStart, framesRead);
+}
+
+bool OpenALSoundStream::FindBufferIndex (unsigned int buffer, unsigned int *bufferIndex) const
+{
+	for (*bufferIndex = 0; *bufferIndex < 4 && Buffers[*bufferIndex] != buffer; ++*bufferIndex)
 	{
 	}
-	if (bufferIndex == 4 || Callback == NULL || EndOfInput)
+	return *bufferIndex < 4;
+}
+
+bool OpenALSoundStream::ReadBufferFrames (unsigned int requestedFrames, unsigned int bytesPerFrame, unsigned long long *mediaStart, unsigned int *framesRead)
+{
+	OpenALProducerReadStatus status;
+	*mediaStart = Producer->TellFrame ();
+	if (Looping && HasLoopRange && *mediaStart >= LoopEnd)
+	{
+		if (!RewindProducer (LoopStart))
+		{
+			return false;
+		}
+		*mediaStart = Producer->TellFrame ();
+	}
+	if (Looping && HasLoopRange && *mediaStart < LoopEnd && requestedFrames > LoopEnd - *mediaStart)
+	{
+		requestedFrames = (unsigned int)(LoopEnd - *mediaStart);
+	}
+	status = Producer->ReadFrames (this, &InputBuffer[0], requestedFrames, bytesPerFrame, framesRead);
+	if (status == OALPRODUCER_EOF && Looping)
+	{
+		if (!RewindProducer (HasLoopRange ? LoopStart : 0))
+		{
+			return false;
+		}
+		*mediaStart = Producer->TellFrame ();
+		status = Producer->ReadFrames (this, &InputBuffer[0], requestedFrames, bytesPerFrame, framesRead);
+	}
+	if (status == OALPRODUCER_EOF)
+	{
+		EndOfInput = true;
+		return false;
+	}
+	if (status != OALPRODUCER_Data || *framesRead == 0 || *framesRead > requestedFrames)
+	{
+		SetFailed ();
+		return false;
+	}
+	return true;
+}
+
+bool OpenALSoundStream::SubmitBuffer (unsigned int buffer, unsigned int bufferIndex, unsigned long long mediaStart, unsigned int framesRead)
+{
+#ifdef OAL_LIFECYCLE_TEST
+	if (TestFailNextBufferUpload || ConsumeTestALFailure (OALAL_BufferUpload))
+	{
+		TestFailNextBufferUpload = false;
+		SetFailed ();
+		return false;
+	}
+#endif
+	alBufferData (buffer, (ALenum)OutputFormat, &OutputBuffer[0], (ALsizei)(framesRead * StreamChannels * (OutputBits / 8)), (ALsizei)SampleRate);
+	if (!CheckALError (OALAL_BufferUpload))
 	{
 		return false;
 	}
 #ifdef OAL_LIFECYCLE_TEST
-	hasData = ((bool (*)(SoundStream *, void *, int, void *))Callback) (this, &InputBuffer[0], (int)InputBuffer.size (), UserData);
-#else
-	hasData = Callback (this, &InputBuffer[0], (int)InputBuffer.size (), UserData);
+	if (ConsumeTestALFailure (OALAL_BufferQueue))
+	{
+		return false;
+	}
 #endif
-	if (!hasData)
-	{
-		EndOfInput = true;
-		return false;
-	}
-	if (!ConvertBuffer ())
-	{
-		EndOfInput = true;
-		return false;
-	}
-	alBufferData (buffer, (ALenum)OutputFormat, &OutputBuffer[0], (ALsizei)OutputBuffer.size (), (ALsizei)SampleRate);
-	if (alGetError () != AL_NO_ERROR)
-	{
-		Failed = true;
-		return false;
-	}
 	alSourceQueueBuffers (Source, 1, (ALuint *)&buffer);
-	if (alGetError () != AL_NO_ERROR)
+	if (!CheckALError (OALAL_BufferQueue))
 	{
-		Failed = true;
 		return false;
 	}
-	BufferFrames[bufferIndex] = (unsigned int)(InputBuffer.size () / bytesPerFrame);
+	BufferFrames[bufferIndex] = framesRead;
+	BufferMediaStart[bufferIndex] = mediaStart;
+	QueueOrder.push_back (buffer);
 	return true;
+}
+
+bool OpenALSoundStream::RecycleProcessedBuffer ()
+{
+	ALuint buffer;
+	unsigned int bufferIndex = 0;
+#ifdef OAL_LIFECYCLE_TEST
+	if (ConsumeTestALFailure (OALAL_BufferUnqueue))
+	{
+		return false;
+	}
+#endif
+	alSourceUnqueueBuffers (Source, 1, &buffer);
+	if (!CheckALError (OALAL_BufferUnqueue))
+	{
+		return false;
+	}
+	if (FindBufferIndex (buffer, &bufferIndex))
+	{
+		MediaFrame = NormalizeMediaFrame (BufferMediaStart[bufferIndex] + BufferFrames[bufferIndex]);
+		BufferFrames[bufferIndex] = 0;
+		if (!QueueOrder.empty ())
+		{
+			QueueOrder.erase (QueueOrder.begin ());
+		}
+		QueueBuffer (buffer);
+		if (State == OALSTREAM_Failed)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+void OpenALSoundStream::UpdatePlaybackState ()
+{
+	ALint queued = 0;
+	ALint state = AL_STOPPED;
+	alGetSourcei (Source, AL_BUFFERS_QUEUED, &queued);
+	if (!CheckALError (OALAL_SourceQuery))
+	{
+		return;
+	}
+	if (EndOfInput && queued == 0)
+	{
+		State = OALSTREAM_Ended;
+		return;
+	}
+	if (EndOfInput && State != OALSTREAM_Paused)
+	{
+		State = OALSTREAM_Draining;
+	}
+	alGetSourcei (Source, AL_SOURCE_STATE, &state);
+	if (!CheckALError (OALAL_SourceQuery))
+	{
+		return;
+	}
+	if ((State == OALSTREAM_Playing || State == OALSTREAM_Draining) && !UserPaused && !InactivePaused && queued > 0 && state != AL_PLAYING)
+	{
+		alSourcePlay (Source);
+		CheckALError (OALAL_SourcePlay);
+	}
+}
+
+void OpenALSoundStream::Update ()
+{
+	ALint processed = 0;
+	if (ResourcesReleased || State == OALSTREAM_Ended || State == OALSTREAM_Failed)
+	{
+		return;
+	}
+	alGetSourcei (Source, AL_BUFFERS_PROCESSED, &processed);
+	if (!CheckALError (OALAL_SourceQuery))
+	{
+		return;
+	}
+	while (processed-- > 0)
+	{
+		if (!RecycleProcessedBuffer ())
+		{
+			return;
+		}
+	}
+	UpdatePlaybackState ();
+}
+
+bool OpenALSoundStream::CheckALError (unsigned int operation)
+{
+#ifdef OAL_LIFECYCLE_TEST
+	if (ConsumeTestALFailure (operation)) return false;
+#endif
+	if (alGetError () == AL_NO_ERROR)
+	{
+		return true;
+	}
+	SetFailed ();
+	return false;
+}
+
+#ifdef OAL_LIFECYCLE_TEST
+bool OpenALSoundStream::ConsumeTestALFailure (unsigned int operation)
+{
+	if (TestFailNextALOperation != operation)
+	{
+		return false;
+	}
+	TestFailNextALOperation = 0;
+	SetFailed ();
+	return true;
+}
+#endif
+
+void OpenALSoundStream::SetFailed ()
+{
+	if (State == OALSTREAM_Failed)
+	{
+		return;
+	}
+	State = OALSTREAM_Failed;
+	EndOfInput = true;
+	ClearQueuedBuffers (false);
+}
+
+bool OpenALSoundStream::RewindProducer (unsigned long long frame)
+{
+	#ifdef OAL_LIFECYCLE_TEST
+	if (TestFailNextRewind)
+	{
+		bool terminal = TestRewindTerminal;
+		TestFailNextRewind = false;
+		if (terminal)
+		{
+			SetFailed ();
+		}
+		return false;
+	}
+	#endif
+	AudioDecoderSeekStatus status = Producer == NULL ? AUDIO_DECODER_SEEK_TERMINAL_ERROR : Producer->SeekFrame (frame);
+	if (status == AUDIO_DECODER_SEEK_OK)
+	{
+		return true;
+	}
+	if (status == AUDIO_DECODER_SEEK_TERMINAL_ERROR)
+	{
+		SetFailed ();
+	}
+	return false;
+}
+
+bool OpenALSoundStream::ConfigureLoop ()
+{
+	unsigned long long total = 0;
+	AudioFrameRange range;
+	HasLoopRange = false;
+	LoopStart = 0;
+	LoopEnd = 0;
+	if (!Looping || Producer == NULL)
+	{
+		return true;
+	}
+	if (!Producer->GetTotalFrames (&total) || total == 0)
+	{
+		return true;
+	}
+	if (Producer->GetLoopRange (&range) && range.Start < range.End && range.End <= total)
+	{
+		LoopStart = range.Start;
+		LoopEnd = range.End;
+	}
+	else
+	{
+		LoopEnd = total;
+	}
+	HasLoopRange = true;
+	return true;
+}
+
+unsigned long long OpenALSoundStream::NormalizeMediaFrame (unsigned long long frame) const
+{
+	if (Looping && HasLoopRange && frame >= LoopStart && LoopEnd > LoopStart)
+	{
+		return LoopStart + (frame - LoopStart) % (LoopEnd - LoopStart);
+	}
+	return frame;
+}
+
+bool OpenALSoundStream::ClearQueuedBuffers (bool failOnError)
+{
+	ALint queued = 0;
+	ALenum error;
+	if (ResourcesReleased)
+	{
+		return false;
+	}
+	alGetError ();
+	alSourceStop (Source);
+	error = alGetError ();
+	if (error != AL_NO_ERROR)
+	{
+		if (failOnError)
+		{
+			SetFailed ();
+		}
+		return false;
+	}
+	alGetSourcei (Source, AL_BUFFERS_QUEUED, &queued);
+	error = alGetError ();
+	if (error != AL_NO_ERROR)
+	{
+		if (failOnError)
+		{
+			SetFailed ();
+		}
+		return false;
+	}
+	while (queued-- > 0)
+	{
+		ALuint buffer;
+		alSourceUnqueueBuffers (Source, 1, &buffer);
+		if (alGetError () != AL_NO_ERROR)
+		{
+			if (failOnError)
+			{
+				SetFailed ();
+			}
+			return false;
+		}
+	}
+	memset (BufferFrames, 0, sizeof (BufferFrames));
+	memset (BufferMediaStart, 0, sizeof (BufferMediaStart));
+	QueueOrder.clear ();
+	return true;
+}
+
+unsigned long long OpenALSoundStream::GetCurrentMediaFrame ()
+{
+	ALint offset = 0;
+	if (!ResourcesReleased && (State == OALSTREAM_Playing || State == OALSTREAM_Draining) && !QueueOrder.empty ())
+	{
+		unsigned int buffer = QueueOrder[0];
+		unsigned int index = 0;
+		for (; index < 4 && Buffers[index] != buffer; ++index) {}
+		alGetSourcei (Source, AL_SAMPLE_OFFSET, &offset);
+		if (!CheckALError (OALAL_SourcePositionQuery))
+		{
+			return MediaFrame;
+		}
+		if (index < 4 && offset > 0)
+		{
+			unsigned int limited = (unsigned int)offset > BufferFrames[index] ? BufferFrames[index] : (unsigned int)offset;
+			MediaFrame = NormalizeMediaFrame (BufferMediaStart[index] + limited);
+		}
+	}
+	return MediaFrame;
 }
 
 void OpenALSoundStream::ApplyGain ()
@@ -286,81 +876,126 @@ void OpenALSoundStream::ApplyGain ()
 	if (!ResourcesReleased)
 	{
 		alSourcef (Source, AL_GAIN, gain);
+		CheckALError (OALAL_SourceGain);
 	}
 }
 
 void OpenALSoundStream::ApplyPauseState ()
 {
 	ALint queued = 0;
-	if (!Playing || Ended || ResourcesReleased)
+	if ((State != OALSTREAM_Playing && State != OALSTREAM_Draining && State != OALSTREAM_Paused) || ResourcesReleased)
 	{
 		return;
 	}
 	if (UserPaused || InactivePaused)
 	{
 		alSourcePause (Source);
+		if (!CheckALError (OALAL_SourcePause))
+		{
+			return;
+		}
+		State = OALSTREAM_Paused;
 		return;
 	}
 	alGetSourcei (Source, AL_BUFFERS_QUEUED, &queued);
+	if (!CheckALError (OALAL_SourceQuery))
+	{
+		return;
+	}
 	if (queued > 0)
 	{
 		alSourcePlay (Source);
+		if (!CheckALError (OALAL_SourcePlay))
+		{
+			return;
+		}
+		if (State == OALSTREAM_Paused)
+		{
+			State = EndOfInput ? OALSTREAM_Draining : OALSTREAM_Playing;
+		}
 	}
 }
 
-bool OpenALSoundStream::Play (bool, float volume)
+bool OpenALSoundStream::Play (bool looping, float volume)
 {
 	ALint queued = 0;
-	if (ResourcesReleased || Ended || Failed)
+	if (ResourcesReleased || State == OALSTREAM_Failed || Producer == NULL)
+	{
+		return false;
+	}
+	if (State == OALSTREAM_Ended)
+	{
+		if (!RewindProducer (0))
+		{
+			return false;
+		}
+		EndOfInput = false;
+		MediaFrame = 0;
+		UserPaused = false;
+		State = OALSTREAM_Stopped;
+	}
+	Looping = looping;
+	if (!ConfigureLoop ())
 	{
 		return false;
 	}
 	Volume = volume;
 	ApplyGain ();
+	if (State == OALSTREAM_Failed)
+	{
+		return false;
+	}
 	alGetSourcei (Source, AL_BUFFERS_QUEUED, &queued);
+	if (!CheckALError (OALAL_SourceQuery))
+	{
+		return false;
+	}
 	if (queued == 0)
 	{
 		for (unsigned int index = 0; index < 4; ++index)
 		{
 			QueueBuffer (Buffers[index]);
-			if (Failed)
+			if (State == OALSTREAM_Failed)
 			{
 				return false;
 			}
 		}
 		alGetSourcei (Source, AL_BUFFERS_QUEUED, &queued);
+		if (!CheckALError (OALAL_SourceQuery))
+		{
+			return false;
+		}
 		if (queued == 0)
 		{
-			Ended = EndOfInput;
+			State = EndOfInput ? OALSTREAM_Ended : OALSTREAM_Stopped;
 			return false;
 		}
 	}
-	Playing = true;
+	State = EndOfInput ? OALSTREAM_Draining : OALSTREAM_Playing;
 	ApplyPauseState ();
-	return alGetError () == AL_NO_ERROR;
+	return State != OALSTREAM_Failed;
 }
 
 void OpenALSoundStream::Stop ()
 {
-	ALint queued = 0;
-	if (ResourcesReleased)
+	if (ResourcesReleased || State == OALSTREAM_Failed)
 	{
 		return;
 	}
-	alSourceStop (Source);
-	alGetSourcei (Source, AL_BUFFERS_QUEUED, &queued);
-	while (queued-- > 0)
+	if (!RewindProducer (0))
 	{
-		ALuint buffer;
-		alSourceUnqueueBuffers (Source, 1, &buffer);
+		return;
 	}
-	memset (BufferFrames, 0, sizeof (BufferFrames));
-	ProcessedFrames = 0;
-	Playing = false;
+	if (!ClearQueuedBuffers ())
+	{
+		return;
+	}
+	MediaFrame = 0;
 	EndOfInput = false;
-	Failed = false;
-	Ended = false;
+	Looping = false;
+	HasLoopRange = false;
 	UserPaused = false;
+	State = OALSTREAM_Stopped;
 }
 
 void OpenALSoundStream::SetVolume (float volume)
@@ -371,27 +1006,24 @@ void OpenALSoundStream::SetVolume (float volume)
 
 bool OpenALSoundStream::SetPaused (bool paused)
 {
-	if (ResourcesReleased || Ended || !Playing)
+	if (ResourcesReleased || State == OALSTREAM_Failed || State == OALSTREAM_Ended ||
+		(State != OALSTREAM_Playing && State != OALSTREAM_Draining && State != OALSTREAM_Paused))
+	{
+		return false;
+	}
+	GetCurrentMediaFrame ();
+	if (State == OALSTREAM_Failed)
 	{
 		return false;
 	}
 	UserPaused = paused;
 	ApplyPauseState ();
-	return alGetError () == AL_NO_ERROR;
+	return State != OALSTREAM_Failed;
 }
 
 unsigned int OpenALSoundStream::GetPosition ()
 {
-	ALint offset = 0;
-	unsigned long long frames = ProcessedFrames;
-	if (!ResourcesReleased && Playing && !Ended)
-	{
-		alGetSourcei (Source, AL_SAMPLE_OFFSET, &offset);
-		if (offset > 0)
-		{
-			frames = SaturatingAdd (frames, (unsigned int)offset);
-		}
-	}
+	unsigned long long frames = GetCurrentMediaFrame ();
 	if (SampleRate == 0)
 	{
 		return 0;
@@ -409,72 +1041,146 @@ unsigned int OpenALSoundStream::GetPosition ()
 
 bool OpenALSoundStream::IsEnded ()
 {
-	return Ended;
+	return State == OALSTREAM_Ended || State == OALSTREAM_Failed;
 }
 
 #ifdef OAL_LIFECYCLE_TEST
 void OpenALSoundStream::SetProcessedFramesForTest (unsigned long long frames)
 {
-	ProcessedFrames = frames;
+	MediaFrame = frames;
+}
+
+void OpenALSoundStream::FailNextRewindForTest (bool terminal)
+{
+	TestFailNextRewind = true;
+	TestRewindTerminal = terminal;
+}
+
+void OpenALSoundStream::FailNextBufferUploadForTest ()
+{
+	TestFailNextBufferUpload = true;
+}
+
+void OpenALSoundStream::FailNextALOperationForTest (OpenALStreamTestALOperation operation)
+{
+	switch (operation)
+	{
+	case OALTESTAL_SourceQuery: TestFailNextALOperation = OALAL_SourceQuery; break;
+	case OALTESTAL_SourcePlay: TestFailNextALOperation = OALAL_SourcePlay; break;
+	case OALTESTAL_SourcePause: TestFailNextALOperation = OALAL_SourcePause; break;
+	case OALTESTAL_BufferUpload: TestFailNextALOperation = OALAL_BufferUpload; break;
+	case OALTESTAL_BufferQueue: TestFailNextALOperation = OALAL_BufferQueue; break;
+	case OALTESTAL_BufferUnqueue: TestFailNextALOperation = OALAL_BufferUnqueue; break;
+	case OALTESTAL_PositionQuery: TestFailNextALOperation = OALAL_SourcePositionQuery; break;
+	default: TestFailNextALOperation = 0; break;
+	}
+}
+
+bool OpenALSoundStream::ProcessNextBufferForTest ()
+{
+	return RecycleProcessedBuffer ();
+}
+
+void OpenALSoundStream::AllowArbitrarySeekForTest ()
+{
+	if (Producer != NULL)
+	{
+		Producer->SetTestAllowArbitrarySeek ();
+	}
+}
+
+OpenALStreamState OpenALSoundStream::GetStateForTest () const
+{
+	return State;
+}
+
+unsigned int OpenALSoundStream::GetQueuedBufferCountForTest () const
+{
+	ALint queued = 0;
+	if (!ResourcesReleased)
+	{
+		alGetSourcei (Source, AL_BUFFERS_QUEUED, &queued);
+	}
+	return queued > 0 ? (unsigned int)queued : 0;
+}
+
+unsigned long long OpenALSoundStream::GetBufferMediaStartForTest (unsigned int buffer) const
+{
+	return buffer < 4 ? BufferMediaStart[buffer] : 0;
+}
+
+unsigned int OpenALSoundStream::GetBufferFramesForTest (unsigned int buffer) const
+{
+	return buffer < 4 ? BufferFrames[buffer] : 0;
+}
+
+unsigned long long OpenALSoundStream::GetMediaFrameForTest () const
+{
+	return MediaFrame;
 }
 #endif
+
+bool OpenALSoundStream::SetPosition (unsigned int milliseconds)
+{
+	unsigned long long total;
+	unsigned long long frame;
+	OpenALStreamState oldState;
+	bool wasUserPaused;
+	bool wasInactivePaused;
+	bool hasTotal;
+	if (ResourcesReleased || State == OALSTREAM_Failed || Producer == NULL || SampleRate == 0)
+	{
+		return false;
+	}
+	frame = ((unsigned long long)milliseconds * SampleRate) / 1000;
+	hasTotal = Producer->GetTotalFrames (&total);
+	if (hasTotal && frame > total)
+	{
+		return false;
+	}
+	if (!RewindProducer (frame))
+	{
+		return false;
+	}
+	oldState = State;
+	wasUserPaused = UserPaused;
+	wasInactivePaused = InactivePaused;
+	if (!ClearQueuedBuffers ())
+	{
+		return false;
+	}
+	MediaFrame = frame;
+	EndOfInput = hasTotal && frame == total;
+	if (EndOfInput)
+	{
+		State = OALSTREAM_Ended;
+		return true;
+	}
+	State = oldState == OALSTREAM_Ended ? OALSTREAM_Stopped : oldState;
+	if (State == OALSTREAM_Stopped)
+	{
+		return true;
+	}
+	for (unsigned int index = 0; index < 4; ++index)
+	{
+		QueueBuffer (Buffers[index]);
+		if (State == OALSTREAM_Failed)
+		{
+			return false;
+		}
+	}
+	UserPaused = wasUserPaused;
+	InactivePaused = wasInactivePaused;
+	State = UserPaused || InactivePaused ? OALSTREAM_Paused : (EndOfInput ? OALSTREAM_Draining : OALSTREAM_Playing);
+	ApplyPauseState ();
+	return true;
+}
 
 void OpenALSoundStream::SetInactive (bool paused)
 {
 	InactivePaused = paused;
 	ApplyGain ();
 	ApplyPauseState ();
-}
-
-void OpenALSoundStream::Update ()
-{
-	ALint processed = 0;
-	ALint queued = 0;
-	ALint state = AL_STOPPED;
-	if (ResourcesReleased || Ended)
-	{
-		return;
-	}
-	alGetSourcei (Source, AL_BUFFERS_PROCESSED, &processed);
-	while (processed-- > 0)
-	{
-		ALuint buffer;
-		unsigned int bufferIndex = 0;
-		alSourceUnqueueBuffers (Source, 1, &buffer);
-		if (alGetError () != AL_NO_ERROR)
-		{
-			Ended = true;
-			Playing = false;
-			return;
-		}
-		for (; bufferIndex < 4 && Buffers[bufferIndex] != buffer; ++bufferIndex)
-		{
-		}
-		if (bufferIndex < 4)
-		{
-			ProcessedFrames = SaturatingAdd (ProcessedFrames, BufferFrames[bufferIndex]);
-			BufferFrames[bufferIndex] = 0;
-			QueueBuffer (buffer);
-			if (Failed)
-			{
-				Ended = true;
-				Playing = false;
-				return;
-			}
-		}
-	}
-	alGetSourcei (Source, AL_BUFFERS_QUEUED, &queued);
-	if (EndOfInput && queued == 0)
-	{
-		Ended = true;
-		Playing = false;
-		return;
-	}
-	alGetSourcei (Source, AL_SOURCE_STATE, &state);
-	if (Playing && !UserPaused && !InactivePaused && queued > 0 && state != AL_PLAYING)
-	{
-		alSourcePlay (Source);
-	}
 }
 
 void OpenALSoundStream::ReleaseResources ()
@@ -829,13 +1535,9 @@ float OpenALSoundRenderer::GetOutputRate ()
 
 SoundStream *OpenALSoundRenderer::CreateStream (SoundStreamCallback callback, int bufferBytes, int flags, int sampleRate, void *userData)
 {
-	OpenALSoundStream *stream;
 	unsigned int inputBits;
 	unsigned int channels;
 	unsigned int bytesPerFrame;
-	ALuint source = 0;
-	ALuint buffers[4];
-	ALint queued = 0;
 	if (!InitSuccess || callback == NULL || bufferBytes <= 0 || sampleRate <= 0 ||
 		(flags & ~(OALSTREAM_Mono | OALSTREAM_Bits8 | OALSTREAM_Bits32 | OALSTREAM_Float)) != 0 ||
 		((flags & OALSTREAM_Bits8) != 0 && (flags & (OALSTREAM_Bits32 | OALSTREAM_Float)) != 0) ||
@@ -850,6 +1552,18 @@ SoundStream *OpenALSoundRenderer::CreateStream (SoundStreamCallback callback, in
 	{
 		return NULL;
 	}
+	return CreateStreamWithProducer (new (std::nothrow) CallbackStreamProducer (callback, userData), bufferBytes, flags, sampleRate);
+}
+
+OpenALSoundStream *OpenALSoundRenderer::CreateStreamWithProducer (OpenALStreamProducer *producer, int bufferBytes, int flags, int sampleRate)
+{
+	OpenALSoundStream *stream;
+	ALuint source = 0;
+	ALuint buffers[4];
+	if (producer == NULL)
+	{
+		return NULL;
+	}
 	memset (buffers, 0, sizeof (buffers));
 	alGetError ();
 	alGenSources (1, &source);
@@ -861,9 +1575,17 @@ SoundStream *OpenALSoundRenderer::CreateStream (SoundStreamCallback callback, in
 			alDeleteSources (1, &source);
 		}
 		alDeleteBuffers (4, buffers);
+		delete producer;
 		return NULL;
 	}
-	stream = new OpenALSoundStream (this, callback, bufferBytes, flags, sampleRate, userData);
+	stream = new (std::nothrow) OpenALSoundStream (this, producer, bufferBytes, flags, sampleRate);
+	if (stream == NULL)
+	{
+		alDeleteSources (1, &source);
+		alDeleteBuffers (4, buffers);
+		delete producer;
+		return NULL;
+	}
 	stream->Source = source;
 	memcpy (stream->Buffers, buffers, sizeof (buffers));
 	stream->SetInactive (InactiveState == INACTIVE_Complete);
@@ -871,10 +1593,39 @@ SoundStream *OpenALSoundRenderer::CreateStream (SoundStreamCallback callback, in
 	return stream;
 }
 
-SoundStream *OpenALSoundRenderer::OpenStream (const char *, int, int, int)
+#ifdef OAL_LIFECYCLE_TEST
+OpenALSoundStream *OpenALSoundRenderer::CreatePatternStreamForTest (unsigned int totalFrames, unsigned int loopStart, unsigned int loopEnd, int bufferBytes)
 {
-	Printf (TEXTCOLOR_RED "OpenAL does not support encoded music streams; use a software PCM music renderer.\n");
-	return NULL;
+	return CreateStreamWithProducer (new (std::nothrow) PatternStreamProducer (totalFrames, loopStart, loopEnd), bufferBytes, OALSTREAM_Mono, 8000);
+}
+#endif
+
+SoundStream *OpenALSoundRenderer::OpenStream (const char *filename, int flags, int offset, int length)
+{
+	AudioFileSource file;
+	AudioMemorySource memory;
+	AudioDataSource *source;
+	DecoderStreamProducer *producer;
+	unsigned int channels = 0;
+	unsigned int sampleRate = 0;
+	if (!InitSuccess || filename == NULL || (flags & ~SoundStream::Loop) != 0 || length < 0 || offset < -1 ||
+		(offset == 0 && length == 0 && strstr (filename, "://") != NULL))
+	{
+		Printf (TEXTCOLOR_RED "OpenAL cannot open this encoded music stream.\n");
+		return NULL;
+	}
+	source = OpenEncodedMusicSource (filename, offset, length, &file, &memory);
+	if (source == NULL)
+	{
+		return NULL;
+	}
+	producer = CreateEncodedMusicProducer (source, &channels, &sampleRate);
+	if (producer == NULL)
+	{
+		return NULL;
+	}
+	return CreateStreamWithProducer (producer, 4096 * channels * (int)sizeof (short),
+		channels == 1 ? OALSTREAM_Mono : 0, (int)sampleRate);
 }
 
 bool OpenALSoundRenderer::IsSourceReserved (unsigned int source) const
@@ -1107,6 +1858,8 @@ bool OpenALSoundRenderer::GetLogicalPosition (FISoundChannel *owner, unsigned in
 FISoundChannel *OpenALSoundRenderer::PublishChannel (OpenALChannel *channel, FISoundChannel *reuseChan, const RestartState &restart)
 {
 	FISoundChannel *owner;
+	ALenum error;
+	bool startFailed = false;
 	if (!ApplyRestartPosition (channel, restart))
 	{
 		alSourceStop (channel->Source);
@@ -1119,10 +1872,11 @@ FISoundChannel *OpenALSoundRenderer::PublishChannel (OpenALChannel *channel, FIS
 	if (FailNextStart)
 	{
 		FailNextStart = false;
-		alSourcei (channel->Source, 0, 0);
+		startFailed = true;
 	}
 #endif
-	if (alGetError () != AL_NO_ERROR)
+	error = alGetError ();
+	if (startFailed || error != AL_NO_ERROR)
 	{
 		alSourceStop (channel->Source);
 		alSourcei (channel->Source, AL_BUFFER, 0);

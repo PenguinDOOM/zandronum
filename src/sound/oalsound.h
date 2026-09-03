@@ -10,6 +10,30 @@
 #include <vector>
 
 class OpenALSoundRenderer;
+class OpenALStreamProducer;
+
+enum OpenALStreamState
+{
+	OALSTREAM_Stopped,
+	OALSTREAM_Playing,
+	OALSTREAM_Paused,
+	OALSTREAM_Draining,
+	OALSTREAM_Ended,
+	OALSTREAM_Failed
+};
+
+#ifdef OAL_LIFECYCLE_TEST
+enum OpenALStreamTestALOperation
+{
+	OALTESTAL_SourceQuery = 1,
+	OALTESTAL_SourcePlay,
+	OALTESTAL_SourcePause,
+	OALTESTAL_BufferUpload,
+	OALTESTAL_BufferQueue,
+	OALTESTAL_BufferUnqueue,
+	OALTESTAL_PositionQuery
+};
+#endif
 
 enum OpenALEndReason
 {
@@ -86,9 +110,20 @@ public:
 	bool SetPaused (bool paused);
 	unsigned int GetPosition ();
 	bool IsEnded ();
+	bool SetPosition (unsigned int milliseconds);
 
 #ifdef OAL_LIFECYCLE_TEST
 	void SetProcessedFramesForTest (unsigned long long frames);
+	void FailNextRewindForTest (bool terminal);
+	void FailNextBufferUploadForTest ();
+	void FailNextALOperationForTest (OpenALStreamTestALOperation operation);
+	bool ProcessNextBufferForTest ();
+	void AllowArbitrarySeekForTest ();
+	OpenALStreamState GetStateForTest () const;
+	unsigned int GetQueuedBufferCountForTest () const;
+	unsigned long long GetBufferMediaStartForTest (unsigned int buffer) const;
+	unsigned int GetBufferFramesForTest (unsigned int buffer) const;
+	unsigned long long GetMediaFrameForTest () const;
 #endif
 
 	unsigned int Source;
@@ -96,36 +131,62 @@ public:
 
 private:
 	friend class OpenALSoundRenderer;
+	OpenALSoundStream (OpenALSoundRenderer *owner, OpenALStreamProducer *producer, int bufferBytes, int flags, int sampleRate);
 
 	bool QueueBuffer (unsigned int buffer);
-	bool ConvertBuffer ();
+	bool FindBufferIndex (unsigned int buffer, unsigned int *bufferIndex) const;
+	bool ReadBufferFrames (unsigned int requestedFrames, unsigned int bytesPerFrame, unsigned long long *mediaStart, unsigned int *framesRead);
+	bool SubmitBuffer (unsigned int buffer, unsigned int bufferIndex, unsigned long long mediaStart, unsigned int framesRead);
+	bool RecycleProcessedBuffer ();
+	bool ConvertBuffer (unsigned int frames);
+	bool ClearQueuedBuffers (bool failOnError = true);
+	bool RewindProducer (unsigned long long frame);
+	bool ConfigureLoop ();
+	unsigned long long NormalizeMediaFrame (unsigned long long frame) const;
+	unsigned long long GetCurrentMediaFrame ();
+	bool CheckALError (unsigned int operation);
+#ifdef OAL_LIFECYCLE_TEST
+	bool ConsumeTestALFailure (unsigned int operation);
+#endif
+	void SetFailed ();
+	void InitializeBuffers (int bufferBytes, int flags);
 	void ApplyGain ();
 	void ApplyPauseState ();
+	void UpdatePlaybackState ();
 	void Update ();
 	void SetInactive (bool paused);
 	void ReleaseResources ();
 
 	OpenALSoundRenderer *Owner;
-	SoundStreamCallback Callback;
-	void *UserData;
+	OpenALStreamProducer *Producer;
 	std::vector<BYTE> InputBuffer;
 	std::vector<BYTE> OutputBuffer;
 	unsigned int BufferFrames[4];
+	unsigned long long BufferMediaStart[4];
+	std::vector<unsigned int> QueueOrder;
 	unsigned int SampleRate;
 	unsigned int StreamChannels;
 	unsigned int InputBits;
 	unsigned int OutputBits;
 	unsigned int OutputFormat;
-	unsigned long long ProcessedFrames;
+	unsigned long long MediaFrame;
+	unsigned long long LoopStart;
+	unsigned long long LoopEnd;
 	float Volume;
 	bool EndOfInput;
-	bool Failed;
-	bool Ended;
-	bool Playing;
+	bool Looping;
+	bool HasLoopRange;
 	bool UserPaused;
 	bool InactivePaused;
 	bool InputIsFloat;
 	bool ResourcesReleased;
+	OpenALStreamState State;
+#ifdef OAL_LIFECYCLE_TEST
+	bool TestFailNextRewind;
+	bool TestRewindTerminal;
+	bool TestFailNextBufferUpload;
+	unsigned int TestFailNextALOperation;
+#endif
 };
 
 class OpenALSoundRenderer : public SoundRenderer
@@ -167,6 +228,10 @@ public:
 	void PrintStatus ();
 	void PrintDriversList ();
 	FString GatherStats ();
+
+#ifdef OAL_LIFECYCLE_TEST
+	OpenALSoundStream *CreatePatternStreamForTest (unsigned int totalFrames, unsigned int loopStart, unsigned int loopEnd, int bufferBytes);
+#endif
 
 #ifdef OAL_LIFECYCLE_TEST
 public:
@@ -227,6 +292,7 @@ private:
 	void ApplyChannelPauseState (OpenALChannel *channel);
 	unsigned long long GetChannelClock (bool noPause) const;
 	void DestroyStream (OpenALSoundStream *stream);
+	OpenALSoundStream *CreateStreamWithProducer (OpenALStreamProducer *producer, int bufferBytes, int flags, int sampleRate);
 
 #ifdef OAL_LIFECYCLE_TEST
 	void InjectStartFailureForTest ();

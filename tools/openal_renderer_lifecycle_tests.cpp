@@ -60,6 +60,48 @@ namespace
 		return std::vector<BYTE> ((size_t)frames * 4, 0);
 	}
 
+	void WriteLE16 (std::vector<BYTE> &bytes, size_t offset, unsigned int value)
+	{
+		bytes[offset] = (BYTE)value;
+		bytes[offset + 1] = (BYTE)(value >> 8);
+	}
+
+	void WriteLE32 (std::vector<BYTE> &bytes, size_t offset, unsigned int value)
+	{
+		WriteLE16 (bytes, offset, value);
+		WriteLE16 (bytes, offset + 2, value >> 16);
+	}
+
+	std::vector<BYTE> MakeStreamWave (unsigned int frames)
+	{
+		std::vector<BYTE> bytes (44 + (size_t)frames * 2, 0);
+		memcpy (&bytes[0], "RIFF", 4);
+		WriteLE32 (bytes, 4, (unsigned int)bytes.size () - 8);
+		memcpy (&bytes[8], "WAVEfmt ", 8);
+		WriteLE32 (bytes, 16, 16);
+		WriteLE16 (bytes, 20, 1);
+		WriteLE16 (bytes, 22, 1);
+		WriteLE32 (bytes, 24, 8000);
+		WriteLE32 (bytes, 28, 16000);
+		WriteLE16 (bytes, 32, 2);
+		WriteLE16 (bytes, 34, 16);
+		memcpy (&bytes[36], "data", 4);
+		WriteLE32 (bytes, 40, frames * 2);
+		return bytes;
+	}
+
+	bool WriteBytes (const char *path, const std::vector<BYTE> &bytes)
+	{
+		FILE *file = fopen (path, "wb");
+		if (file == NULL)
+		{
+			return false;
+		}
+		bool written = fwrite (&bytes[0], 1, bytes.size (), file) == bytes.size ();
+		fclose (file);
+		return written;
+	}
+
 	bool NearlyEqual (float actual, float expected)
 	{
 		return fabsf (actual - expected) < 0.001f;
@@ -113,6 +155,25 @@ namespace
 		return true;
 	}
 
+	bool CallbackLoopAfterEOF (SoundStream *, void *buffer, int length, void *userData)
+	{
+		StreamFixture *fixture = (StreamFixture *)userData;
+		++fixture->CallCount;
+		if (fixture->CallCount == 2)
+		{
+			return false;
+		}
+		memset (buffer, 0, (size_t)length);
+		return true;
+	}
+
+	bool CallbackAlwaysEOF (SoundStream *, void *, int, void *userData)
+	{
+		StreamFixture *fixture = (StreamFixture *)userData;
+		++fixture->CallCount;
+		return false;
+	}
+
 	void DrainStream (OpenALSoundRenderer &renderer, OpenALSoundStream *stream)
 	{
 		for (int attempt = 0; attempt < 150 && !stream->IsEnded (); ++attempt)
@@ -155,6 +216,408 @@ namespace
 		}
 	}
 
+	OpenALSoundStream *CreateStreamInState (OpenALSoundRenderer &renderer, OpenALStreamState state, StreamFixture **fixture)
+	{
+		OpenALSoundStream *stream;
+		*fixture = new StreamFixture (8);
+		stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (reinterpret_cast<SoundStreamCallback> (StreamCallback), 1600, 1, 8000, *fixture));
+		if (stream == NULL || state == OALSTREAM_Stopped)
+		{
+			if (stream != NULL)
+			{
+				stream->AllowArbitrarySeekForTest ();
+			}
+			return stream;
+		}
+		stream->AllowArbitrarySeekForTest ();
+		if (state == OALSTREAM_Draining)
+		{
+			(*fixture)->BuffersRemaining = 1;
+		}
+		if (state == OALSTREAM_Ended)
+		{
+			(*fixture)->BuffersRemaining = 0;
+		}
+		if (state == OALSTREAM_Failed)
+		{
+			stream->FailNextBufferUploadForTest ();
+			stream->Play (false, 1.f);
+			return stream;
+		}
+		stream->Play (false, 1.f);
+		if (state == OALSTREAM_Paused)
+		{
+			stream->SetPaused (true);
+		}
+		else if (state == OALSTREAM_Ended)
+		{
+			(*fixture)->BuffersRemaining = 8;
+		}
+		return stream;
+	}
+
+	struct StreamStateContract
+	{
+		OpenALStreamState State;
+		bool PlayResult;
+		OpenALStreamState PlayState;
+		bool SeekResult;
+		OpenALStreamState SeekState;
+		bool PauseResult;
+		OpenALStreamState PauseState;
+		bool ResumeResult;
+		OpenALStreamState ResumeState;
+	};
+
+	const StreamStateContract StreamStateContracts[] =
+	{
+		{ OALSTREAM_Stopped, true, OALSTREAM_Playing, true, OALSTREAM_Stopped, false, OALSTREAM_Stopped, false, OALSTREAM_Stopped },
+		{ OALSTREAM_Playing, true, OALSTREAM_Playing, true, OALSTREAM_Playing, true, OALSTREAM_Paused, true, OALSTREAM_Playing },
+		{ OALSTREAM_Paused, true, OALSTREAM_Paused, true, OALSTREAM_Paused, true, OALSTREAM_Paused, true, OALSTREAM_Playing },
+		{ OALSTREAM_Draining, true, OALSTREAM_Draining, true, OALSTREAM_Playing, true, OALSTREAM_Paused, true, OALSTREAM_Draining },
+		{ OALSTREAM_Ended, true, OALSTREAM_Playing, true, OALSTREAM_Stopped, false, OALSTREAM_Ended, false, OALSTREAM_Ended },
+		{ OALSTREAM_Failed, false, OALSTREAM_Failed, false, OALSTREAM_Failed, false, OALSTREAM_Failed, false, OALSTREAM_Failed }
+	};
+
+	OpenALSoundStream *CreateVerifiedStreamInState (OpenALSoundRenderer &renderer, const StreamStateContract &contract, StreamFixture **fixture)
+	{
+		OpenALSoundStream *stream = CreateStreamInState (renderer, contract.State, fixture);
+		Check (stream != NULL && stream->GetStateForTest () == contract.State, "stream state contract creates requested state");
+		return stream;
+	}
+
+	void TestStreamPlayContract (OpenALSoundRenderer &renderer, const StreamStateContract &contract)
+	{
+		StreamFixture *fixture;
+		OpenALSoundStream *stream = CreateVerifiedStreamInState (renderer, contract, &fixture);
+		if (stream != NULL)
+		{
+			unsigned int queued = stream->GetQueuedBufferCountForTest ();
+			unsigned int position = stream->GetPosition ();
+			bool result = stream->Play (false, 1.f);
+			Check (result == contract.PlayResult && stream->GetStateForTest () == contract.PlayState &&
+				(!result ? stream->GetQueuedBufferCountForTest () == 0 : stream->GetQueuedBufferCountForTest () > 0) &&
+				(contract.State == OALSTREAM_Playing || contract.State == OALSTREAM_Paused || contract.State == OALSTREAM_Draining ?
+					stream->GetQueuedBufferCountForTest () == queued && stream->GetPosition () == position : true),
+				"stream state contract Play post-state and queue");
+		}
+		delete stream;
+		delete fixture;
+	}
+
+	void TestStreamSeekContract (OpenALSoundRenderer &renderer, const StreamStateContract &contract)
+	{
+		StreamFixture *fixture;
+		OpenALSoundStream *stream = CreateVerifiedStreamInState (renderer, contract, &fixture);
+		if (stream != NULL)
+		{
+			fixture->BuffersRemaining = 8;
+			bool result = stream->SetPosition (1);
+			Check (result == contract.SeekResult && stream->GetStateForTest () == contract.SeekState &&
+				(!result ? stream->GetQueuedBufferCountForTest () == 0 : stream->GetPosition () == 1) &&
+				(contract.SeekState == OALSTREAM_Stopped || !result ? stream->GetQueuedBufferCountForTest () == 0 :
+					stream->GetQueuedBufferCountForTest () > 0),
+				"stream state contract SetPosition post-state, queue, and position");
+		}
+		delete stream;
+		delete fixture;
+	}
+
+	void TestStreamPauseContract (OpenALSoundRenderer &renderer, const StreamStateContract &contract, bool paused)
+	{
+		StreamFixture *fixture;
+		OpenALSoundStream *stream = CreateVerifiedStreamInState (renderer, contract, &fixture);
+		if (stream != NULL)
+		{
+			unsigned int queued = stream->GetQueuedBufferCountForTest ();
+			bool result = stream->SetPaused (paused);
+			OpenALStreamState expectedState = paused ? contract.PauseState : contract.ResumeState;
+			bool expectedResult = paused ? contract.PauseResult : contract.ResumeResult;
+			Check (result == expectedResult && stream->GetStateForTest () == expectedState &&
+				(expectedState == OALSTREAM_Paused || expectedState == OALSTREAM_Playing || expectedState == OALSTREAM_Draining ?
+					stream->GetQueuedBufferCountForTest () > 0 : stream->GetQueuedBufferCountForTest () == queued),
+				paused ? "stream state contract SetPaused(true) post-state and queue" : "stream state contract SetPaused(false) post-state and queue");
+		}
+		delete stream;
+		delete fixture;
+	}
+
+	void TestStreamStopContract (OpenALSoundRenderer &renderer, const StreamStateContract &contract)
+	{
+		StreamFixture *fixture;
+		OpenALSoundStream *stream = CreateVerifiedStreamInState (renderer, contract, &fixture);
+		if (stream != NULL)
+		{
+			stream->Stop ();
+			Check (stream->GetStateForTest () == (contract.State == OALSTREAM_Failed ? OALSTREAM_Failed : OALSTREAM_Stopped) &&
+				(contract.State == OALSTREAM_Failed || (stream->GetQueuedBufferCountForTest () == 0 && stream->GetPosition () == 0)),
+				"stream state contract Stop post-state, queue, and position");
+		}
+		delete stream;
+		delete fixture;
+	}
+
+	void TestStreamStateContract (OpenALSoundRenderer &renderer)
+	{
+		for (unsigned int index = 0; index < sizeof (StreamStateContracts) / sizeof (StreamStateContracts[0]); ++index)
+		{
+			TestStreamPlayContract (renderer, StreamStateContracts[index]);
+			TestStreamSeekContract (renderer, StreamStateContracts[index]);
+			TestStreamPauseContract (renderer, StreamStateContracts[index], true);
+			TestStreamPauseContract (renderer, StreamStateContracts[index], false);
+			TestStreamStopContract (renderer, StreamStateContracts[index]);
+		}
+	}
+
+	OpenALSoundStream *CreateKnownDurationStreamInState (OpenALSoundRenderer &renderer, OpenALStreamState state, unsigned int *duration)
+	{
+		unsigned int frames = state == OALSTREAM_Draining || state == OALSTREAM_Ended ? 1200 : 8000;
+		OpenALSoundStream *stream = renderer.CreatePatternStreamForTest (frames, 0, 0, 800);
+		*duration = frames / 8;
+		if (stream == NULL || state == OALSTREAM_Stopped)
+		{
+			return stream;
+		}
+		stream->Play (false, 1.f);
+		if (state == OALSTREAM_Paused)
+		{
+			stream->SetPaused (true);
+		}
+		else if (state == OALSTREAM_Ended)
+		{
+			stream->SetPosition (*duration);
+		}
+		return stream;
+	}
+
+	void TestExactDurationSeekMatrix (OpenALSoundRenderer &renderer)
+	{
+		const OpenALStreamState states[] = { OALSTREAM_Stopped, OALSTREAM_Playing, OALSTREAM_Paused, OALSTREAM_Draining, OALSTREAM_Ended };
+		for (unsigned int index = 0; index < sizeof (states) / sizeof (states[0]); ++index)
+		{
+			unsigned int duration = 0;
+			OpenALSoundStream *stream = CreateKnownDurationStreamInState (renderer, states[index], &duration);
+			Check (stream != NULL && stream->GetStateForTest () == states[index], "exact-duration matrix creates known-duration source state");
+			if (stream != NULL)
+			{
+				OpenALStreamState oldState = stream->GetStateForTest ();
+				unsigned int oldQueue = stream->GetQueuedBufferCountForTest ();
+				unsigned int oldPosition = stream->GetPosition ();
+				Check (!stream->SetPosition (duration + 1) && stream->GetStateForTest () == oldState &&
+					stream->GetQueuedBufferCountForTest () == oldQueue && stream->GetPosition () == oldPosition,
+					"known-duration past-end seek preserves state, queue, and position");
+				Check (stream->SetPosition (duration) && stream->GetStateForTest () == OALSTREAM_Ended && stream->IsEnded () &&
+					stream->GetQueuedBufferCountForTest () == 0 && stream->GetPosition () == duration,
+					"known-duration exact seek ends with no queued PCM at the media duration");
+				Check (!stream->SetPaused (true) && !stream->SetPaused (false) && stream->GetStateForTest () == OALSTREAM_Ended,
+					"exact-duration ended state ignores pause reasons");
+				Check (stream->Play (false, 1.f) && stream->GetStateForTest () != OALSTREAM_Paused &&
+					stream->GetQueuedBufferCountForTest () > 0, "exact-duration replay clears prior pause state");
+				delete stream;
+			}
+		}
+	}
+
+	void TestCallbackLoopAndSeekFailures (OpenALSoundRenderer &renderer)
+	{
+		StreamFixture loopFixture (0);
+		OpenALSoundStream *stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (reinterpret_cast<SoundStreamCallback> (CallbackLoopAfterEOF), 1600, 1, 8000, &loopFixture));
+		Check (stream != NULL && stream->Play (true, 1.f) && loopFixture.CallCount >= 3,
+			"callback Play(true) starts and retries the producer after EOF");
+		delete stream;
+
+		StreamFixture fixture (16);
+		stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (reinterpret_cast<SoundStreamCallback> (StreamCallback), 1600, 1, 8000, &fixture));
+		Check (stream != NULL && stream->Play (false, 1.f), "unknown-duration callback stream starts for seek contract");
+		if (stream != NULL)
+		{
+			stream->AllowArbitrarySeekForTest ();
+			unsigned int queued = stream->GetQueuedBufferCountForTest ();
+			Check (stream->SetPosition (1) && stream->GetStateForTest () == OALSTREAM_Playing && stream->GetQueuedBufferCountForTest () > 0,
+				"unknown-duration seek succeeds without a total-frame declaration");
+			stream->FailNextRewindForTest (false);
+			Check (!stream->SetPosition (2) && stream->GetStateForTest () == OALSTREAM_Playing && stream->GetQueuedBufferCountForTest () == queued,
+				"recoverable unknown-duration seek failure preserves playing queue and state");
+			stream->SetPaused (true);
+			queued = stream->GetQueuedBufferCountForTest ();
+			stream->FailNextRewindForTest (false);
+			stream->Stop ();
+			Check (stream->GetStateForTest () == OALSTREAM_Paused && stream->GetQueuedBufferCountForTest () == queued,
+				"recoverable Stop rewind failure preserves paused queue and state");
+			stream->SetPaused (false);
+			queued = stream->GetQueuedBufferCountForTest ();
+			stream->FailNextRewindForTest (false);
+			stream->Stop ();
+			Check (stream->GetStateForTest () == OALSTREAM_Playing && stream->GetQueuedBufferCountForTest () == queued,
+				"recoverable Stop rewind failure preserves playing queue and state");
+			delete stream;
+		}
+	}
+
+	void TestTerminalStreamFailure (OpenALSoundRenderer &renderer)
+	{
+		{
+			StreamFixture seekFixture (16);
+			OpenALSoundStream *seekStream = static_cast<OpenALSoundStream *> (renderer.CreateStream (reinterpret_cast<SoundStreamCallback> (StreamCallback), 1600, 1, 8000, &seekFixture));
+			Check (seekStream != NULL && seekStream->Play (false, 1.f), "terminal seek failure stream starts");
+			if (seekStream != NULL)
+			{
+				seekStream->FailNextRewindForTest (true);
+				Check (!seekStream->SetPosition (1) && seekStream->GetStateForTest () == OALSTREAM_Failed && seekStream->IsEnded () &&
+					seekStream->GetQueuedBufferCountForTest () == 0, "terminal decoder seek failure stops and unqueues stale PCM immediately");
+				delete seekStream;
+			}
+		}
+		StreamFixture fixture (16);
+		OpenALSoundStream *stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (reinterpret_cast<SoundStreamCallback> (StreamCallback), 1600, 1, 8000, &fixture));
+		Check (stream != NULL && stream->Play (false, 1.f), "terminal failure stream starts");
+		if (stream != NULL)
+		{
+			unsigned int source = stream->Source;
+			unsigned int buffer = stream->Buffers[0];
+			stream->FailNextBufferUploadForTest ();
+			alSourceStop (source);
+			renderer.UpdateSounds ();
+			Check (stream->GetStateForTest () == OALSTREAM_Failed && stream->IsEnded () && stream->GetQueuedBufferCountForTest () == 0,
+				"terminal upload failure stops and unqueues stale PCM immediately");
+			stream->Stop ();
+			Check (stream->GetStateForTest () == OALSTREAM_Failed && stream->GetQueuedBufferCountForTest () == 0,
+				"failed stream Stop remains an idempotent no-op");
+			delete stream;
+			Check (!alIsSource (source) && !alIsBuffer (buffer) && alGetError () == AL_NO_ERROR,
+				"failed stream destruction releases resources exactly once without OpenAL errors");
+		}
+	}
+
+	void TestTerminalALErrors (OpenALSoundRenderer &renderer)
+	{
+		const OpenALStreamTestALOperation operations[] =
+		{
+			OALTESTAL_SourceQuery, OALTESTAL_SourcePlay, OALTESTAL_SourcePause, OALTESTAL_BufferUpload,
+			OALTESTAL_BufferQueue, OALTESTAL_BufferUnqueue, OALTESTAL_PositionQuery
+		};
+		const char *names[] = { "source query", "source play", "source pause", "buffer upload", "buffer queue", "buffer unqueue", "position query" };
+		for (unsigned int index = 0; index < sizeof (operations) / sizeof (operations[0]); ++index)
+		{
+			StreamFixture fixture (16);
+			OpenALSoundStream *stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (reinterpret_cast<SoundStreamCallback> (StreamCallback), 1600, 1, 8000, &fixture));
+			if (stream == NULL)
+			{
+				Check (false, "terminal AL error stream allocation");
+				continue;
+			}
+			if (operations[index] == OALTESTAL_SourcePause)
+			{
+				Check (stream->Play (false, 1.f), "terminal AL pause error stream starts");
+				stream->FailNextALOperationForTest (operations[index]);
+				Check (!stream->SetPaused (true), "terminal AL pause error reports failure");
+			}
+			else if (operations[index] == OALTESTAL_BufferUnqueue)
+			{
+				Check (stream->Play (false, 1.f), "terminal AL unqueue error stream starts");
+				stream->FailNextALOperationForTest (operations[index]);
+				Check (!stream->ProcessNextBufferForTest (), "terminal AL unqueue error reports failure");
+			}
+			else if (operations[index] == OALTESTAL_PositionQuery)
+			{
+				Check (stream->Play (false, 1.f), "terminal AL position error stream starts");
+				stream->FailNextALOperationForTest (operations[index]);
+				stream->GetPosition ();
+			}
+			else
+			{
+				stream->FailNextALOperationForTest (operations[index]);
+				Check (!stream->Play (false, 1.f), "terminal AL query/play error reports failure");
+			}
+			ALint sourceState = AL_PLAYING;
+			alGetSourcei (stream->Source, AL_SOURCE_STATE, &sourceState);
+			Check (stream->GetStateForTest () == OALSTREAM_Failed && stream->IsEnded () &&
+				stream->GetQueuedBufferCountForTest () == 0 && sourceState != AL_PLAYING && sourceState != AL_PAUSED && alGetError () == AL_NO_ERROR,
+				names[index]);
+			Check (alIsSource (stream->Source) && alIsBuffer (stream->Buffers[0]), "failed AL stream keeps resources until destruction");
+			stream->Stop ();
+			Check (stream->GetStateForTest () == OALSTREAM_Failed && stream->GetQueuedBufferCountForTest () == 0 && !stream->Play (false, 1.f) &&
+				!stream->SetPosition (1) && !stream->SetPaused (true) && !stream->SetPaused (false), "failed AL stream commands cannot resurrect it");
+			unsigned int source = stream->Source;
+			unsigned int buffer = stream->Buffers[0];
+			delete stream;
+			Check (!alIsSource (source) && !alIsBuffer (buffer) && alGetError () == AL_NO_ERROR,
+				"failed AL stream destruction releases resources exactly once without OpenAL errors");
+		}
+	}
+
+	void TestForwardLoopBoundary (OpenALSoundRenderer &renderer)
+	{
+		OpenALSoundStream *stream = renderer.CreatePatternStreamForTest (6, 2, 5, 8);
+		Check (stream != NULL && stream->Play (true, 1.f), "controlled forward-loop stream starts");
+		if (stream != NULL)
+		{
+			ALint tailBytes = 0;
+			alGetBufferi (stream->Buffers[1], AL_SIZE, &tailBytes);
+			Check (stream->GetBufferMediaStartForTest (0) == 0 && stream->GetBufferFramesForTest (0) == 4 &&
+				stream->GetBufferMediaStartForTest (1) == 4 && stream->GetBufferFramesForTest (1) == 1 && tailBytes == 2 &&
+				stream->GetBufferMediaStartForTest (2) == 2 && stream->GetBufferFramesForTest (2) == 3,
+				"forward loop keeps tail and head in separate submitted buffers");
+			delete stream;
+		}
+	}
+
+	void TestStreamPauseReasonsAndBoundaries (OpenALSoundRenderer &renderer)
+	{
+		StreamFixture pauseFixture (32);
+		OpenALSoundStream *stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (reinterpret_cast<SoundStreamCallback> (StreamCallback), 1600, 1, 8000, &pauseFixture));
+		Check (stream != NULL && stream->Play (false, 1.f), "pause-reason stream starts");
+		if (stream != NULL)
+		{
+			stream->AllowArbitrarySeekForTest ();
+			renderer.SetInactive (INACTIVE_Complete);
+			Check (stream->SetPosition (1) && stream->GetStateForTest () == OALSTREAM_Paused,
+				"inactive-only paused seek remains paused");
+			renderer.SetInactive (INACTIVE_Active);
+			ALint sourceState = AL_STOPPED;
+			alGetSourcei (stream->Source, AL_SOURCE_STATE, &sourceState);
+			Check (stream->GetStateForTest () == OALSTREAM_Playing && sourceState == AL_PLAYING,
+				"clearing inactive pause resumes an inactive-only paused seek");
+			Check (stream->SetPaused (true) && stream->SetPosition (2) && stream->GetStateForTest () == OALSTREAM_Paused,
+				"user-paused seek remains user paused");
+			alGetSourcei (stream->Source, AL_SOURCE_STATE, &sourceState);
+			Check (sourceState != AL_PLAYING, "user-paused seek does not auto-resume");
+			Check (stream->SetPaused (false), "user-paused seek accepts explicit resume");
+			alGetSourcei (stream->Source, AL_SOURCE_STATE, &sourceState);
+			Check (sourceState == AL_PLAYING, "user-paused seek resumes only after user resume");
+			delete stream;
+		}
+
+		StreamFixture roundingFixture (32);
+		stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (reinterpret_cast<SoundStreamCallback> (StreamCallback), 22050, 1, 11025, &roundingFixture));
+		if (stream != NULL)
+		{
+			stream->AllowArbitrarySeekForTest ();
+		}
+		Check (stream != NULL && stream->Play (false, 1.f) && stream->SetPosition (1) &&
+			stream->GetBufferMediaStartForTest (0) == 11 && stream->GetPosition () == 0,
+			"non-integral stream seek uses floor frame conversion");
+		delete stream;
+
+		stream = renderer.CreatePatternStreamForTest (6000, 2000, 5000, 8000);
+		Check (stream != NULL && stream->Play (true, 1.f), "runtime custom-loop stream starts");
+		if (stream != NULL)
+		{
+			alSourceStop (stream->Source);
+			renderer.UpdateSounds ();
+			Check (stream->GetMediaFrameForTest () >= 2000 && stream->GetMediaFrameForTest () < 5000,
+				"runtime custom-loop cursor wraps inside the loop range");
+			delete stream;
+		}
+
+		StreamFixture eofFixture (0);
+		stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (reinterpret_cast<SoundStreamCallback> (CallbackAlwaysEOF), 1600, 1, 8000, &eofFixture));
+		Check (stream != NULL && !stream->Play (true, 1.f) && stream->IsEnded () &&
+			stream->GetQueuedBufferCountForTest () == 0 && eofFixture.CallCount == 2,
+			"looping callback reaches natural Ended after repeated EOF");
+		delete stream;
+	}
+
 	void TestStreamPositionConversion (OpenALSoundRenderer &renderer)
 	{
 		StreamFixture fixture (1);
@@ -167,6 +630,64 @@ namespace
 			Check (stream->GetPosition () == std::numeric_limits<unsigned int>::max (), "stream position safely saturates true millisecond overflow");
 			delete stream;
 		}
+	}
+
+	void TestEncodedStreams (OpenALSoundRenderer &renderer)
+	{
+		const char *filePath = "openal_lifecycle_stream.wav";
+		const char *slicePath = "openal_lifecycle_stream_slice.bin";
+		std::vector<BYTE> data = MakeStreamWave (8000);
+		std::vector<BYTE> wrapped;
+		OpenALSoundStream *stream;
+		Check (WriteBytes (filePath, data), "encoded stream fixture writes");
+		stream = static_cast<OpenALSoundStream *> (renderer.OpenStream (filePath, 0, 0, 0));
+		Check (stream != NULL, "encoded file stream opens");
+		if (stream != NULL)
+		{
+			Check (stream->SetPosition (500) && stream->GetPosition () == 500, "encoded stream seeks while stopped");
+			Check (stream->Play (false, 1.f), "encoded stream plays after stopped seek");
+			ALint uploadedBytes = 0;
+			alGetBufferi (stream->Buffers[0], AL_SIZE, &uploadedBytes);
+			Check (uploadedBytes == (8000 - 4000) * 2, "encoded final PCM buffer uploads only its partial frame count");
+			stream->SetPaused (true);
+			Check (stream->SetPosition (750) && stream->GetPosition () == 750, "encoded stream seeks while paused");
+			stream->SetPaused (false);
+			DrainStream (renderer, stream);
+			Check (stream->IsEnded () && stream->GetPosition () == 1000, "encoded stream drains at exact duration");
+			Check (stream->SetPosition (1000) && stream->IsEnded (), "encoded stream accepts exact-duration seek as ended");
+			ALint replayState = AL_STOPPED;
+			Check (stream->Play (false, 1.f) && stream->GetStateForTest () != OALSTREAM_Paused && stream->GetQueuedBufferCountForTest () > 0,
+				"exact-duration replay clears the previous user pause state and queues playback");
+			alGetSourcei (stream->Source, AL_SOURCE_STATE, &replayState);
+			Check (replayState == AL_PLAYING, "exact-duration replay resumes its OpenAL source");
+			Check (!stream->SetPosition (1001) && !stream->SetPosition (std::numeric_limits<unsigned int>::max ()), "encoded stream rejects past-end and overflow seeks");
+			stream->Stop ();
+			Check (!stream->IsEnded () && stream->GetPosition () == 0, "encoded stream stop rewinds for replay");
+			delete stream;
+		}
+		stream = static_cast<OpenALSoundStream *> (renderer.OpenStream ((const char *)&data[0], 0, -1, (int)data.size ()));
+		Check (stream != NULL && stream->Play (false, 1.f), "encoded memory stream opens and plays");
+		if (stream != NULL)
+		{
+			delete stream;
+		}
+		std::vector<BYTE> empty = MakeStreamWave (0);
+		stream = static_cast<OpenALSoundStream *> (renderer.OpenStream ((const char *)&empty[0], 0, -1, (int)empty.size ()));
+		Check (stream != NULL && !stream->Play (true, 1.f) && stream->IsEnded () && stream->GetQueuedBufferCountForTest () == 0,
+			"zero-frame stream reaches Ended without queueing or retrying");
+		delete stream;
+		wrapped.insert (wrapped.end (), "head", "head" + 4);
+		wrapped.insert (wrapped.end (), data.begin (), data.end ());
+		wrapped.insert (wrapped.end (), "tail", "tail" + 4);
+		Check (WriteBytes (slicePath, wrapped), "encoded stream slice fixture writes");
+		stream = static_cast<OpenALSoundStream *> (renderer.OpenStream (slicePath, 0, 4, (int)data.size ()));
+		Check (stream != NULL && stream->Play (true, 1.f) && !stream->IsEnded (), "encoded file slice opens and loops");
+		if (stream != NULL)
+		{
+			delete stream;
+		}
+		remove (filePath);
+		remove (slicePath);
 	}
 
 	void TestStreams (OpenALSoundRenderer &renderer, SoundHandle sound)
@@ -213,7 +734,15 @@ namespace
 		TestPrePlayEmptyStream (renderer);
 		TestStoppedStreamReplay (renderer);
 		TestStreamPositionConversion (renderer);
-		Check (renderer.OpenStream ("unsupported.ogg", 0, 0, 0) == NULL, "encoded stream opening is rejected safely");
+		TestStreamStateContract (renderer);
+		TestExactDurationSeekMatrix (renderer);
+		TestCallbackLoopAndSeekFailures (renderer);
+		TestTerminalStreamFailure (renderer);
+		TestTerminalALErrors (renderer);
+		TestForwardLoopBoundary (renderer);
+		TestStreamPauseReasonsAndBoundaries (renderer);
+		TestEncodedStreams (renderer);
+		Check (renderer.OpenStream ("https://example.invalid/music.ogg", 0, 0, 0) == NULL, "encoded URL stream opening is rejected safely");
 	}
 
 	void ReleaseOwner (FISoundChannel *owner)
@@ -761,6 +1290,7 @@ namespace
 		renderer.InjectStartFailureForTest ();
 		Check (renderer.StartSound (sound, 0.5f, 128, 81, SNDF_LOOP, NULL) == NULL,
 			"injected physical start failure reaches high-level looping fallback");
+		Check (alGetError () == AL_NO_ERROR, "injected looping start failure leaves no OpenAL validation error");
 		FISoundChannel *reused = S_GetChannel (NULL);
 		Check (reused == evicted && reused->SysChannel == NULL && renderer.GetPosition (reused) == 0,
 			"deserialize-style owner reuse cannot serialize the old logical phase before MarkStartTime");
@@ -769,6 +1299,7 @@ namespace
 		Check (renderer.StartSound (sound, 0.5f, 128, 81, SNDF_LOOP | SNDF_ABSTIME, reused) == NULL &&
 			reused->SysChannel == NULL && renderer.GetPosition (reused) == 0,
 			"failed deserialize-style ABSTIME restart keeps the old logical phase hidden before retry");
+		Check (alGetError () == AL_NO_ERROR, "injected ABSTIME restart failure leaves no OpenAL validation error");
 		FISoundChannel *retried = renderer.StartSound (sound, 0.5f, 128, 81, SNDF_LOOP | SNDF_ABSTIME, reused);
 		Check (retried == reused && abs ((int)SourceOffset (retried) - 321) <= 1 &&
 			abs ((int)renderer.GetPosition (retried) - 321) <= 1,
@@ -786,6 +1317,7 @@ namespace
 		renderer.InjectStartFailureForTest ();
 		FISoundChannel *failed = renderer.StartSound (sound, 0.5f, 128, 0, SNDF_LOOP, NULL);
 		Check (failed == NULL, "injected OpenAL start failure returns null");
+		Check (alGetError () == AL_NO_ERROR, "injected start failure leaves no OpenAL validation error");
 		Check (Events.size () == eventCount, "injected OpenAL start failure does not notify high-level channel end");
 		Check (renderer.ActiveChannels.empty () && renderer.AllocatedSources - (int)renderer.ActiveChannels.size () == freeSources, "injected OpenAL start failure recovers source baseline");
 		Check (openalSound->References == 0, "injected OpenAL start failure does not retain sound reference");
@@ -793,6 +1325,7 @@ namespace
 		AdvanceTestClock (renderer, 100);
 		renderer.InjectStartFailureForTest ();
 		FISoundChannel *failedNoPause = renderer.StartSound (sound, 0.5f, 128, 0, SNDF_LOOP | SNDF_NOPAUSE, NULL);
+		Check (alGetError () == AL_NO_ERROR, "injected NOPAUSE start failure leaves no OpenAL validation error");
 		FISoundChannel *evictedLoop = new FISoundChannel;
 		renderer.MarkStartTime (evictedLoop);
 		Check (failedNoPause == NULL && evictedLoop->StartTime.AsOne == renderer.NonPausableOutputFrames, "failed NOPAUSE start records the immediate nonpausable clock class");
@@ -971,6 +1504,7 @@ int main ()
 		priorityRenderer.UnloadSound (prioritySound);
 	}
 	snd_channels.Value = 1;
+	{
 	OpenALSoundRenderer renderer;
 	if (!renderer.IsValid ())
 	{
@@ -1007,10 +1541,12 @@ int main ()
 	TestRestartConversionBounds (renderer);
 	TestClockWrap (renderer);
 	TestStreams (renderer, longSound);
-	TestCrossRendererResetHandoff ();
 
 	renderer.UnloadSound (longSound);
 	renderer.UnloadSound (shortSound);
 	renderer.UnloadSound (stereoSound);
+	Check (alGetError () == AL_NO_ERROR, "normal renderer sound unloads leave no OpenAL error");
+	}
+	TestCrossRendererResetHandoff ();
 	return Failures == 0 ? 0 : 1;
 }

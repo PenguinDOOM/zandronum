@@ -65,6 +65,8 @@ struct FISoundChannel
 
 class SoundStream
 {
+	public:
+	enum { Loop = 16 };
 };
 
 typedef void (*SoundStreamCallback) ();
