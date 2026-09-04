@@ -126,6 +126,12 @@ enum EInactiveState
 	INACTIVE_Mute
 };
 
+enum ECodecType
+{
+	CODEC_Unknown,
+	CODEC_Vorbis
+};
+
 class SoundRenderer
 {
 public:
@@ -158,6 +164,7 @@ public:
 	virtual void PrintStatus () = 0;
 	virtual void PrintDriversList () = 0;
 	virtual FString GatherStats () = 0;
+	virtual short *DecodeSample (int, const void *, int, ECodecType) { return NULL; }
 };
 
 class OALTestIntCVar

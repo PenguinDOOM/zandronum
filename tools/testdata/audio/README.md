@@ -34,6 +34,68 @@ python tools/testdata/audio/generate_wav_fixtures.py --ffmpeg C:\path\to\ffmpeg.
 | `vorbis_stereo.ogg` | `18afa51033264ac747f0826424e5c65be9a99a2daa5d0ed8991f5d637b60e2c7` | 529-frame stereo Ogg Vorbis |
 | `vorbis_three_channel.ogg` | `aeb3085a309c9e97a5f25441b678ba5dfb2373fd1772e6f701471deb1b4d258e` | 529-frame three-channel Ogg Vorbis; rejection contract |
 
+## Phase 1B validation fixtures
+
+`generate_phase1b_music_fixtures.py` deterministically creates the compact,
+self-authored music corpus below. It uses `vorbis_mono.ogg` only as the payload
+for the generated DUMB Ogg-sample XM; that input is itself generated from the
+mathematically defined signal documented above. The SMF, DosBox Raw OPL, MOD, VGM, WAD,
+and PK3 layouts are authored by the generator and contain no third-party music.
+They are project test fixtures under `LICENSE.txt`; no third-party audio license
+is claimed.
+
+Regenerate and verify the fixtures with:
+
+```text
+python tools/testdata/audio/generate_phase1b_music_fixtures.py --verify
+python tools/testdata/audio/validate_phase1b_manifest.py
+```
+
+| Fixture path | SHA-256 | Purpose |
+| --- | --- | --- |
+| `phase1b-generated.mid` | `f71c35cad946d4eddcd11bf9b47a7c8048b045926db77c22d91a4ac0b30980fb` | Generated single-track SMF |
+| `phase1b-ogg-sample.xm` | `55e6b848d85777f46891322e9504b6f45e76693427c24f2d9ca578b25cb8eed9` | DUMB XM with embedded mono Ogg sample |
+| `phase1b-dosbox-raw-opl.dro` | `b35680580629b7032f523bdfeb340effbb344edd33bb870bec3a3b5a500fde1f` | DosBox Raw OPL (`DBRAWOPL`) stream |
+| `phase1b-mod.mod` | `30a8ada7ae0ea435e144598e356777c9fe994419d118959765522a18086a8b16` | Four-channel silent MOD |
+| `phase1b-gme.vgm` | `18772548b07096ac6635225f44a60ecd46bd60f8f9357a53f97f69b831971f81` | VGM 1.50 stream with `0x66` at the `0x40` command-stream start |
+| `phase1b-audio.wad` | `edf900ce2b7abfdc16844ed4e880b81bb4da91e7dcc738b8375dc6c64dcc6c27` | Generated music lumps (`D_MIDI`, `D_XMOGG`, `D_OPL`, `D_MOD`, `D_GME`) |
+| `phase1b-fixtures.pk3` | `e3e2b420c7da6b2afb43fb4c9c260fcdd827f5b1da53710b3336ccf24081800e` | Self-contained PK3 with `phase1b-audio.wad` at its root and other generated files under `music/` |
+
+`phase1b-validation.json` is the source-controlled validation contract. The
+two local rows first run `cmake --build build-v143-openal --config Release
+--target openal_lifecycle_tests`, then run
+`build-v143-openal/tools/Release/openal_lifecycle_tests.exe
+--phase1b-direct-memory` and `--phase1b-file-slice` against the exact
+checked-in Vorbis and WAVE bytes. This is the CMake target's canonical Windows
+output location, not a requirement for ignored build output to exist during
+source validation.
+
+Generated music rows launch the client with the fixture PK3 and `${STOCK_PK3}`
+as a stock package passed to `-file`, then select OpenAL with `+set snd_backend
+openal` before initialization. After the startup screen is rendering and the
+OpenAL renderer has initialized, the operator opens the console and executes
+the row's ordered post-init actions. The MIDI row executes console `stopmus`,
+then console `set snd_mididevice -1`, starts a fresh external console/log
+capture, and then executes console `changemus D_MIDI`. `stopmus` ensures that
+the setting callback cannot restart an already-playing MIDI song. The capture
+start is an operator/harness action, not an engine console command: the engine
+`clear` command only clears the console display and does not reset diagnostic
+history. Count exactly one occurrence of `FMOD MIDI playback is unavailable
+with the current sound backend; using OPL instead.` after that capture start
+and through the target selection; earlier process output is outside this
+observation window. Every non-MIDI runtime row has exactly one post-init
+`changemus D_*` action. The WAD is deliberately at the PK3 root as
+`phase1b-audio.wad`, so embedded-WAD discovery exposes the `D_*` lumps. The
+MIDI, XM, OPL, and MOD rows are local runtime playback checks and do not connect
+to a server. Only the final GME compatibility row uses
+`${REFERENCE_SERVER}`. All runtime rows remain Phase 6 handoff checks; they are
+not claimed as locally executed audio proof. `validate_phase1b_manifest.py`
+verifies file, archive-entry, root-WAD, WAD-lump, ordered runtime-action,
+focused-target, and VGM stream contracts without a game runtime. Its
+`--self-test` option uses temporary manifests to reject negative command-line
+settings and broken MIDI stop, setting, observation-window, or selection
+ordering.
+
 ## Vendored decoder provenance
 
 The decoder sources are byte-pinned imports. Do not trim whitespace, normalize

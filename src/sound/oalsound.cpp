@@ -11,6 +11,7 @@
 #include <limits>
 #include <math.h>
 #include <new>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef OAL_LIFECYCLE_TEST
@@ -21,6 +22,55 @@
 #include "i_system.h"
 #include "s_sound.h"
 #include "v_text.h"
+#endif
+
+namespace
+{
+	const std::size_t MaxOpenALEncodedInputBytes = 64 * 1024 * 1024;
+
+	bool AcceptsOpenALEncodedInputSize (std::size_t bytes)
+	{
+		return bytes <= MaxOpenALEncodedInputBytes;
+	}
+
+#ifdef OAL_LIFECYCLE_TEST
+	bool FailNextOpenALEncodedSourceAssign = false;
+#endif
+
+	bool AssignOpenALEncodedSource (AudioMemorySource &source, const void *data, std::size_t bytes)
+	{
+		if (!AcceptsOpenALEncodedInputSize (bytes))
+		{
+			return false;
+		}
+		try
+		{
+	#ifdef OAL_LIFECYCLE_TEST
+			if (FailNextOpenALEncodedSourceAssign)
+			{
+				FailNextOpenALEncodedSourceAssign = false;
+				throw std::bad_alloc ();
+			}
+	#endif
+			return source.Assign (data, bytes) == AUDIO_SOURCE_OK;
+		}
+		catch (const std::bad_alloc &)
+		{
+			return false;
+		}
+	}
+}
+
+#ifdef OAL_LIFECYCLE_TEST
+void OALTestFailNextEncodedSourceAssign ()
+{
+	FailNextOpenALEncodedSourceAssign = true;
+}
+
+bool OALTestAcceptsEncodedInputSize (unsigned int bytes)
+{
+	return AcceptsOpenALEncodedInputSize (bytes);
+}
 #endif
 
 #ifndef ALC_ALL_DEVICES_SPECIFIER
@@ -1452,17 +1502,74 @@ SoundHandle OpenALSoundRenderer::CreateSound (const OALPCMData &data)
 SoundHandle OpenALSoundRenderer::LoadSound (BYTE *sfxdata, int length)
 {
 	SoundHandle handle = { NULL };
-	if (length <= 0)
+	AudioMemorySource source;
+	AudioProbeResult probe;
+	AudioDecodedPCM16 decoded;
+	OALPCMData data;
+	if (length <= 0 || !AcceptsOpenALEncodedInputSize ((std::size_t)length))
 	{
 		return handle;
 	}
 	OALPCMResult result = OALParseWavePCM (sfxdata, (size_t)length);
-	if (!result.IsValid ())
+	if (result.IsValid ())
 	{
-		DPrintf ("OpenAL could not load WAVE sample: error %d\n", result.Error);
+		return CreateSound (result.Data);
+	}
+	if (!AssignOpenALEncodedSource (source, sfxdata, (size_t)length))
+	{
 		return handle;
 	}
-	return CreateSound (result.Data);
+	probe = ProbeAudioFormat (source);
+	if (probe.Status != AUDIO_PROBE_RECOGNIZED ||
+		(probe.Format != AUDIO_FORMAT_OGG_VORBIS && probe.Format != AUDIO_FORMAT_MPEG &&
+			probe.Format != AUDIO_FORMAT_FLAC && probe.Format != AUDIO_FORMAT_WAVE_FLOAT) ||
+		DecodeAudioToPCM16 (source, probe, &decoded) != AUDIO_DECODE_OK || decoded.SampleRate == 0 ||
+		(decoded.Channels != 1 && decoded.Channels != 2) || decoded.Samples.empty () ||
+		decoded.Samples.size () / decoded.Channels > (size_t)std::numeric_limits<unsigned int>::max ())
+	{
+		DPrintf ("OpenAL could not load encoded sample: error %d\n", result.Error);
+		return handle;
+	}
+	data.Samples.swap (decoded.Samples);
+	data.SampleRate = decoded.SampleRate;
+	data.Channels = decoded.Channels;
+	data.Frames = (unsigned int)(data.Samples.size () / data.Channels);
+	return CreateSound (data);
+}
+
+short *OpenALSoundRenderer::DecodeSample (int outlen, const void *coded, int sizebytes, ECodecType type)
+{
+	AudioMemorySource source;
+	AudioProbeResult probe;
+	AudioDecodedPCM16 decoded;
+	short *outbuf;
+	std::size_t outputBytes;
+	std::size_t decodedBytes;
+
+	if (outlen <= 0 || coded == NULL || sizebytes <= 0 || type != CODEC_Vorbis ||
+		!AssignOpenALEncodedSource (source, coded, (size_t)sizebytes))
+	{
+		return NULL;
+	}
+	probe = ProbeAudioFormat (source);
+	if (probe.Status != AUDIO_PROBE_RECOGNIZED || probe.Format != AUDIO_FORMAT_OGG_VORBIS ||
+		DecodeAudioToPCM16 (source, probe, &decoded) != AUDIO_DECODE_OK || decoded.Channels != 1)
+	{
+		return NULL;
+	}
+	outputBytes = (std::size_t)outlen;
+	outbuf = (short *)malloc (outputBytes);
+	if (outbuf == NULL)
+	{
+		return NULL;
+	}
+	memset (outbuf, 0, outputBytes);
+	decodedBytes = decoded.Samples.size () * sizeof (short);
+	if (decodedBytes != 0)
+	{
+		memcpy (outbuf, &decoded.Samples[0], decodedBytes < outputBytes ? decodedBytes : outputBytes);
+	}
+	return outbuf;
 }
 
 SoundHandle OpenALSoundRenderer::LoadSoundRaw (BYTE *sfxdata, int length, int frequency, int channels, int bits, int loopstart, int loopend)

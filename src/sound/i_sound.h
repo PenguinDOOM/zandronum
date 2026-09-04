@@ -89,6 +89,7 @@ public:
 	virtual ~SoundRenderer ();
 
 	virtual bool IsNull() { return false; }
+	virtual bool SupportsGeneratedSMFStreaming() { return false; }
 	virtual void SetSfxVolume (float volume) = 0;
 	virtual void SetMusicVolume (float volume) = 0;
 	virtual SoundHandle LoadSound(BYTE *sfxdata, int length) = 0;

@@ -11,6 +11,7 @@ public:
 	FMODSoundRenderer ();
 	~FMODSoundRenderer ();
 	bool IsValid ();
+	bool SupportsGeneratedSMFStreaming();
 
 	void SetSfxVolume (float volume);
 	void SetMusicVolume (float volume);

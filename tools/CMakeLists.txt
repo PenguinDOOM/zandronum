@@ -24,6 +24,12 @@ if( BUILD_TESTING )
 	target_include_directories( openal_pcm_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/sound )
 	add_test( NAME openal_pcm COMMAND openal_pcm_tests )
 
+	add_executable( midi_device_selection_tests
+		midi_device_selection_tests.cpp
+		${CMAKE_SOURCE_DIR}/src/sound/music_mididevice_policy.cpp )
+	target_include_directories( midi_device_selection_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/sound )
+	add_test( NAME midi_device_selection COMMAND midi_device_selection_tests )
+
 	if( NOT NO_SOUND AND NOT SERVERONLY )
 		find_package( OpenAL REQUIRED )
 		add_executable( openal_lifecycle_tests

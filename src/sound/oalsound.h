@@ -228,6 +228,7 @@ public:
 	void PrintStatus ();
 	void PrintDriversList ();
 	FString GatherStats ();
+	short *DecodeSample (int outlen, const void *coded, int sizebytes, ECodecType type);
 
 #ifdef OAL_LIFECYCLE_TEST
 	OpenALSoundStream *CreatePatternStreamForTest (unsigned int totalFrames, unsigned int loopStart, unsigned int loopEnd, int bufferBytes);
@@ -327,5 +328,10 @@ private:
 	bool FailNextStart;
 #endif
 };
+
+#ifdef OAL_LIFECYCLE_TEST
+void OALTestFailNextEncodedSourceAssign ();
+bool OALTestAcceptsEncodedInputSize (unsigned int bytes);
+#endif
 
 #endif

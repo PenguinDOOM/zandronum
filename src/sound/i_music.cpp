@@ -57,6 +57,7 @@ extern void ChildSigHandler (int signum);
 #include <stdio.h>
 
 #include "i_musicinterns.h"
+#include "music_mididevice_policy.h"
 #include "doomtype.h"
 #include "m_argv.h"
 #include "i_music.h"
@@ -379,6 +380,12 @@ static EMIDIType IdentifyMIDIType(DWORD *id, int size)
 //
 //==========================================================================
 
+static bool ShouldRetryGeneratedSMFAsFMOD (MusInfo *info, EMidiDevice devtype)
+{
+	return info == NULL && devtype != MDEV_FMOD && snd_mididevice < 0 &&
+		MusicMIDIDevicePolicy::CanRetryFMOD(GSnd != NULL && GSnd->SupportsGeneratedSMFStreaming());
+}
+
 MusInfo *I_RegisterSong (const char *filename, BYTE *musiccache, int offset, int len, int device)
 {
 	FILE *file;
@@ -487,7 +494,7 @@ retry_as_fmod:
 			delete info;
 			info = NULL;
 		}
-		if (info == NULL && devtype != MDEV_FMOD && snd_mididevice < 0)
+		if (ShouldRetryGeneratedSMFAsFMOD(info, devtype))
 		{
 			devtype = MDEV_FMOD;
 			goto retry_as_fmod;

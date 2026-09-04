@@ -35,6 +35,7 @@
 // HEADER FILES ------------------------------------------------------------
 
 #include "i_musicinterns.h"
+#include "music_mididevice_policy.h"
 #include "templates.h"
 #include "doomdef.h"
 #include "m_swap.h"
@@ -225,27 +226,19 @@ EMidiDevice MIDIStreamer::SelectMIDIDevice(EMidiDevice device)
 			- as fallback when both OPL and Timidity failed and snd_mididevice is >= 0
 	*/
 
-	// Choose the type of MIDI device we want.
-	if (device != MDEV_DEFAULT)
-	{
-		return device;
-	}
-	switch (snd_mididevice)
-	{
-	case -1:		return MDEV_FMOD;
-	case -2:		return MDEV_TIMIDITY;
-	case -3:		return MDEV_OPL;
-	case -4:		return MDEV_GUS;
-#ifdef HAVE_FLUIDSYNTH
-	case -5:		return MDEV_FLUIDSYNTH;
+	const MusicMIDIDevicePolicy::DeviceSelection selection = MusicMIDIDevicePolicy::ResolveSelection(device,
+		snd_mididevice,
+#ifdef _WIN32
+		true,
+#else
+		false,
 #endif
-	default:
-		#ifdef _WIN32
-					return MDEV_MMAPI;
-		#else
-					return MDEV_FMOD;
-		#endif
+		GSnd != NULL && GSnd->SupportsGeneratedSMFStreaming());
+	if (selection.DiagnosticCount != 0)
+	{
+		Printf(PRINT_BOLD, "FMOD MIDI playback is unavailable with the current sound backend; using OPL instead.\n");
 	}
+	return selection.FinalDevice;
 }
 
 //==========================================================================

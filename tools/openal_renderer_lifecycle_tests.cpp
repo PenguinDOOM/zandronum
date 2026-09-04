@@ -1,10 +1,14 @@
 #include "oalsound.h"
 
+#include "audio_decoder.h"
+
 #include <AL/al.h>
 #include <chrono>
 #include <limits>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -102,6 +106,30 @@ namespace
 		return written;
 	}
 
+	bool ReadFixture (const char *name, std::vector<BYTE> *bytes)
+	{
+		std::string path = std::string (AUDIO_DECODER_TESTDATA_DIR) + "/" + name;
+		FILE *file = fopen (path.c_str (), "rb");
+		long length;
+		if (file == NULL || fseek (file, 0, SEEK_END) != 0 || (length = ftell (file)) <= 0 || fseek (file, 0, SEEK_SET) != 0)
+		{
+			if (file != NULL)
+			{
+				fclose (file);
+			}
+			return false;
+		}
+		bytes->assign ((size_t)length, 0);
+		bool read = fread (&(*bytes)[0], 1, bytes->size (), file) == bytes->size ();
+		fclose (file);
+		return read;
+	}
+
+	std::string FixturePath (const char *name)
+	{
+		return std::string (AUDIO_DECODER_TESTDATA_DIR) + "/" + name;
+	}
+
 	bool NearlyEqual (float actual, float expected)
 	{
 		return fabsf (actual - expected) < 0.001f;
@@ -128,6 +156,7 @@ namespace
 
 	void ReleaseOwner (FISoundChannel *owner);
 	void StopAndDrain (OpenALSoundRenderer &renderer, FISoundChannel *owner);
+	ALint SourceState (FISoundChannel *owner);
 
 	struct StreamFixture
 	{
@@ -688,6 +717,143 @@ namespace
 		}
 		remove (filePath);
 		remove (slicePath);
+	}
+
+	void TestPhase1BDirectMemory (OpenALSoundRenderer &renderer)
+	{
+		std::vector<BYTE> bytes;
+		SoundHandle sound = { NULL };
+		Check (ReadFixture ("vorbis_mono.ogg", &bytes), "Phase 1B direct-memory fixture reads");
+		if (bytes.empty ())
+		{
+			return;
+		}
+		sound = renderer.LoadSound (&bytes[0], (int)bytes.size ());
+		Check (sound.data != NULL, "Phase 1B direct-memory fixture loads from exact Vorbis bytes");
+		if (sound.data != NULL)
+		{
+			renderer.UnloadSound (sound);
+			Check (alGetError () == AL_NO_ERROR, "Phase 1B direct-memory fixture releases OpenAL resources");
+		}
+	}
+
+	void TestPhase1BFileSlice (OpenALSoundRenderer &renderer)
+	{
+		const std::string path = FixturePath ("float32_mono.wav");
+		std::vector<BYTE> bytes;
+		OpenALSoundStream *stream;
+		Check (ReadFixture ("float32_mono.wav", &bytes), "Phase 1B file-slice fixture reads");
+		if (bytes.empty ())
+		{
+			return;
+		}
+		stream = static_cast<OpenALSoundStream *> (renderer.OpenStream (path.c_str (), 0, 0, (int)bytes.size ()));
+		Check (stream != NULL && stream->Play (false, 1.f), "Phase 1B bounded file slice opens from exact WAVE bytes");
+		delete stream;
+	}
+
+	void TestEncodedSfxFixture (OpenALSoundRenderer &renderer, const char *name, unsigned int channels)
+	{
+		std::vector<BYTE> bytes;
+		SoundHandle sound = { NULL };
+		Check (ReadFixture (name, &bytes), "encoded SFX fixture reads");
+		if (bytes.empty ())
+		{
+			return;
+		}
+		sound = renderer.LoadSound (&bytes[0], (int)bytes.size ());
+		OpenALSound *openalSound = (OpenALSound *)sound.data;
+		Check (openalSound != NULL && openalSound->Channels == channels && openalSound->Frames != 0,
+			"identified encoded SFX loads into OpenAL PCM");
+		if (openalSound != NULL)
+		{
+			FISoundChannel *channel = renderer.StartSound (sound, 0.5f, 128, 0, 0, NULL);
+			ALint buffer = 0;
+			Check (channel != NULL && SourceState (channel) == AL_PLAYING, "identified encoded SFX plays through an OpenAL source");
+			if (channel != NULL)
+			{
+				alGetSourcei (((OpenALChannel *)channel->SysChannel)->Source, AL_BUFFER, &buffer);
+				Check ((unsigned int)buffer == openalSound->Buffer2D, "encoded SFX 2D playback keeps the original channel buffer");
+				StopAndDrain (renderer, channel);
+				ReleaseOwner (channel);
+			}
+			if (channels == 2)
+			{
+				SoundListener listener;
+				FRolloffInfo rolloff = MakeLinearRolloff (0.f, 100.f);
+				FISoundChannel *spatial;
+				listener.valid = true;
+				spatial = renderer.StartSound3D (sound, &listener, 0.5f, &rolloff, 1.f, 128, 0, FVector3 (1.f, 0.f, 0.f), FVector3 (), 0, 0, NULL);
+				Check (spatial != NULL && openalSound->BufferMono != 0, "stereo encoded SFX creates a mono spatial buffer");
+				if (spatial != NULL)
+				{
+					alGetSourcei (((OpenALChannel *)spatial->SysChannel)->Source, AL_BUFFER, &buffer);
+					Check ((unsigned int)buffer == openalSound->BufferMono, "stereo encoded SFX 3D playback selects the mono spatial buffer");
+					StopAndDrain (renderer, spatial);
+					ReleaseOwner (spatial);
+				}
+			}
+			renderer.UnloadSound (sound);
+			Check (alGetError () == AL_NO_ERROR, "encoded SFX unload leaves no OpenAL error");
+		}
+	}
+
+	void TestDumbVorbisSample (OpenALSoundRenderer &renderer)
+	{
+		std::vector<BYTE> mono;
+		std::vector<BYTE> stereo;
+		AudioMemorySource source;
+		AudioDecodedPCM16 decoded;
+		short *output;
+		const BYTE *outputBytes;
+		Check (ReadFixture ("vorbis_mono.ogg", &mono) && ReadFixture ("vorbis_stereo.ogg", &stereo), "DUMB Vorbis fixtures read");
+		if (mono.empty () || stereo.empty ())
+		{
+			return;
+		}
+		source.Assign (&mono[0], mono.size ());
+		Check (DecodeAudioToPCM16 (source, ProbeAudioFormat (source), &decoded) == AUDIO_DECODE_OK && decoded.Channels == 1,
+			"DUMB Vorbis expected PCM decodes");
+		output = renderer.DecodeSample ((int)(decoded.Samples.size () * sizeof (short) + 4), &mono[0], (int)mono.size (), CODEC_Vorbis);
+		outputBytes = reinterpret_cast<const BYTE *> (output);
+		Check (output != NULL && memcmp (output, &decoded.Samples[0], decoded.Samples.size () * sizeof (short)) == 0 &&
+			outputBytes[decoded.Samples.size () * sizeof (short)] == 0 && outputBytes[decoded.Samples.size () * sizeof (short) + 3] == 0,
+			"DUMB Vorbis returns malloc PCM16 and zero-fills clean EOF");
+		free (output);
+		Check (renderer.DecodeSample (16, &stereo[0], (int)stereo.size (), CODEC_Vorbis) == NULL,
+			"DUMB Vorbis rejects stereo PCM output");
+		Check (renderer.DecodeSample (16, &mono[0], (int)mono.size (), CODEC_Unknown) == NULL,
+			"DUMB decoder rejects an unsupported codec type");
+		mono.resize (64);
+		Check (renderer.DecodeSample (16, &mono[0], (int)mono.size (), CODEC_Vorbis) == NULL,
+			"DUMB Vorbis frees and fails on truncated input");
+	}
+
+	void TestEncodedSfxAndDumb (OpenALSoundRenderer &renderer)
+	{
+		const unsigned int encodedInputCap = 64 * 1024 * 1024;
+		Check (OALTestAcceptsEncodedInputSize (encodedInputCap), "encoded input size cap is accepted");
+		Check (!OALTestAcceptsEncodedInputSize (encodedInputCap + 1), "encoded input size cap plus one is rejected");
+		TestEncodedSfxFixture (renderer, "vorbis_mono.ogg", 1);
+		TestEncodedSfxFixture (renderer, "vorbis_stereo.ogg", 2);
+		TestEncodedSfxFixture (renderer, "mp3_mono.mp3", 1);
+		TestEncodedSfxFixture (renderer, "flac_stereo.flac", 2);
+		TestEncodedSfxFixture (renderer, "float32_mono.wav", 1);
+		std::vector<BYTE> truncated;
+		Check (ReadFixture ("vorbis_mono.ogg", &truncated), "truncated encoded SFX fixture reads");
+		if (truncated.size () > 64)
+		{
+			truncated.resize (64);
+			Check (renderer.LoadSound (&truncated[0], (int)truncated.size ()).data == NULL,
+				"malformed encoded SFX falls back to an empty sound handle");
+		}
+		OALTestFailNextEncodedSourceAssign ();
+		Check (renderer.LoadSound (&truncated[0], (int)truncated.size ()).data == NULL,
+			"encoded SFX source allocation failure falls back to an empty sound handle");
+		OALTestFailNextEncodedSourceAssign ();
+		Check (renderer.DecodeSample (16, &truncated[0], (int)truncated.size (), CODEC_Vorbis) == NULL,
+			"DUMB source allocation failure falls back to null");
+		TestDumbVorbisSample (renderer);
 	}
 
 	void TestStreams (OpenALSoundRenderer &renderer, SoundHandle sound)
@@ -1475,33 +1641,48 @@ void S_ChannelEnded (FISoundChannel *owner)
 	}
 }
 
-int main ()
+static int RunPriorityRendererTests (std::vector<BYTE> &longSamples)
 {
+	OpenALSoundRenderer priorityRenderer;
+	if (!priorityRenderer.IsValid ())
+	{
+		if (priorityRenderer.Device == NULL && priorityRenderer.Context == NULL)
+		{
+			fprintf (stderr, "SKIP: OpenAL device/context could not initialize\n");
+			return 77;
+		}
+		fprintf (stderr, "FAILED: OpenAL renderer could not initialize after context creation\n");
+		return 1;
+	}
+	SoundHandle prioritySound = priorityRenderer.LoadSoundRaw (&longSamples[0], (int)longSamples.size (), 8000, 1, -16, -1);
+	if (prioritySound.data == NULL)
+	{
+		fprintf (stderr, "FAILED: OpenAL priority PCM buffer could not initialize\n");
+		return 1;
+	}
+	TestPriorityOrdering (priorityRenderer, prioritySound);
+	TestEffectiveGainOrdering (priorityRenderer, prioritySound);
+	TestPauseReasonsAndClocks (priorityRenderer, prioritySound);
+	priorityRenderer.UnloadSound (prioritySound);
+	return 0;
+}
+
+int main (int argc, char **argv)
+{
+	const char *phase1bOperation = argc == 2 ? argv[1] : NULL;
+	if (phase1bOperation != NULL && strcmp (phase1bOperation, "--phase1b-direct-memory") != 0 &&
+		strcmp (phase1bOperation, "--phase1b-file-slice") != 0)
+	{
+		fprintf (stderr, "Usage: %s [--phase1b-direct-memory|--phase1b-file-slice]\n", argv[0]);
+		return 2;
+	}
 	std::vector<BYTE> longSamples = MakeSamples (8000);
 	std::vector<BYTE> shortSamples = MakeSamples (160);
 	snd_channels.Value = 2;
+	int priorityResult = RunPriorityRendererTests (longSamples);
+	if (priorityResult != 0)
 	{
-		OpenALSoundRenderer priorityRenderer;
-		if (!priorityRenderer.IsValid ())
-		{
-			if (priorityRenderer.Device == NULL && priorityRenderer.Context == NULL)
-			{
-				fprintf (stderr, "SKIP: OpenAL device/context could not initialize\n");
-				return 77;
-			}
-			fprintf (stderr, "FAILED: OpenAL renderer could not initialize after context creation\n");
-			return 1;
-		}
-		SoundHandle prioritySound = priorityRenderer.LoadSoundRaw (&longSamples[0], (int)longSamples.size (), 8000, 1, -16, -1);
-		if (prioritySound.data == NULL)
-		{
-			fprintf (stderr, "FAILED: OpenAL priority PCM buffer could not initialize\n");
-			return 1;
-		}
-		TestPriorityOrdering (priorityRenderer, prioritySound);
-		TestEffectiveGainOrdering (priorityRenderer, prioritySound);
-		TestPauseReasonsAndClocks (priorityRenderer, prioritySound);
-		priorityRenderer.UnloadSound (prioritySound);
+		return priorityResult;
 	}
 	snd_channels.Value = 1;
 	{
@@ -1515,6 +1696,18 @@ int main ()
 		}
 		fprintf (stderr, "FAILED: OpenAL renderer could not initialize after context creation\n");
 		return 1;
+	}
+	if (phase1bOperation != NULL)
+	{
+		if (strcmp (phase1bOperation, "--phase1b-direct-memory") == 0)
+		{
+			TestPhase1BDirectMemory (renderer);
+		}
+		else
+		{
+			TestPhase1BFileSlice (renderer);
+		}
+		return Failures == 0 ? 0 : 1;
 	}
 
 	SoundHandle longSound = renderer.LoadSoundRaw (&longSamples[0], (int)longSamples.size (), 8000, 1, -16, -1);
@@ -1541,6 +1734,7 @@ int main ()
 	TestRestartConversionBounds (renderer);
 	TestClockWrap (renderer);
 	TestStreams (renderer, longSound);
+	TestEncodedSfxAndDumb (renderer);
 
 	renderer.UnloadSound (longSound);
 	renderer.UnloadSound (shortSound);

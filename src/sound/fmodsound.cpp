@@ -634,6 +634,11 @@ bool FMODSoundRenderer::IsValid()
 	return InitSuccess;
 }
 
+bool FMODSoundRenderer::SupportsGeneratedSMFStreaming()
+{
+	return true;
+}
+
 #ifdef _MSC_VER
 //==========================================================================
 //
