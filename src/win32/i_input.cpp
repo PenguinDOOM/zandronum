@@ -130,8 +130,10 @@ FJoystickCollection *JoyDevices[NUM_JOYDEVICES];
 extern HINSTANCE g_hInst;
 extern DWORD SessionID;
 
+#ifndef NO_SOUND
 extern void ShowEAXEditor ();
 extern bool SpawnEAXWindow;
+#endif
 
 static HMODULE DInputDLL;
 
@@ -141,10 +143,14 @@ extern FKeyboard *Keyboard;
 
 bool VidResizing;
 
+#ifndef NO_SOUND
 extern bool SpawnEAXWindow;
+#endif
 extern BOOL vidactive;
 extern HWND Window, ConWindow;
+#ifndef NO_SOUND
 extern HWND EAXEditWindow;
+#endif
 
 EXTERN_CVAR (String, language)
 EXTERN_CVAR (Bool, lookstrafe)
@@ -497,12 +503,14 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 
 	case WM_KEYDOWN:
+	#ifndef NO_SOUND
 		// When the EAX editor is open, pressing Ctrl+Tab will switch to it
 		if (EAXEditWindow != 0 && wParam == VK_TAB && !(lParam & 0x40000000) &&
 			(GetKeyState (VK_CONTROL) & 0x8000))
 		{
 			SetForegroundWindow (EAXEditWindow);
 		}
+	#endif
 		break;
 
 	case WM_SYSKEYDOWN:
@@ -527,11 +535,13 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 
 	case WM_DISPLAYCHANGE:
+	#ifndef NO_SOUND
 		if (SpawnEAXWindow)
 		{
 			SpawnEAXWindow = false;
 			ShowEAXEditor ();
 		}
+	#endif
 		break;
 
 	case WM_GETMINMAXINFO:
@@ -798,7 +808,9 @@ void I_GetEvent ()
 	{
 		if (mess.message == WM_QUIT)
 			exit (mess.wParam);
+	#ifndef NO_SOUND
 		if (EAXEditWindow == 0 || !IsDialogMessage (EAXEditWindow, &mess))
+	#endif
 		{
 			if (GUICapture)
 			{

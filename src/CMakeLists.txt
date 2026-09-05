@@ -35,6 +35,20 @@ if( "${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" OR "${CMAKE_CXX_COMPILER_ID}" STRE
 endif( "${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" )
 
 option( DYN_FLUIDSYNTH "Dynamically load fluidsynth" ON )
+option( SERVERONLY "Build a server only binary" )
+set( SERVERONLY "${SERVERONLY}" CACHE BOOL "Build a server only binary" FORCE )
+option( NO_SOUND "Turn of sound support" )
+set( EFFECTIVE_NO_SOUND ${NO_SOUND} )
+
+if( SERVERONLY )
+	set( EFFECTIVE_NO_SOUND ON )
+	add_definitions ( -DSERVER_ONLY=1 )
+	set( ZDOOM_EXE_NAME ${ZDOOM_EXE_NAME}-server )
+endif( SERVERONLY )
+
+if( EFFECTIVE_NO_SOUND )
+	add_definitions( -DNO_SOUND=1 )
+endif( EFFECTIVE_NO_SOUND )
 
 if( CMAKE_SIZEOF_VOID_P MATCHES "8" )
 	set( X64 64 )
@@ -186,19 +200,14 @@ else( WIN32 )
 		option( NO_GTK "Disable GTK+ dialogs (Not applicable to Windows)" )
 		option( VALGRIND "Add special Valgrind sequences to self-modifying code" )
 		# [BB] Added SERVERONLY, NO_SOUND and NO_GL.
-		option( SERVERONLY "Build a server only binary" )
-		option( NO_SOUND "Turn of sound support" )
 		option( NO_GL "Turn of OpenGL support" )
 		option( NO_LIBSECRET "Turn off libsecret support" ) # [SB]
 
 		# [BB] The server doesn't need sound, GTK or OpenGL.
 		if( SERVERONLY )
-			set( NO_SOUND ON )
 			set( NO_GTK ON )
 			set( NO_GL ON )
 			set( NO_LIBSECRET ON ) # [SB]
-			add_definitions ( -DSERVER_ONLY=1 )
-			set( ZDOOM_EXE_NAME ${ZDOOM_EXE_NAME}-server )
 		endif( SERVERONLY )
 
 		set( FMOD_SEARCH_PATHS
@@ -277,11 +286,6 @@ else( WIN32 )
 	# [BB] Only the Windows version has the server console GUI.
 	add_definitions( -DNO_SERVER_GUI=1 )
 
-	# [BB] Turning off sound needs special handling in the code, activated with the define NO_SOUND.
-	if( NO_SOUND )
-		add_definitions( -DNO_SOUND=1 )
-	endif( NO_SOUND )
-
 	# [BB] Turning off OpenGL needs special handling in the code, activated with the define NO_GL.
 	if( NO_GL )
 		add_definitions( -DNO_GL=1 )
@@ -321,51 +325,41 @@ if( NOT FMOD_LIB_NAME )
 endif( NOT FMOD_LIB_NAME )
 
 
-# Search for FMOD include files
-
-if( NOT WIN32 )
-	find_path( FMOD_INCLUDE_DIR fmod.hpp
-		PATHS ${FMOD_LOCAL_INC_DIRS} )
-endif( NOT WIN32 )
-
-if( NOT FMOD_INCLUDE_DIR )
-	find_path( FMOD_INCLUDE_DIR fmod.hpp
-		PATHS ${FMOD_SEARCH_PATHS}
-		${FMOD_INC_PATH_SUFFIXES} )
-endif( NOT FMOD_INCLUDE_DIR )
-
-if( FMOD_INCLUDE_DIR )
-	message( STATUS "FMOD include files found at ${FMOD_INCLUDE_DIR}" )
-else( FMOD_INCLUDE_DIR )
-	# [BB] Without sound, we don't need FMOD.
-	if ( NOT NO_SOUND )
+if( NOT EFFECTIVE_NO_SOUND )
+	# Search for FMOD include files.
+	if( NOT WIN32 )
+		find_path( FMOD_INCLUDE_DIR fmod.hpp
+			PATHS ${FMOD_LOCAL_INC_DIRS} )
+	endif( NOT WIN32 )
+	if( NOT FMOD_INCLUDE_DIR )
+		find_path( FMOD_INCLUDE_DIR fmod.hpp
+			PATHS ${FMOD_SEARCH_PATHS}
+			${FMOD_INC_PATH_SUFFIXES} )
+	endif( NOT FMOD_INCLUDE_DIR )
+	if( FMOD_INCLUDE_DIR )
+		message( STATUS "FMOD include files found at ${FMOD_INCLUDE_DIR}" )
+	else( FMOD_INCLUDE_DIR )
 		message( SEND_ERROR "Could not find FMOD include files" )
-	endif ( NOT NO_SOUND )
-endif( FMOD_INCLUDE_DIR )
+	endif( FMOD_INCLUDE_DIR )
 
-
-# Search for FMOD library
-
-if( WIN32 OR APPLE )
-	find_library( FMOD_LIBRARY ${FMOD_LIB_NAME}
-		PATHS ${FMOD_SEARCH_PATHS}
-		${FMOD_LIB_PATH_SUFFIXES} )
-else( WIN32 OR APPLE )
-	find_library( FMOD_LIBRARY
-		NAMES ${FMOD_VERSIONS}
-		PATHS ${FMOD_LOCAL_LIB_DIRS} )
-endif( WIN32 OR APPLE )
-
-if( FMOD_LIBRARY )
-	message( STATUS "FMOD library found at ${FMOD_LIBRARY}" )
-else( FMOD_LIBRARY )
-	# [BB] Without sound, we don't need FMOD.
-	if ( NOT NO_SOUND )
+	# Search for FMOD library.
+	if( WIN32 OR APPLE )
+		find_library( FMOD_LIBRARY ${FMOD_LIB_NAME}
+			PATHS ${FMOD_SEARCH_PATHS}
+			${FMOD_LIB_PATH_SUFFIXES} )
+	else( WIN32 OR APPLE )
+		find_library( FMOD_LIBRARY
+			NAMES ${FMOD_VERSIONS}
+			PATHS ${FMOD_LOCAL_LIB_DIRS} )
+	endif( WIN32 OR APPLE )
+	if( FMOD_LIBRARY )
+		message( STATUS "FMOD library found at ${FMOD_LIBRARY}" )
+	else( FMOD_LIBRARY )
 		message( SEND_ERROR "Could not find FMOD library" )
-	endif ( NOT NO_SOUND )
-endif( FMOD_LIBRARY )
+	endif( FMOD_LIBRARY )
+endif( NOT EFFECTIVE_NO_SOUND )
 
-if( NOT NO_SOUND )
+if( NOT EFFECTIVE_NO_SOUND )
 	find_package( OpenAL )
 	if( OPENAL_FOUND )
 		message( STATUS "OpenAL include files found at ${OPENAL_INCLUDE_DIR}" )
@@ -373,7 +367,7 @@ if( NOT NO_SOUND )
 	else( OPENAL_FOUND )
 		message( SEND_ERROR "Could not find OpenAL headers and library" )
 	endif( OPENAL_FOUND )
-endif( NOT NO_SOUND )
+endif( NOT EFFECTIVE_NO_SOUND )
 
 
 # Search for FluidSynth
@@ -601,7 +595,9 @@ endif( "${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" OR "${CMAKE_CXX_COMPILER_ID}" S
 # MSVC Flags
 
 if( MSVC )
-	set( CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /DELAYLOAD:\"fmodex${X64}.dll\"" )
+	if( NOT EFFECTIVE_NO_SOUND )
+		set( CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /DELAYLOAD:\"fmodex${X64}.dll\"" )
+	endif( NOT EFFECTIVE_NO_SOUND )
 	# [BB] Use object level parallelism for our main target.
 	set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP" )
 endif( MSVC )
@@ -684,20 +680,20 @@ add_custom_target( revision_check ALL
 message( STATUS "Fluid synth libs: ${FLUIDSYNTH_LIBRARIES}" )
 set( ZDOOM_LIBS ${ZDOOM_LIBS} "${ZLIB_LIBRARIES}" "${JPEG_LIBRARIES}" "${BZIP2_LIBRARIES}" "${GME_LIBRARIES}" )
 # [BB] Without sound, we don't need FMOD.
-if ( NOT NO_SOUND )
+if ( NOT EFFECTIVE_NO_SOUND )
 	set( ZDOOM_LIBS ${ZDOOM_LIBS} "${FMOD_LIBRARY}" "${OPENAL_LIBRARY}" )
 	include_directories( "${ZLIB_INCLUDE_DIR}" "${FMOD_INCLUDE_DIR}" "${OPENAL_INCLUDE_DIR}" "${BZIP2_INCLUDE_DIR}" "${LZMA_INCLUDE_DIR}" "${JPEG_INCLUDE_DIR}" "${GME_INCLUDE_DIR}" )
 	set( SOUND_SOURCES
 		sound/audio_decoder.cpp
-			sound/audio_decoder_miniaudio.cpp
-			sound/audio_decoder_vorbis.cpp
-			sound/thirdparty/stb/stb_vorbis.c
+		sound/audio_decoder_miniaudio.cpp
+		sound/audio_decoder_vorbis.cpp
+		sound/thirdparty/stb/stb_vorbis.c
 		sound/fmodsound.cpp
 		sound/oalsound.cpp
 	)
-else ( NOT NO_SOUND )
+else ( NOT EFFECTIVE_NO_SOUND )
 	include_directories( "${ZLIB_INCLUDE_DIR}" "${BZIP2_INCLUDE_DIR}" "${LZMA_INCLUDE_DIR}" "${JPEG_INCLUDE_DIR}" "${GME_INCLUDE_DIR}" )
-endif ( NOT NO_SOUND )
+endif ( NOT EFFECTIVE_NO_SOUND )
 
 # [BB] We need OpenSSL for csrp.
 FIND_PACKAGE ( OpenSSL REQUIRED )
@@ -708,11 +704,11 @@ if( WIN32 )
 endif ( WIN32 )
 
 # [AK] We need Opus for encoding/decoding VoIP audio packets, and RNNoise for noise suppression.
-if ( NOT NO_SOUND )
+if ( NOT EFFECTIVE_NO_SOUND )
 	find_package( Opus REQUIRED )
 	include_directories( ${OPUS_INCLUDE_DIR} )
 	set( ZDOOM_LIBS ${ZDOOM_LIBS} ${OPUS_LIBRARIES} rnnoise )
-endif ( NOT NO_SOUND )
+endif ( NOT EFFECTIVE_NO_SOUND )
 
 # [AK] We also need ZStd for encoding/decoding network packets.
 find_package( ZStd REQUIRED )
@@ -740,7 +736,6 @@ set( PLAT_WIN32_SOURCES
 	gl/hqnx_asm/hq3x_asm.cpp
 	gl/hqnx_asm/hq4x_asm.cpp
 	gl/hqnx_asm/hqnx_asm_Image.cpp
-	win32/eaxedit.cpp
 	win32/fb_d3d9.cpp
 	win32/fb_d3d9_wipe.cpp
 	win32/fb_ddraw.cpp
@@ -760,6 +755,9 @@ set( PLAT_WIN32_SOURCES
 	win32/st_start.cpp
 	win32/win32gliface.cpp
 	win32/win32video.cpp )
+if( NOT EFFECTIVE_NO_SOUND )
+	list( APPEND PLAT_WIN32_SOURCES win32/eaxedit.cpp )
+endif( NOT EFFECTIVE_NO_SOUND )
 # [BB] Add files for G15 support and the Windows server console.
 set( PLAT_WIN32_SOURCES ${PLAT_WIN32_SOURCES}
 	win32/g15/include/EZ_LCD.cpp
@@ -1257,7 +1255,7 @@ add_executable( zdoom WIN32
 	r_sky.cpp
 	r_things.cpp
 	s_advsound.cpp
-	 sound/audio_timetag.cpp
+	sound/audio_timetag.cpp
 	s_environment.cpp
 	s_playlist.cpp
 	s_sndseq.cpp
@@ -1494,9 +1492,9 @@ endif(${CMAKE_SYSTEM_NAME} STREQUAL "SunOS")
 
 # [BB] Added GeoIP, huffman & sqlite
 target_link_libraries( zdoom ${ZDOOM_LIBS} gdtoa dumb lzma GeoIP sqlite3 )
-if ( NOT NO_SOUND AND OPENAL_FOUND )
+if ( NOT EFFECTIVE_NO_SOUND AND OPENAL_FOUND )
 	target_include_directories( zdoom PRIVATE "${OPENAL_INCLUDE_DIR}" )
-endif ( NOT NO_SOUND AND OPENAL_FOUND )
+endif ( NOT EFFECTIVE_NO_SOUND AND OPENAL_FOUND )
 include_directories( .
 	g_doom
 	g_heretic
@@ -1545,11 +1543,15 @@ endif( NOT ZDOOM_OUTPUT_OLDSTYLE OR NO_GENERATOR_EXPRESSIONS )
 
 if( MSVC )
 	option( ZDOOM_GENERATE_MAPFILE "Generate .map file for debugging." OFF )
-	if( ZDOOM_GENERATE_MAPFILE )
-		set_target_properties(zdoom PROPERTIES LINK_FLAGS "/MANIFEST:NO /DELAYLOAD:\"fmodex${X64}.dll\" /MAP")
-	else( ZDOOM_GENERATE_MAPFILE )
-		set_target_properties(zdoom PROPERTIES LINK_FLAGS "/MANIFEST:NO /DELAYLOAD:\"fmodex${X64}.dll\"")
-	endif( ZDOOM_GENERATE_MAPFILE )
+	if( EFFECTIVE_NO_SOUND )
+		set_target_properties(zdoom PROPERTIES LINK_FLAGS "/MANIFEST:NO")
+	else( EFFECTIVE_NO_SOUND )
+		if( ZDOOM_GENERATE_MAPFILE )
+			set_target_properties(zdoom PROPERTIES LINK_FLAGS "/MANIFEST:NO /DELAYLOAD:\"fmodex${X64}.dll\" /MAP")
+		else( ZDOOM_GENERATE_MAPFILE )
+			set_target_properties(zdoom PROPERTIES LINK_FLAGS "/MANIFEST:NO /DELAYLOAD:\"fmodex${X64}.dll\"")
+		endif( ZDOOM_GENERATE_MAPFILE )
+	endif( EFFECTIVE_NO_SOUND )
 
 	if( NO_GENERATOR_EXPRESSIONS )
 		add_custom_command(TARGET zdoom POST_BUILD

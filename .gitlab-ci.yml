@@ -44,7 +44,7 @@ variables:
         )
       fi
       cmake "${cmake_args[@]}" ..
-    - ninja
+    - ninja && if [[ "$SERVERONLY" != "ON" ]]; then python3 ../tools/testdata/audio/validate_phase1b_manifest.py --self-test && ctest --test-dir . --output-on-failure -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_lifecycle)$'; fi
     # liboutput_sdl is a symlink, we need the actual file
     - if [ -L liboutput_sdl.so ]; then
         cp --remove-destination "$(readlink liboutput_sdl.so)" liboutput_sdl.so ;
@@ -153,6 +153,11 @@ variables:
         json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8'
       )
       PY
+      if [[ "$sound_enabled" == true ]]; then
+        python3 ../scripts/phase1b_audio_gate.py package --package "$PWD" --source-root .. --sound-enabled
+      else
+        python3 ../scripts/phase1b_audio_gate.py package --package "$PWD" --source-root ..
+      fi
   artifacts:
     paths:
       - build/zandronum*
@@ -161,6 +166,9 @@ variables:
       - build/*.so.*
       - build/OpenAL-Soft-COPYING.txt
       - build/OpenAL-Soft-SOURCE.txt
+      - build/miniaudio-LICENSE.txt
+      - build/stb_vorbis-LICENSE.txt
+      - build/audio-decoders.md
       - build/phase1a-runtime-manifest.json
 
 build_linux:
@@ -193,6 +201,9 @@ appimage:
     - cp build/libfmodex*.so AppDir/usr/lib
     - cp build/OpenAL-Soft-COPYING.txt AppDir/usr/share/licenses/zandronum
     - cp build/OpenAL-Soft-SOURCE.txt AppDir/usr/share/licenses/zandronum
+    - cp build/miniaudio-LICENSE.txt AppDir/usr/share/licenses/zandronum
+    - cp build/stb_vorbis-LICENSE.txt AppDir/usr/share/licenses/zandronum
+    - cp build/audio-decoders.md AppDir/usr/share/licenses/zandronum
     - test -f build/libopenal.so.1
     - cp appimage/AppRun AppDir
     - cp appimage/zandronum.desktop AppDir
@@ -248,15 +259,18 @@ appimage:
       pk3s = matching('usr/bin/*.pk3')
       fmod = matching('usr/lib/libfmodex*.so*')
       openal = matching_openal()
-      licenses = matching('usr/share/licenses/zandronum/OpenAL-Soft-*.txt')
+      licenses = sorted(
+        matching('usr/share/licenses/zandronum/*.txt') +
+        matching('usr/share/licenses/zandronum/*.md')
+      )
       if not executables or not pk3s:
         raise RuntimeError('the AppDir must contain executable and PK3 inputs')
       if len(fmod) != 1:
         raise RuntimeError('the AppDir FMOD runtime set is missing or has extras')
       if len(openal) != 1:
         raise RuntimeError('the AppDir OpenAL runtime set is missing or has extras')
-      if [path.name for path in licenses] != ['OpenAL-Soft-COPYING.txt', 'OpenAL-Soft-SOURCE.txt']:
-        raise RuntimeError('the AppDir OpenAL license/notice set is missing or has extras')
+      if [path.name for path in licenses] != ['OpenAL-Soft-COPYING.txt', 'OpenAL-Soft-SOURCE.txt', 'audio-decoders.md', 'miniaudio-LICENSE.txt', 'stb_vorbis-LICENSE.txt']:
+        raise RuntimeError('the AppDir decoder and OpenAL license/notice set is missing or has extras')
 
       build_manifest_path = Path('build/phase1a-runtime-manifest.json')
       if not build_manifest_path.is_file():
@@ -298,6 +312,7 @@ appimage:
         json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8'
       )
       PY
+      python3 scripts/phase1b_audio_gate.py package --package AppDir --source-root . --notice-directory usr/share/licenses/zandronum --sound-enabled
     - linuxdeploy --appimage-extract-and-run
       --appdir AppDir --output appimage -v0
     - |
@@ -307,6 +322,10 @@ appimage:
       rm -rf squashfs-root
       "$appimage" --appimage-extract >/dev/null
       test -f squashfs-root/phase1a-runtime-manifest.json
+      test -f squashfs-root/usr/share/licenses/zandronum/miniaudio-LICENSE.txt
+      test -f squashfs-root/usr/share/licenses/zandronum/stb_vorbis-LICENSE.txt
+      test -f squashfs-root/usr/share/licenses/zandronum/audio-decoders.md
+      ! find squashfs-root -type f -regextype posix-extended -iregex '.*(miniaudio|stb[_-]?vorbis|vorbis|ogg|flac|mp3|mad|mpeg|codec)[^/]*\.(dll|so(\..*)?)'
       mapfile -t extracted_openal < <(find squashfs-root -type f -name 'libopenal.so*' | sort)
       ((${#extracted_openal[@]} == 1))
       MANIFEST_ROOT="$PWD/squashfs-root" python3 - <<'PY'
@@ -339,7 +358,7 @@ appimage:
         'fmod_runtime': actual('usr/lib/libfmodex*.so*'),
         'openal_runtime': actual_openal,
         'pk3s': actual('usr/bin/*.pk3'),
-        'license_notice': actual('usr/share/licenses/zandronum/OpenAL-Soft-*.txt'),
+        'license_notice': sorted(actual('usr/share/licenses/zandronum/*.txt') + actual('usr/share/licenses/zandronum/*.md')),
       }
       for category in ('executables', 'fmod_runtime', 'openal_runtime', 'pk3s', 'license_notice'):
         manifest_paths = sorted(item['path'] for item in manifest['files'][category])
@@ -409,8 +428,10 @@ appimage:
         throw "$openalRootVariable for ARCH=$env:ARCH must contain include\AL\al.h, lib\OpenAL32.lib, and bin\OpenAL32.dll.";
       } ;
 
-      mkdir build-$env:CI_JOB_ID &&
-      cd build-$env:CI_JOB_ID &&
+      mkdir build-$env:CI_JOB_ID ;
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } ;
+      cd build-$env:CI_JOB_ID ;
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } ;
       & cmake
         -Tv140_xp
         -G"Visual Studio 14 2015"
@@ -430,10 +451,16 @@ appimage:
         -DZSTD_INCLUDE_DIR="$env:ZA_ZSTD_ROOT\include"
         -DZSTD_LIBRARY="$env:ZA_ZSTD_ROOT\lib\${env:ARCH}\zstd_static.lib"
         -DRELEASE_WITH_DEBUG_FILE=ON
-        .. &&
+        .. ;
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } ;
       & 'C:\Program Files (x86)\MSBuild\14.0\Bin\amd64\MSBuild.exe'
         /property:Configuration=Release
-        zandronum.sln &&
+        zandronum.sln ;
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } ;
+      python ..\tools\testdata\audio\validate_phase1b_manifest.py --self-test ;
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } ;
+      ctest --test-dir . -C Release --output-on-failure -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_lifecycle)' ;
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } ;
       Copy-Item "$env:ZA_FMOD_ROOT\api\fmodex${fmodArch}.dll" -Destination "Release" ;
       $release = (Resolve-Path "Release").Path ;
       $openalTarget = Join-Path $release "OpenAL32.dll" ;
@@ -549,7 +576,8 @@ appimage:
           license_notice = @($licenses | ForEach-Object { Get-ManifestRecord $_ })
         }
       } ;
-      $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $release "phase1a-runtime-manifest.json") -Encoding utf8
+      $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $release "phase1a-runtime-manifest.json") -Encoding utf8 ;
+      python ..\scripts\phase1b_audio_gate.py package --package $release --source-root .. --sound-enabled
   artifacts:
     paths:
       - build-$CI_JOB_ID/Release/*

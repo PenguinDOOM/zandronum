@@ -1897,7 +1897,9 @@ test &lt;= $screenblocks 10 "echo the view window is shrunk" "echo the view wind
 				<div class="v" id="snd_backend">snd_backend</div>
 				<div class="t">string: "fmod"</div>
 				<div class="d">Selects the sound backend. The accepted values are "fmod" and "openal", without regard to case. "fmod" is the default and uses the existing FMOD backend. "openal" selects the native OpenAL Soft backend. An unknown value produces a warning and uses FMOD. If OpenAL cannot initialize, the failure is reported and FMOD is used instead. Run <a href="#snd_reset">snd_reset</a> after changing this cvar.
-					With OpenAL, software-generated PCM music streams remain supported through <code>CreateStream</code>, including the OPL, GME, DUMB, FluidSynth, and Timidity producers. The OpenAL <code>OpenStream</code> path used for encoded music, MIDI-file playback, and file or URL stream paths is unavailable, and VoIP is unavailable. FMOD retains its existing encoded-music and VoIP behavior. OpenAL area sounds within 32 map units use a centered panning approximation; farther area sounds use normal positional panning while attenuation still uses the true distance.</div>
+			With OpenAL, local or lump-backed music opened from a file, file slice, or copied memory supports integer PCM WAVE, IEEE-float WAVE, Ogg Vorbis, MP3/MPEG audio, and FLAC. Decoded output is mono or stereo PCM16 at the source's native rate; multichannel input is rejected. Whole-stream looping, millisecond seek and position, pause/resume, natural end-of-file, and replay after the end are supported for these local streams. Vorbis streams also support forward <code>LOOP_START</code>/<code>LOOP_END</code> tags and the legacy <code>LOOPSTART</code>/<code>LOOPEND</code> aliases; a missing start uses the beginning and a missing end uses the stream end. Bidirectional loops and MP3/FLAC loop metadata are not supported.
+			OpenAL encoded sound effects support Ogg Vorbis, MP3, and FLAC. Float WAVE sound effects are supported when recognized by the common decoder; integer PCM WAVE remains handled first by the existing WAVE parser. Ogg-compressed XM samples loaded through DUMB use the same decoder with fixed mono PCM16 output. Existing OPL, GME, ordinary DUMB, Timidity, and FluidSynth players continue to use their PCM callback streams. FMOD remains the default and retains its existing behavior.
+			OpenAL does not currently support URL or remote streams or Ogg Opus; these fail at load time with an explicit diagnostic and do not fall back to reconnecting or streaming through FMOD. AIFF, WMA/ASF, FSB, AAC, other non-PCM/non-float WAVE codecs, and other deferred encoded formats are also unsupported by OpenAL. OpenAL area sounds within 32 map units use a centered panning approximation; farther area sounds use normal positional panning while attenuation still uses the true distance.</div>
 				<div class="v" id="snd_buffersize">snd_buffersize</div>
 				<div class="t">integer: 0</div>
 				<div class="d">This is the length of the sound buffer in milliseconds. Leaving this 
@@ -2019,7 +2021,11 @@ test &lt;= $screenblocks 10 "echo the view window is shrunk" "echo the view wind
 				<div class="d">This cvar determines which MIDI device ZDoom uses for MIDI and MUS 
 					music. A value of -1 indicates to use the Windows MIDI Mapper, while other 
 					values select specific MIDI devices. A complete list of MIDI devices available 
-					can be obtained with the snd_listmididevices command.
+			can be obtained with the snd_listmididevices command. When OpenAL or another
+			renderer that cannot stream generated MIDI files is active, a requested or default
+			FMOD MIDI selection is remapped once per selection to the built-in OPL synthesizer,
+			with a one-time console diagnostic. FMOD-capable renderers keep the requested
+			selection unchanged.
 				</div>
 				<div class="v" id="snd_midiprecache">snd_midiprecache</div>
 				<div class="t">boolean: true</div>

@@ -89,7 +89,7 @@ jobs:
         cmake "${cmake_args[@]}"
 
     - name: Build
-      run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config ${{ matrix.build_type }} -j $(nproc)
+      run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config ${{ matrix.build_type }} -j $(nproc) && if [[ "${{ matrix.serveronly }}" == "" ]]; then python3 tools/testdata/audio/validate_phase1b_manifest.py --self-test && ctest --test-dir "${{ steps.strings.outputs.build-output-dir }}" -C "${{ matrix.build_type }}" --output-on-failure -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_lifecycle)$'; fi
 
     - name: Create package
       shell: bash
@@ -223,6 +223,11 @@ jobs:
             json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8'
         )
         PY
+        if [[ "$sound_enabled" == true ]]; then
+          python3 scripts/phase1b_audio_gate.py package --package "$package" --source-root "$PWD" --sound-enabled
+        else
+          python3 scripts/phase1b_audio_gate.py package --package "$package" --source-root "$PWD"
+        fi
 
     - name: Upload artefacts
       uses: actions/upload-artifact@v4

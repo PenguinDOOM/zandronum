@@ -6,7 +6,12 @@ endif( WIN32 )
 add_subdirectory( updaterevision )
 add_subdirectory( zipdir )
 
-if( BUILD_TESTING )
+set( EFFECTIVE_NO_SOUND ${NO_SOUND} )
+if( SERVERONLY )
+	set( EFFECTIVE_NO_SOUND ON )
+endif( SERVERONLY )
+
+if( BUILD_TESTING AND NOT EFFECTIVE_NO_SOUND )
 	add_executable( audio_decoder_tests
 		audio_decoder_tests.cpp
 		${CMAKE_SOURCE_DIR}/src/sound/audio_decoder.cpp
@@ -30,7 +35,7 @@ if( BUILD_TESTING )
 	target_include_directories( midi_device_selection_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/sound )
 	add_test( NAME midi_device_selection COMMAND midi_device_selection_tests )
 
-	if( NOT NO_SOUND AND NOT SERVERONLY )
+	if( NOT EFFECTIVE_NO_SOUND )
 		find_package( OpenAL REQUIRED )
 		add_executable( openal_lifecycle_tests
 			openal_renderer_lifecycle_tests.cpp
@@ -46,7 +51,7 @@ if( BUILD_TESTING )
 		target_link_libraries( openal_lifecycle_tests ${OPENAL_LIBRARY} )
 		add_test( NAME openal_lifecycle COMMAND openal_lifecycle_tests )
 		set_tests_properties( openal_lifecycle PROPERTIES SKIP_RETURN_CODE 77 )
-	endif( NOT NO_SOUND AND NOT SERVERONLY )
-endif( BUILD_TESTING )
+	endif( NOT EFFECTIVE_NO_SOUND )
+endif( BUILD_TESTING AND NOT EFFECTIVE_NO_SOUND )
 
 set( CROSS_EXPORTS ${CROSS_EXPORTS} PARENT_SCOPE )

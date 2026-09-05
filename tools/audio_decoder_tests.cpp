@@ -1,6 +1,7 @@
 #include "audio_decoder.h"
 #include "audio_timetag.h"
 
+#include <climits>
 #include <stdint.h>
 #include <limits>
 #include <stdio.h>

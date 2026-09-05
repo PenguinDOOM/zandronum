@@ -116,7 +116,14 @@ jobs:
             -DNASM_PATH="${{ steps.strings.outputs.deps-dir }}\nasm\nasm.exe"
 
     - name: Build
-      run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config ${{ matrix.build_type }}
+      shell: pwsh
+      run: |
+        & cmake --build '${{ steps.strings.outputs.build-output-dir }}' --config '${{ matrix.build_type }}'
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        python tools/testdata/audio/validate_phase1b_manifest.py --self-test
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        ctest --test-dir '${{ steps.strings.outputs.build-output-dir }}' -C '${{ matrix.build_type }}' --output-on-failure -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_lifecycle)$'
+        exit $LASTEXITCODE
 
     - name: Create package
       shell: pwsh
@@ -277,6 +284,7 @@ jobs:
               }
           }
           $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $package 'phase1a-runtime-manifest.json') -Encoding utf8
+                    python scripts/phase1b_audio_gate.py package --package $package --source-root $PWD --sound-enabled
 
     - name: Upload artefacts
       uses: actions/upload-artifact@v4

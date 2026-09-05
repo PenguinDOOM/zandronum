@@ -1,5 +1,6 @@
 #include "audio_timetag.h"
 
+#include <cstddef>
 #include <limits>
 
 namespace
