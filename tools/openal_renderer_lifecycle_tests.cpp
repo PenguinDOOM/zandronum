@@ -1,4 +1,8 @@
+#include <vector>
+
+#define private public
 #include "oalsound.h"
+#undef private
 
 #include "audio_decoder.h"
 
@@ -10,12 +14,12 @@
 #include <stdlib.h>
 #include <string>
 #include <thread>
-#include <vector>
 
 OALTestIntCVar snd_channels (1);
 OALTestStringCVar snd_openal_device ("default");
 OALTestFloatCVar snd_sfxvolume (1.f);
 OALTestBoolCVar snd_pitched (true);
+extern bool OALTestForceFloatPCM16Fallback;
 
 namespace
 {
@@ -44,6 +48,10 @@ namespace
 	std::vector<CallbackEvent> Events;
 	int Failures = 0;
 	FISoundChannel *ForcedNextOwner = NULL;
+	const int OALTestStreamMono = 1;
+	const int OALTestStreamBits8 = 2;
+	const int OALTestStreamBits32 = 4;
+	const int OALTestStreamFloat = 8;
 
 	void Check (bool condition, const char *name)
 	{
@@ -201,6 +209,113 @@ namespace
 		StreamFixture *fixture = (StreamFixture *)userData;
 		++fixture->CallCount;
 		return false;
+	}
+
+	struct FloatCallbackFixture
+	{
+		FloatCallbackFixture (const float *samples, size_t count) : Samples (samples, samples + count), CallCount (0) {}
+
+		std::vector<float> Samples;
+		int CallCount;
+	};
+
+	bool FloatCallback (SoundStream *, void *buffer, int length, void *userData)
+	{
+		FloatCallbackFixture *fixture = static_cast<FloatCallbackFixture *> (userData);
+		++fixture->CallCount;
+		if (fixture->CallCount != 1 || length != (int)(fixture->Samples.size () * sizeof (float)))
+		{
+			return false;
+		}
+		memcpy (buffer, &fixture->Samples[0], fixture->Samples.size () * sizeof (float));
+		return true;
+	}
+
+	short FloatToPCM16 (float sample)
+	{
+		if (sample > 1.f)
+		{
+			sample = 1.f;
+		}
+		else if (sample < -1.f)
+		{
+			sample = -1.f;
+		}
+		return (short)(sample * 32767.f);
+	}
+
+	void TestFloatCallbackPCM (OpenALSoundRenderer &renderer, int flags, bool forcePCM16Fallback, const char *name)
+	{
+		const float samples[] = { -1.f, -0.5f, 0.25f, 1.f, -0.25f, 0.5f, 0.75f, -0.75f };
+		const unsigned int channels = (flags & OALTestStreamMono) ? 1 : 2;
+		const unsigned int frames = 4;
+		const size_t sampleCount = (size_t)frames * channels;
+		const unsigned int expectedOutputBits = forcePCM16Fallback ? 16 : 32;
+		FloatCallbackFixture fixture (samples, sampleCount);
+		if (!forcePCM16Fallback && !alIsExtensionPresent ("AL_EXT_FLOAT32"))
+		{
+			fprintf (stderr, "SKIPPED: %s (AL_EXT_FLOAT32 unavailable)\n", name);
+			return;
+		}
+		OALTestForceFloatPCM16Fallback = forcePCM16Fallback;
+		OpenALSoundStream *stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (
+			reinterpret_cast<SoundStreamCallback> (FloatCallback), (int)(sampleCount * sizeof (float)), flags, 8000, &fixture));
+		OALTestForceFloatPCM16Fallback = false;
+		Check (stream != NULL && stream->InputBits == 32 && stream->InputIsFloat && stream->OutputBits == expectedOutputBits,
+			name);
+		if (stream == NULL)
+		{
+			return;
+		}
+		Check (stream->Play (false, 1.f) && fixture.CallCount >= 1 && stream->BufferFrames[0] == frames,
+			"Float callback preserves frame count through the producer stream");
+		Check (stream->OutputBuffer.size () == sampleCount * (expectedOutputBits / 8),
+			"Float callback produces the expected uploaded PCM byte count");
+		if (expectedOutputBits == 32)
+		{
+			Check (memcmp (&stream->OutputBuffer[0], samples, sampleCount * sizeof (float)) == 0,
+				"Float callback preserves nonzero float32 PCM samples");
+		}
+		else
+		{
+			for (size_t index = 0; index < sampleCount; ++index)
+			{
+				short converted;
+				memcpy (&converted, &stream->OutputBuffer[index * sizeof (converted)], sizeof (converted));
+				Check (converted == FloatToPCM16 (samples[index]), "Float callback PCM16 fallback preserves sample values");
+			}
+		}
+		delete stream;
+	}
+
+	void TestFloatCallbackPCMFormats (OpenALSoundRenderer &renderer)
+	{
+		TestFloatCallbackPCM (renderer, OALTestStreamMono | OALTestStreamFloat, false, "mono Float callback keeps float input format");
+		TestFloatCallbackPCM (renderer, OALTestStreamFloat, false, "stereo Float callback keeps float input format");
+		TestFloatCallbackPCM (renderer, OALTestStreamMono | OALTestStreamFloat, true, "mono Float callback converts to PCM16 fallback input format");
+		TestFloatCallbackPCM (renderer, OALTestStreamFloat, true, "stereo Float callback converts to PCM16 fallback input format");
+	}
+
+	void TestProducerPCMFormat (OpenALSoundRenderer &renderer, int flags, unsigned int inputBits, unsigned int outputBits, const char *name)
+	{
+		const unsigned int channels = (flags & OALTestStreamMono) ? 1 : 2;
+		const unsigned int frames = 4;
+		StreamFixture fixture (1);
+		OpenALSoundStream *stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (
+			reinterpret_cast<SoundStreamCallback> (StreamCallback), (int)(frames * channels * (inputBits / 8)), flags, 8000, &fixture));
+		Check (stream != NULL && stream->InputBits == inputBits && !stream->InputIsFloat && stream->OutputBits == outputBits, name);
+		if (stream != NULL)
+		{
+			Check (stream->Play (false, 1.f) && stream->BufferFrames[0] == frames, "PCM callback preserves producer frame count");
+			delete stream;
+		}
+	}
+
+	void TestProducerPCMFormats (OpenALSoundRenderer &renderer)
+	{
+		TestProducerPCMFormat (renderer, OALTestStreamMono | OALTestStreamBits8, 8, 8, "PCM8 callback keeps producer input format");
+		TestProducerPCMFormat (renderer, OALTestStreamMono, 16, 16, "PCM16 callback keeps producer input format");
+		TestProducerPCMFormat (renderer, OALTestStreamMono | OALTestStreamBits32, 32, 16, "PCM32 callback keeps producer input format");
 	}
 
 	void DrainStream (OpenALSoundRenderer &renderer, OpenALSoundStream *stream)
@@ -856,8 +971,26 @@ namespace
 		TestDumbVorbisSample (renderer);
 	}
 
+	void TestInitialStreamPosition (OpenALSoundRenderer &renderer)
+	{
+		StreamFixture fixture (1);
+		OpenALSoundStream *stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (
+			reinterpret_cast<SoundStreamCallback> (StreamCallback), 1600, 1, 8000, &fixture));
+		Check (stream != NULL && stream->GetMediaFrameForTest () == 0 && stream->GetPosition () == 0,
+			"new callback stream reports the deterministic initial media position");
+		renderer.SetInactive (INACTIVE_Complete);
+		Check (stream != NULL && stream->Play (false, 0.8f) && stream->GetStateForTest () == OALSTREAM_Paused &&
+			stream->GetMediaFrameForTest () == 0 && stream->GetPosition () == 0,
+			"first callback stream playback preserves the exact paused initial position");
+		renderer.SetInactive (INACTIVE_Active);
+		delete stream;
+	}
+
 	void TestStreams (OpenALSoundRenderer &renderer, SoundHandle sound)
 	{
+		TestFloatCallbackPCMFormats (renderer);
+		TestProducerPCMFormats (renderer);
+		TestInitialStreamPosition (renderer);
 		StreamFixture fixture (5);
 		OpenALSoundStream *stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (reinterpret_cast<SoundStreamCallback> (StreamCallback), 1600, 1, 8000, &fixture));
 		Check (stream != NULL && stream->Source != 0 && stream->Buffers[0] != 0 && stream->Buffers[1] != 0 &&

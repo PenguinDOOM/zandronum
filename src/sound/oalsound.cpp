@@ -106,6 +106,10 @@ enum
 	OALSTREAM_Float = 8
 };
 
+#ifdef OAL_LIFECYCLE_TEST
+bool OALTestForceFloatPCM16Fallback = false;
+#endif
+
 enum
 {
 	OALAL_SourceQuery = 1,
@@ -457,8 +461,9 @@ OpenALSoundStream::OpenALSoundStream (OpenALSoundRenderer *owner, SoundStreamCal
 
 OpenALSoundStream::OpenALSoundStream (OpenALSoundRenderer *owner, OpenALStreamProducer *producer, int bufferBytes, int flags, int sampleRate)
 	: Source (0), Owner (owner), Producer (producer), SampleRate ((unsigned int)sampleRate),
-	  StreamChannels ((flags & OALSTREAM_Mono) ? 1 : 2), InputBits (16), OutputBits (0), OutputFormat (0), MediaFrame (0), LoopStart (0), LoopEnd (0),
-	  Volume (1.f), EndOfInput (false), Looping (false), HasLoopRange (false), UserPaused (false), InactivePaused (false), InputIsFloat (false),
+	  StreamChannels ((flags & OALSTREAM_Mono) ? 1 : 2), InputBits ((flags & OALSTREAM_Float) ? 32 : (flags & OALSTREAM_Bits32) ? 32 : (flags & OALSTREAM_Bits8) ? 8 : 16),
+	  OutputBits (0), OutputFormat (0), MediaFrame (0), LoopStart (0), LoopEnd (0), Volume (1.f), EndOfInput (false), Looping (false), HasLoopRange (false),
+	  UserPaused (false), InactivePaused (false), InputIsFloat ((flags & OALSTREAM_Float) != 0),
 	  ResourcesReleased (false), State (OALSTREAM_Stopped)
 #ifdef OAL_LIFECYCLE_TEST
 	  , TestFailNextRewind (false), TestRewindTerminal (false), TestFailNextBufferUpload (false), TestFailNextALOperation (0)
@@ -476,7 +481,11 @@ void OpenALSoundStream::InitializeBuffers (int bufferBytes, int flags)
 	InputBuffer.resize ((size_t)bufferBytes);
 	if (flags & OALSTREAM_Float)
 	{
-		OutputBits = alIsExtensionPresent ("AL_EXT_FLOAT32") ? 32 : 16;
+		OutputBits =
+#ifdef OAL_LIFECYCLE_TEST
+			!OALTestForceFloatPCM16Fallback &&
+#endif
+			alIsExtensionPresent ("AL_EXT_FLOAT32") ? 32 : 16;
 	}
 	else
 	{
