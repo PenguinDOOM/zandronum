@@ -4,6 +4,14 @@
 
 namespace
 {
+	static_assert(MDEV_DEFAULT == -1, "MDEV_DEFAULT value changed");
+	static_assert(MDEV_MMAPI == 0, "MDEV_MMAPI value changed");
+	static_assert(MDEV_OPL == 1, "MDEV_OPL value changed");
+	static_assert(MDEV_FMOD == 2, "MDEV_FMOD value changed");
+	static_assert(MDEV_TIMIDITY == 3, "MDEV_TIMIDITY value changed");
+	static_assert(MDEV_FLUIDSYNTH == 4, "MDEV_FLUIDSYNTH value changed");
+	static_assert(MDEV_GUS == 5, "MDEV_GUS value changed");
+
 	int Failures = 0;
 
 	void Check(bool condition, const char *name)

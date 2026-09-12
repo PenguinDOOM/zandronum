@@ -318,6 +318,22 @@ namespace
 		TestProducerPCMFormat (renderer, OALTestStreamMono | OALTestStreamBits32, 32, 16, "PCM32 callback keeps producer input format");
 	}
 
+	void TestTypedPCM16ProducerStorage (OpenALSoundRenderer &renderer)
+	{
+		OpenALSoundStream *stream = renderer.CreatePatternStreamForTest (16, 0, 0, 8);
+		Check (stream != NULL && stream->PCM16Buffer.size () == 4,
+			"PCM16 producer receives setup-time typed sample storage");
+		if (stream != NULL)
+		{
+			short *storage = &stream->PCM16Buffer[0];
+			size_t capacity = stream->PCM16Buffer.capacity ();
+			Check (stream->Play (false, 1.f) && storage == &stream->PCM16Buffer[0] &&
+				capacity == stream->PCM16Buffer.capacity (),
+				"PCM16 producer reuses setup-time storage while queuing buffers");
+			delete stream;
+		}
+	}
+
 	void DrainStream (OpenALSoundRenderer &renderer, OpenALSoundStream *stream)
 	{
 		for (int attempt = 0; attempt < 150 && !stream->IsEnded (); ++attempt)
@@ -990,6 +1006,7 @@ namespace
 	{
 		TestFloatCallbackPCMFormats (renderer);
 		TestProducerPCMFormats (renderer);
+		TestTypedPCM16ProducerStorage (renderer);
 		TestInitialStreamPosition (renderer);
 		StreamFixture fixture (5);
 		OpenALSoundStream *stream = static_cast<OpenALSoundStream *> (renderer.CreateStream (reinterpret_cast<SoundStreamCallback> (StreamCallback), 1600, 1, 8000, &fixture));

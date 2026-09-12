@@ -132,6 +132,8 @@ public:
 private:
 	friend class OpenALSoundRenderer;
 	OpenALSoundStream (OpenALSoundRenderer *owner, OpenALStreamProducer *producer, int bufferBytes, int flags, int sampleRate);
+	OpenALSoundStream (const OpenALSoundStream &);
+	OpenALSoundStream &operator= (const OpenALSoundStream &);
 
 	bool QueueBuffer (unsigned int buffer);
 	bool FindBufferIndex (unsigned int buffer, unsigned int *bufferIndex) const;
@@ -160,6 +162,7 @@ private:
 	OpenALSoundRenderer *Owner;
 	OpenALStreamProducer *Producer;
 	std::vector<BYTE> InputBuffer;
+	std::vector<short> PCM16Buffer;
 	std::vector<BYTE> OutputBuffer;
 	unsigned int BufferFrames[4];
 	unsigned long long BufferMediaStart[4];

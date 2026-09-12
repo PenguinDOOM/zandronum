@@ -24,6 +24,7 @@
 #include "doomtype.h"
 #include "i_soundinternal.h"
 #include "dobject.h"
+#include "sound/music_mididevice.h"
 
 class AActor;
 class FScanner;
@@ -396,17 +397,6 @@ void S_SetEnvironment (const ReverbContainer *settings);
 ReverbContainer *S_FindEnvironment (const char *name);
 ReverbContainer *S_FindEnvironment (int id);
 void S_AddEnvironment (ReverbContainer *settings);
-
-enum EMidiDevice
-{
-	MDEV_DEFAULT = -1,
-	MDEV_MMAPI = 0,
-	MDEV_OPL = 1,
-	MDEV_FMOD = 2,
-	MDEV_TIMIDITY = 3,
-	MDEV_FLUIDSYNTH = 4,
-	MDEV_GUS = 5,
-};
 
 typedef TMap<FName, FName> MusicAliasMap;
 typedef TMap<FName, int> MidiDeviceMap;

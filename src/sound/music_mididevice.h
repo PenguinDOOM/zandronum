@@ -1,0 +1,15 @@
+#ifndef MUSIC_MIDIDEVICE_H
+#define MUSIC_MIDIDEVICE_H
+
+enum EMidiDevice
+{
+	MDEV_DEFAULT = -1,
+	MDEV_MMAPI = 0,
+	MDEV_OPL = 1,
+	MDEV_FMOD = 2,
+	MDEV_TIMIDITY = 3,
+	MDEV_FLUIDSYNTH = 4,
+	MDEV_GUS = 5,
+};
+
+#endif

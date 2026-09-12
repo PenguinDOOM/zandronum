@@ -1,7 +1,9 @@
 #ifndef MUSIC_MIDIDEVICE_POLICY_H
 #define MUSIC_MIDIDEVICE_POLICY_H
 
-#include "s_sound.h"
+#include <cstddef>
+
+#include "music_mididevice.h"
 
 namespace MusicMIDIDevicePolicy
 {

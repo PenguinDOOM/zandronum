@@ -13,6 +13,7 @@
 #include <new>
 #include <stdlib.h>
 #include <string.h>
+#include <type_traits>
 
 #ifdef OAL_LIFECYCLE_TEST
 #include "oalsound_test_support.h"
@@ -130,11 +131,17 @@ enum OpenALProducerReadStatus
 	OALPRODUCER_Error
 };
 
+static_assert(!std::is_copy_constructible<OpenALSoundStream>::value,
+	"OpenAL streams must not be copy constructible");
+static_assert(!std::is_copy_assignable<OpenALSoundStream>::value,
+	"OpenAL streams must not be copy assignable");
+
 class OpenALStreamProducer
 {
 public:
 	virtual ~OpenALStreamProducer () {}
-	virtual OpenALProducerReadStatus ReadFrames (OpenALSoundStream *stream, BYTE *data, unsigned int frameCount, unsigned int bytesPerFrame, unsigned int *framesRead) = 0;
+	virtual OpenALProducerReadStatus ReadFrames (OpenALSoundStream *stream, BYTE *data, short *pcm16Data, unsigned int frameCount, unsigned int bytesPerFrame, unsigned int *framesRead) = 0;
+	virtual bool UsesTypedPCM16Destination () const { return false; }
 	virtual bool GetTotalFrames (unsigned long long *frames) const = 0;
 	virtual unsigned long long TellFrame () const = 0;
 	virtual bool GetLoopRange (AudioFrameRange *range) const = 0;
@@ -155,7 +162,7 @@ public:
 	{
 	}
 
-	OpenALProducerReadStatus ReadFrames (OpenALSoundStream *stream, BYTE *data, unsigned int frameCount, unsigned int bytesPerFrame, unsigned int *framesRead)
+	OpenALProducerReadStatus ReadFrames (OpenALSoundStream *stream, BYTE *data, short *, unsigned int frameCount, unsigned int bytesPerFrame, unsigned int *framesRead)
 	{
 		bool hasData;
 		if (framesRead == NULL || Callback == NULL)
@@ -217,15 +224,15 @@ public:
 	explicit DecoderStreamProducer (AudioDecoder *decoder) : Decoder (decoder) {}
 	~DecoderStreamProducer () { delete Decoder; }
 
-	OpenALProducerReadStatus ReadFrames (OpenALSoundStream *, BYTE *data, unsigned int frameCount, unsigned int, unsigned int *framesRead)
+	OpenALProducerReadStatus ReadFrames (OpenALSoundStream *, BYTE *, short *pcm16Data, unsigned int frameCount, unsigned int, unsigned int *framesRead)
 	{
 		std::size_t read = 0;
 		AudioDecoderReadStatus status;
-		if (Decoder == NULL || framesRead == NULL)
+		if (Decoder == NULL || pcm16Data == NULL || framesRead == NULL)
 		{
 			return OALPRODUCER_Error;
 		}
-		status = Decoder->ReadFrames ((short *)data, frameCount, &read);
+		status = Decoder->ReadFrames (pcm16Data, frameCount, &read);
 		if (read > frameCount)
 		{
 			return OALPRODUCER_Error;
@@ -236,13 +243,21 @@ public:
 	}
 
 	bool GetTotalFrames (unsigned long long *frames) const { return Decoder != NULL && Decoder->GetTotalFrames (frames); }
+	bool UsesTypedPCM16Destination () const { return true; }
 	unsigned long long TellFrame () const { return Decoder == NULL ? 0 : Decoder->TellFrame (); }
 	bool GetLoopRange (AudioFrameRange *range) const { return Decoder != NULL && Decoder->GetLoopRange (range); }
 	AudioDecoderSeekStatus SeekFrame (unsigned long long frame) { return Decoder == NULL ? AUDIO_DECODER_SEEK_TERMINAL_ERROR : Decoder->SeekFrame (frame); }
 
 private:
+	DecoderStreamProducer (const DecoderStreamProducer &);
+	DecoderStreamProducer &operator= (const DecoderStreamProducer &);
 	AudioDecoder *Decoder;
 };
+
+static_assert(!std::is_copy_constructible<DecoderStreamProducer>::value,
+	"Decoder producers must not be copy constructible");
+static_assert(!std::is_copy_assignable<DecoderStreamProducer>::value,
+	"Decoder producers must not be copy assignable");
 
 #ifdef OAL_LIFECYCLE_TEST
 class PatternStreamProducer : public OpenALStreamProducer
@@ -253,12 +268,12 @@ public:
 	{
 	}
 
-	OpenALProducerReadStatus ReadFrames (OpenALSoundStream *, BYTE *data, unsigned int frameCount, unsigned int, unsigned int *framesRead)
+	OpenALProducerReadStatus ReadFrames (OpenALSoundStream *, BYTE *, short *pcm16Data, unsigned int frameCount, unsigned int, unsigned int *framesRead)
 	{
 		unsigned int available;
 		unsigned int count;
 		short *samples;
-		if (data == NULL || framesRead == NULL)
+		if (pcm16Data == NULL || framesRead == NULL)
 		{
 			return OALPRODUCER_Error;
 		}
@@ -269,7 +284,7 @@ public:
 		}
 		available = TotalFrames - Position;
 		count = frameCount < available ? frameCount : available;
-		samples = (short *)data;
+		samples = pcm16Data;
 		for (unsigned int index = 0; index < count; ++index)
 		{
 			samples[index] = (short)(Position + index);
@@ -288,6 +303,8 @@ public:
 		*frames = TotalFrames;
 		return true;
 	}
+
+	bool UsesTypedPCM16Destination () const { return true; }
 
 	unsigned long long TellFrame () const { return Position; }
 	bool GetLoopRange (AudioFrameRange *range) const
@@ -479,6 +496,10 @@ void OpenALSoundStream::InitializeBuffers (int bufferBytes, int flags)
 	memset (BufferFrames, 0, sizeof (BufferFrames));
 	memset (BufferMediaStart, 0, sizeof (BufferMediaStart));
 	InputBuffer.resize ((size_t)bufferBytes);
+	if (InputBits == 16)
+	{
+		PCM16Buffer.resize ((size_t)bufferBytes / sizeof (short));
+	}
 	if (flags & OALSTREAM_Float)
 	{
 		OutputBits =
@@ -522,7 +543,14 @@ bool OpenALSoundStream::ConvertBuffer (unsigned int frames)
 	size_t samples = (size_t)frames * StreamChannels;
 	if (InputBits == OutputBits && InputBits != 8)
 	{
-		memcpy (&OutputBuffer[0], &InputBuffer[0], samples * (InputBits / 8));
+		if (Producer != NULL && Producer->UsesTypedPCM16Destination ())
+		{
+			memcpy (&OutputBuffer[0], &PCM16Buffer[0], samples * sizeof (short));
+		}
+		else
+		{
+			memcpy (&OutputBuffer[0], &InputBuffer[0], samples * (InputBits / 8));
+		}
 		return true;
 	}
 	if (InputBits == 8)
@@ -611,7 +639,8 @@ bool OpenALSoundStream::ReadBufferFrames (unsigned int requestedFrames, unsigned
 	{
 		requestedFrames = (unsigned int)(LoopEnd - *mediaStart);
 	}
-	status = Producer->ReadFrames (this, &InputBuffer[0], requestedFrames, bytesPerFrame, framesRead);
+	short *pcm16Data = Producer->UsesTypedPCM16Destination () && !PCM16Buffer.empty () ? &PCM16Buffer[0] : NULL;
+	status = Producer->ReadFrames (this, &InputBuffer[0], pcm16Data, requestedFrames, bytesPerFrame, framesRead);
 	if (status == OALPRODUCER_EOF && Looping)
 	{
 		if (!RewindProducer (HasLoopRange ? LoopStart : 0))
@@ -619,7 +648,7 @@ bool OpenALSoundStream::ReadBufferFrames (unsigned int requestedFrames, unsigned
 			return false;
 		}
 		*mediaStart = Producer->TellFrame ();
-		status = Producer->ReadFrames (this, &InputBuffer[0], requestedFrames, bytesPerFrame, framesRead);
+		status = Producer->ReadFrames (this, &InputBuffer[0], pcm16Data, requestedFrames, bytesPerFrame, framesRead);
 	}
 	if (status == OALPRODUCER_EOF)
 	{
