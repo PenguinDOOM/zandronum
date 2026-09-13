@@ -1513,6 +1513,7 @@ namespace
 		}
 		Check (callbacks.Opened && totalPCMFrames == 529 && pcmHash == 0xae1a6ff7e4b9ff1bULL && nativePCM.Samples.size () > 264 && firstSample == nativePCM.Samples[0] && seekSample == nativePCM.Samples[264], "miniaudio Ogg-FLAC decodes valid packets, seeks, and reaches EOF through the low-level memory path");
 		Check (callbacks.MallocCount == 2 && callbacks.ReallocCount == 0 && callbacks.FreeCount == 2 && callbacks.AllocationPointers[0] != callbacks.AllocationPointers[1] && callbacks.AllocationPointers[0] == callbacks.FreePointers[0] && callbacks.AllocationPointers[1] == callbacks.FreePointers[1] && callbacks.CanaryIntact, "miniaudio Ogg-FLAC transfers temporary Ogg state into one parent allocation");
+		Check (AudioDecoderTestMiniaudioOggFlacDecode (&seektableFlac[0], seektableFlac.size (), 0, 0, &totalPCMFrames, &pcmHash, &firstSample, &seekSample, &callbacks) && !callbacks.Opened && callbacks.MallocCount == 1 && callbacks.FreeCount == 1 && callbacks.AllocationPointers[0] == callbacks.FreePointers[0] && callbacks.CanaryIntact, "miniaudio Ogg-FLAC hook closes native FLAC without reporting it as Ogg");
 	}
 
 	void TestMiniaudioOggFlacSeektableTemporaryOOM (const std::vector<unsigned char> &oggFlac)
@@ -1653,6 +1654,7 @@ namespace
 		std::vector<unsigned char> seektableFlac;
 		std::vector<unsigned char> emptySeektableFlac;
 		std::vector<unsigned char> shortSeektableFlac;
+		std::vector<unsigned char> applicationFlac;
 		unsigned long long firstPCMFrame = 0;
 		unsigned long long flacFrameOffset = 0;
 		unsigned int pcmFrameCount = 0;
@@ -1686,6 +1688,21 @@ namespace
 			TestMiniaudioFlacCallbackInitialSeekFailure (seektableFlac);
 			TestMiniaudioFlacCallbackReturnSeekFailure (seektableFlac);
 			TestMiniaudioFlacCallbackShortRead (seektableFlac);
+			applicationFlac.assign (flac.begin (), flac.begin () + 42);
+			applicationFlac[4] &= 0x7f;
+			for (unsigned int index = 0; index < 5; ++index)
+			{
+				applicationFlac.push_back (index == 4 ? 0x82 : 0x02);
+				applicationFlac.push_back (0);
+				applicationFlac.push_back (0);
+				applicationFlac.push_back (4);
+				applicationFlac.push_back (0);
+				applicationFlac.push_back (0);
+				applicationFlac.push_back (0);
+				applicationFlac.push_back ((unsigned char)index);
+			}
+			applicationFlac.insert (applicationFlac.end (), flac.begin () + 42, flac.end ());
+			Check (AudioDecoderTestMiniaudioFlacCallbackOpen (&applicationFlac[0], applicationFlac.size (), true, false, 0, (std::size_t)-1, 0, (std::size_t)-1, &callbacks) && !callbacks.Opened && callbacks.MallocCount == 5 && callbacks.FreeCount == 4 && callbacks.AllocationPointers[0] == callbacks.FreePointers[0] && callbacks.AllocationPointers[1] == callbacks.FreePointers[1] && callbacks.AllocationPointers[2] == callbacks.FreePointers[2] && callbacks.AllocationPointers[3] == callbacks.FreePointers[3] && callbacks.CanaryIntact, "miniaudio native FLAC metadata rejects an untrackable fifth APPLICATION allocation");
 			shortSeektableFlac = seektableFlac;
 			shortSeektableFlac.resize (42 + 4 + 17);
 			Check (!AudioDecoderTestMiniaudioFlacOpenSeektable (&shortSeektableFlac[0], shortSeektableFlac.size (), true, &pcmFrameCount, &firstPCMFrame, &flacFrameOffset, &nativePCMFrameCount, &metadataRawDataSize), "miniaudio native FLAC metadata seektable rejects short read");

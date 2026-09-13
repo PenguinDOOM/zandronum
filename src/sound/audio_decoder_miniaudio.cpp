@@ -392,6 +392,10 @@ namespace
 		{
 			return NULL;
 		}
+		if (allocationOrdinal > 4)
+		{
+			return NULL;
+		}
 		host = static_cast<unsigned char *> (malloc (size + 79));
 		if (host == NULL)
 		{
@@ -434,7 +438,7 @@ namespace
 		}
 		for (allocationIndex = 0; allocationIndex < 4; ++allocationIndex)
 		{
-			if (pointer == probe->RawPointers[allocationIndex])
+			if (pointer == probe->RawPointers[allocationIndex] && probe->HostPointers[allocationIndex] != NULL)
 			{
 				probe->CanaryIntact = probe->CanaryIntact && memcmp (static_cast<unsigned char *> (pointer) + probe->AllocationSizes[allocationIndex], "\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", 8) == 0;
 				free (probe->HostPointers[allocationIndex]);
@@ -443,6 +447,59 @@ namespace
 			}
 		}
 		probe->CanaryIntact = false;
+	}
+
+	bool FlacAllocationProbeHasLiveAllocations (const FlacAllocationProbe *probe)
+	{
+		for (std::size_t allocationIndex = 0; allocationIndex < 4; ++allocationIndex)
+		{
+			if (probe->HostPointers[allocationIndex] != NULL)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void FlacAllocationProbeReleaseLiveAllocations (FlacAllocationProbe *probe)
+	{
+		for (std::size_t allocationIndex = 0; allocationIndex < 4; ++allocationIndex)
+		{
+			if (probe->HostPointers[allocationIndex] != NULL)
+			{
+				free (probe->HostPointers[allocationIndex]);
+				probe->HostPointers[allocationIndex] = NULL;
+			}
+		}
+	}
+
+	bool FlacAllocationProbeVerifyStaleRawPointerReuse ()
+	{
+		FlacAllocationProbe probe = { 0, 0, 0, { NULL }, { NULL }, { 0 }, { NULL }, true, false, 0 };
+		unsigned char *host = static_cast<unsigned char *> (malloc (95));
+		uintptr_t address;
+		unsigned char *raw;
+		bool released;
+		if (host == NULL)
+		{
+			return false;
+		}
+		address = ((uintptr_t)host + 15) & ~(uintptr_t)15;
+		if (address % 64 == 0)
+		{
+			address += 16;
+		}
+		raw = reinterpret_cast<unsigned char *> (address);
+		memset (raw + 16, 0xa5, 8);
+		probe.RawPointers[0] = raw;
+		probe.AllocationSizes[0] = 16;
+		probe.HostPointers[1] = host;
+		probe.RawPointers[1] = raw;
+		probe.AllocationSizes[1] = 16;
+		FlacAllocationProbeFree (raw, &probe);
+		released = !FlacAllocationProbeHasLiveAllocations (&probe) && probe.CanaryIntact;
+		FlacAllocationProbeReleaseLiveAllocations (&probe);
+		return released;
 	}
 
 	void FlacAllocationProbeCorruptCanary (FlacAllocationProbe *probe)
@@ -601,7 +658,9 @@ bool AudioDecoderTestMiniaudioFlacCallbackOpen (const unsigned char *data, std::
 	memcpy (report->SeekPositions, probe.SeekPositions, sizeof (report->SeekPositions));
 	memcpy (report->AllocationPointers, probe.Allocation.RawPointers, sizeof (report->AllocationPointers));
 	memcpy (report->FreePointers, probe.Allocation.FreePointers, sizeof (report->FreePointers));
-	return true;
+	bool allocationsReleased = !FlacAllocationProbeHasLiveAllocations (&probe.Allocation);
+	FlacAllocationProbeReleaseLiveAllocations (&probe.Allocation);
+	return allocationsReleased && FlacAllocationProbeVerifyStaleRawPointerReuse ();
 }
 
 bool AudioDecoderTestMiniaudioOggFlacDecode (const unsigned char *data, std::size_t bytes, unsigned long long seekFrame, std::size_t failAllocationOrdinal, unsigned long long *totalPCMFrames, unsigned long long *pcmHash, short *firstSample, short *seekSample, AudioDecoderTestMiniaudioFlacCallbackReport *report)
@@ -624,26 +683,33 @@ bool AudioDecoderTestMiniaudioOggFlacDecode (const unsigned char *data, std::siz
 	flac = ma_dr_flac_open_memory (data, bytes, &callbacks);
 	memset (report, 0, sizeof (*report));
 	report->Opened = flac != NULL;
-	if (flac != NULL && flac->container == ma_dr_flac_container_ogg)
+	if (flac != NULL)
 	{
-		*totalPCMFrames = flac->totalPCMFrameCount;
-		while ((framesRead = ma_dr_flac_read_pcm_frames_s16 (flac, sizeof (samples) / sizeof (samples[0]), samples)) > 0)
+		if (flac->container == ma_dr_flac_container_ogg)
 		{
-			for (ma_uint64 index = 0; index < framesRead; ++index)
+			*totalPCMFrames = flac->totalPCMFrameCount;
+			while ((framesRead = ma_dr_flac_read_pcm_frames_s16 (flac, sizeof (samples) / sizeof (samples[0]), samples)) > 0)
 			{
-				unsigned short sample = (unsigned short)samples[index];
-				hash = (hash ^ (sample & 0xff)) * 1099511628211ULL;
-				hash = (hash ^ (sample >> 8)) * 1099511628211ULL;
-				if (totalRead == 0)
+				for (ma_uint64 index = 0; index < framesRead; ++index)
 				{
-					*firstSample = samples[index];
+					unsigned short sample = (unsigned short)samples[index];
+					hash = (hash ^ (sample & 0xff)) * 1099511628211ULL;
+					hash = (hash ^ (sample >> 8)) * 1099511628211ULL;
+					if (totalRead == 0)
+					{
+						*firstSample = samples[index];
+					}
+					totalRead++;
 				}
-				totalRead++;
 			}
-		}
-		if (totalRead == *totalPCMFrames && ma_dr_flac_read_pcm_frames_s16 (flac, 1, samples) == 0 && ma_dr_flac_seek_to_pcm_frame (flac, seekFrame) && ma_dr_flac_read_pcm_frames_s16 (flac, 1, seekSample) == 1 && ma_dr_flac_seek_to_pcm_frame (flac, *totalPCMFrames) && ma_dr_flac_read_pcm_frames_s16 (flac, 1, samples) == 0)
-		{
-			*pcmHash = hash;
+			if (totalRead == *totalPCMFrames && ma_dr_flac_read_pcm_frames_s16 (flac, 1, samples) == 0 && ma_dr_flac_seek_to_pcm_frame (flac, seekFrame) && ma_dr_flac_read_pcm_frames_s16 (flac, 1, seekSample) == 1 && ma_dr_flac_seek_to_pcm_frame (flac, *totalPCMFrames) && ma_dr_flac_read_pcm_frames_s16 (flac, 1, samples) == 0)
+			{
+				*pcmHash = hash;
+			}
+			else
+			{
+				report->Opened = false;
+			}
 		}
 		else
 		{
