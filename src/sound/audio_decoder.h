@@ -203,6 +203,52 @@ bool AudioDecoderTestVorbisIsLogicalEOF (unsigned int totalFrames, unsigned long
 bool AudioDecoderTestVorbisCanUseLoopEndpoint (unsigned int totalFrames, unsigned long long endpoint);
 bool AudioDecoderTestParseVorbisLoopComments (const char *const *comments, int commentCount, bool totalFramesKnown, unsigned long long totalFrames, unsigned int sampleRate, AudioFrameRange *range, int *diagnosticCode);
 const char *AudioDecoderTestVorbisLoopDiagnosticString ();
+void AudioDecoderTestMiniaudioPCMToS16 (short *output, const unsigned char *input, std::size_t sampleCount, unsigned int bytesPerSample);
+void AudioDecoderTestMiniaudioPCMToF32 (float *output, const unsigned char *input, std::size_t sampleCount, unsigned int bytesPerSample);
+void AudioDecoderTestMiniaudioPCMToS32 (int *output, const unsigned char *input, std::size_t sampleCount, unsigned int bytesPerSample);
+void AudioDecoderTestMiniaudioIEEEToS16 (short *output, const unsigned char *input, std::size_t sampleCount, unsigned int bytesPerSample);
+void AudioDecoderTestMiniaudioIEEEToF32 (float *output, const unsigned char *input, std::size_t sampleCount, unsigned int bytesPerSample);
+void AudioDecoderTestMiniaudioIEEEToS32 (int *output, const unsigned char *input, std::size_t sampleCount, unsigned int bytesPerSample);
+bool AudioDecoderTestMiniaudioAutoDetectMemory (const unsigned char *data, std::size_t bytes);
+bool AudioDecoderTestMiniaudioAutoDetectFile (const char *path);
+bool AudioDecoderTestMiniaudioAutoDetectWideFile (const wchar_t *path);
+std::size_t AudioDecoderTestMiniaudioReadWavS16 (const unsigned char *data, std::size_t bytes, short *output, std::size_t frames);
+bool AudioDecoderTestMiniaudioFlacAllocationLayout (unsigned int maxBlockSize, unsigned int channels, unsigned int seekpointCount, bool isOgg, std::size_t *allocationSize, std::size_t *decodedSamplesOffset, std::size_t *decodedSampleCount, std::size_t *seekpointsOffset);
+bool AudioDecoderTestMiniaudioFlacAllocationOwnership (const unsigned char *data, std::size_t bytes, std::size_t *allocationCount, std::size_t *freeCount);
+bool AudioDecoderTestMiniaudioFlacDecodeSeekpoint (const unsigned char *data, std::size_t bytes, unsigned long long *firstPCMFrame, unsigned long long *flacFrameOffset, unsigned int *pcmFrameCount);
+bool AudioDecoderTestMiniaudioFlacOpenSeektable (const unsigned char *data, std::size_t bytes, bool withMetadata, unsigned int *seekpointCount, unsigned long long *firstPCMFrame, unsigned long long *flacFrameOffset, unsigned int *pcmFrameCount, unsigned int *metadataRawDataSize);
+struct AudioDecoderTestMiniaudioFlacCallbackReport
+{
+	bool Opened;
+	bool CanaryIntact;
+	bool ReallocExistingPointer;
+	unsigned int SeekpointCount;
+	std::size_t MallocCount;
+	std::size_t ReallocCount;
+	std::size_t FreeCount;
+	std::size_t ReadCount;
+	std::size_t SeekCount;
+	std::size_t MetadataSeektableCount;
+	bool MetadataRawDataMatchesSeekpoints;
+	std::size_t MetadataRawDataSize;
+	unsigned int MetadataSeekpointCount;
+	unsigned long long MetadataFirstPCMFrame;
+	unsigned long long MetadataFlacFrameOffset;
+	unsigned int MetadataPCMFrameCount;
+	std::size_t ReadPositions[16];
+	std::size_t SeekPositions[16];
+	void *AllocationPointers[4];
+	void *FreePointers[4];
+};
+bool AudioDecoderTestMiniaudioFlacCallbackOpen (const unsigned char *data, std::size_t bytes, bool withMetadata, bool reallocOnly, std::size_t failAllocationOrdinal, std::size_t failReadPosition, std::size_t failSeekOrdinal, std::size_t failSeekPosition, AudioDecoderTestMiniaudioFlacCallbackReport *report, bool corruptCanaryBeforeClose = false);
+bool AudioDecoderTestMiniaudioOggFlacDecode (const unsigned char *data, std::size_t bytes, unsigned long long seekFrame, std::size_t failAllocationOrdinal, unsigned long long *totalPCMFrames, unsigned long long *pcmHash, short *firstSample, short *seekSample, AudioDecoderTestMiniaudioFlacCallbackReport *report);
+extern "C" int stb_vorbis_test_memory_seek_sequence (const unsigned char *data, int length, const unsigned int *locations, int locationCount, int *success, int *eof, unsigned int *offsets);
+extern "C" int stb_vorbis_test_temp_memory_required (int channels, int blocksize, int residueType, unsigned int begin, unsigned int end, unsigned int partSize, int classwords, unsigned int *required);
+extern "C" int stb_vorbis_test_open_memory_scratch (const unsigned char *data, int length, char *arena, int arenaLength, int failureMode, unsigned int *arenaRequired, int *error, int *scratchFreeCount, int *allocationsStable, int *arenaOffsetStable);
+extern "C" int stb_vorbis_test_residue_scratch_canary (int channels, int blocksize, int residueType, unsigned int begin, unsigned int end, unsigned int partSize, int classwords, char *arena, int arenaLength, unsigned int *required);
+extern "C" int stb_vorbis_test_decode_residue_layout (int residueType, int channels, int blocksize, int n, unsigned int end, char *arena, int arenaLength, int *logicalPartitions, int *rowCapacity, int *channel0Samples, int *channel1Samples, int *bitsConsumed);
+extern "C" int stb_vorbis_test_arena_deinit_offset (int tempOffset, int *offsetStable);
+extern "C" int stb_vorbis_test_outofmem_error ();
 #endif
 
 #endif

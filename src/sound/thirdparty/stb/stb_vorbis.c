@@ -822,6 +822,7 @@ struct stb_vorbis
    stb_vorbis_alloc alloc;
    int setup_offset;
    int temp_offset;
+   void *temp_memory;
 
   // run-time results
    int eof;
@@ -927,7 +928,7 @@ static int error(vorb *f, enum STBVorbisError e)
 
 #define array_size_required(count,size)  (count*(sizeof(void *)+(size)))
 
-#define temp_alloc(f,size)              (f->alloc.alloc_buffer ? setup_temp_malloc(f,size) : alloca(size))
+#define temp_alloc(f,size)              (f->alloc.alloc_buffer ? setup_temp_malloc(f,size) : (f)->temp_memory)
 #define temp_free(f,p)                  (void)0
 #define temp_alloc_save(f)              ((f)->temp_offset)
 #define temp_alloc_restore(f,p)         ((f)->temp_offset = (p))
@@ -946,6 +947,354 @@ static void *make_block_array(void *mem, int count, int size)
    }
    return p;
 }
+
+typedef struct
+{
+   int logical_part_read;
+   int row_capacity;
+} ResiduePartRead;
+
+static int get_residue_part_read(vorb *f, Residue *r, int residue_type, int n, ResiduePartRead *part_read)
+{
+   size_t actual_size;
+   size_t begin;
+   size_t end;
+   size_t part_count;
+
+   if (residue_type > 2 || r->part_size == 0 || n < 0)
+      return 0;
+   actual_size = (size_t) n;
+   if (residue_type == 2) {
+      if (actual_size > ((size_t) -1) / 2)
+         return 0;
+      actual_size *= 2;
+   }
+   begin = r->begin < actual_size ? r->begin : actual_size;
+   end = r->end < actual_size ? r->end : actual_size;
+   part_count = (end - begin) / r->part_size;
+
+   if (part_count > INT_MAX)
+      return 0;
+   part_read->logical_part_read = (int) part_count;
+
+   #ifdef STB_VORBIS_DIVIDES_IN_RESIDUE
+   {
+      int classwords = f->codebooks[r->classbook].dimensions;
+      if (classwords <= 0)
+         return 0;
+      if (part_count > ((size_t) -1) - ((size_t) classwords - 1))
+         return 0;
+      part_count = (part_count + classwords - 1) / classwords;
+      if (part_count > ((size_t) -1) / classwords)
+         return 0;
+      part_count *= classwords;
+   }
+   #endif
+
+   if (part_count > INT_MAX)
+      return 0;
+   part_read->row_capacity = (int) part_count;
+   return 1;
+}
+
+#ifdef STB_VORBIS_DIVIDES_IN_RESIDUE
+static void write_residue_classifications(int *classifications, int part_read, int classwords, int classification_count, int value)
+{
+   int i;
+   for (i = classwords-1; i >= 0; --i) {
+      classifications[i+part_read] = value % classification_count;
+      value /= classification_count;
+   }
+}
+#endif
+
+static int get_residue_temp_memory_required(vorb *f, Residue *r, int residue_type, size_t *required)
+{
+   ResiduePartRead part_read;
+   size_t row_size;
+
+   if (!get_residue_part_read(f, r, residue_type, f->blocksize_1 / 2, &part_read))
+      return 0;
+
+   #ifdef STB_VORBIS_DIVIDES_IN_RESIDUE
+   if ((size_t) part_read.row_capacity > (((size_t) -1) - sizeof(void *)) / sizeof(int))
+      return 0;
+   row_size = sizeof(void *) + (size_t) part_read.row_capacity * sizeof(int);
+   #else
+   if ((size_t) part_read.row_capacity > (((size_t) -1) - sizeof(void *)) / sizeof(uint8 *))
+      return 0;
+   row_size = sizeof(void *) + (size_t) part_read.row_capacity * sizeof(uint8 *);
+   #endif
+
+   if ((size_t) f->channels > ((size_t) -1) / row_size)
+      return 0;
+   *required = (size_t) f->channels * row_size;
+   return 1;
+}
+
+static int get_temp_memory_required(vorb *f, size_t *required)
+{
+   size_t imdct_memory;
+   size_t residue_memory = 0;
+   int i;
+
+   if (f->channels <= 0 || f->blocksize_1 <= 0)
+      return 0;
+   if ((size_t) (f->blocksize_1 / 2) > ((size_t) -1) / sizeof(float))
+      return 0;
+   imdct_memory = (size_t) (f->blocksize_1 / 2) * sizeof(float);
+
+   for (i = 0; i < f->residue_count; ++i) {
+      size_t size;
+      if (!get_residue_temp_memory_required(f, f->residue_config + i, f->residue_types[i], &size))
+         return 0;
+      if (size > residue_memory)
+         residue_memory = size;
+   }
+
+   if (residue_memory > (size_t) INT_MAX - 7 || imdct_memory > (size_t) INT_MAX - 7)
+      return 0;
+   *required = residue_memory > imdct_memory ? residue_memory : imdct_memory;
+   return 1;
+}
+
+static void *setup_temp_malloc(vorb *f, int sz);
+static void decode_residue(vorb *f, float *residue_buffers[], int ch, int n, int rn, uint8 *do_not_decode);
+static void compute_accelerated_huffman(Codebook *c);
+
+#ifdef AUDIO_DECODER_TESTING
+static int stb_vorbis_test_scratch_allocation_failure;
+static int stb_vorbis_test_handle_allocation_failure;
+static int stb_vorbis_test_scratch_free_count;
+static int stb_vorbis_test_temp_allocation_count;
+static int stb_vorbis_test_arena_offset_stable;
+
+int stb_vorbis_test_temp_memory_required(int channels, int blocksize, int residue_type, unsigned int begin, unsigned int end, unsigned int part_size, int classwords, unsigned int *required)
+{
+   vorb f;
+   Residue residue;
+   Codebook codebook;
+   size_t size;
+
+   if (required == NULL)
+      return 0;
+   memset(&f, 0, sizeof(f));
+   memset(&residue, 0, sizeof(residue));
+   memset(&codebook, 0, sizeof(codebook));
+   f.channels = channels;
+   f.blocksize_1 = blocksize;
+   f.residue_count = 1;
+   f.residue_config = &residue;
+   f.residue_types[0] = (uint16) residue_type;
+   f.codebooks = &codebook;
+   residue.begin = begin;
+   residue.end = end;
+   residue.part_size = part_size;
+   residue.classbook = 0;
+   codebook.dimensions = classwords;
+   if (!get_temp_memory_required(&f, &size) || size > UINT_MAX)
+      return 0;
+   *required = (unsigned int) size;
+   return 1;
+}
+
+int stb_vorbis_test_open_memory_scratch(const unsigned char *data, int length, char *arena, int arena_length, int failure_mode, unsigned int *arena_required, int *error, int *scratch_free_count, int *allocations_stable, int *arena_offset_stable)
+{
+   stb_vorbis_alloc alloc;
+   stb_vorbis *f;
+   int allocation_count;
+
+   if (data == NULL || length <= 0 || error == NULL || scratch_free_count == NULL || allocations_stable == NULL)
+      return 0;
+   memset(&alloc, 0, sizeof(alloc));
+   stb_vorbis_test_scratch_allocation_failure = failure_mode == 1;
+   stb_vorbis_test_handle_allocation_failure = failure_mode == 2;
+   stb_vorbis_test_scratch_free_count = 0;
+   stb_vorbis_test_temp_allocation_count = 0;
+   stb_vorbis_test_arena_offset_stable = 1;
+   if (arena) {
+      alloc.alloc_buffer = arena;
+      alloc.alloc_buffer_length_in_bytes = arena_length;
+      f = stb_vorbis_open_memory(data, length, error, &alloc);
+   } else {
+      f = stb_vorbis_open_memory(data, length, error, NULL);
+   }
+   if (f) {
+      stb_vorbis_info info = stb_vorbis_get_info(f);
+      if (arena_required)
+         *arena_required = info.setup_memory_required + info.temp_memory_required;
+      allocation_count = stb_vorbis_test_temp_allocation_count;
+      stb_vorbis_get_frame_float(f, NULL, NULL);
+      *allocations_stable = allocation_count == stb_vorbis_test_temp_allocation_count;
+      stb_vorbis_close(f);
+   } else {
+      *allocations_stable = 0;
+   }
+   *scratch_free_count = stb_vorbis_test_scratch_free_count;
+   if (arena_offset_stable)
+      *arena_offset_stable = stb_vorbis_test_arena_offset_stable;
+   stb_vorbis_test_scratch_allocation_failure = 0;
+   stb_vorbis_test_handle_allocation_failure = 0;
+   return f != NULL;
+}
+
+int stb_vorbis_test_residue_scratch_canary(int channels, int blocksize, int residue_type, unsigned int begin, unsigned int end, unsigned int part_size, int classwords, char *arena, int arena_length, unsigned int *required)
+{
+   vorb f;
+   Residue residue;
+   Codebook codebook;
+   size_t size;
+   ResiduePartRead part_read;
+
+   if (required == NULL || arena == NULL || arena_length <= 0)
+      return 0;
+   memset(&f, 0, sizeof(f));
+   memset(&residue, 0, sizeof(residue));
+   memset(&codebook, 0, sizeof(codebook));
+   f.channels = channels;
+   f.blocksize_1 = blocksize;
+   f.residue_count = 1;
+   f.residue_config = &residue;
+   f.residue_types[0] = (uint16) residue_type;
+   f.codebooks = &codebook;
+   f.alloc.alloc_buffer = arena;
+   f.alloc.alloc_buffer_length_in_bytes = arena_length;
+   f.temp_offset = arena_length;
+   residue.begin = begin;
+   residue.end = end;
+   residue.part_size = part_size;
+   codebook.dimensions = classwords;
+   if (!get_temp_memory_required(&f, &size) || size > UINT_MAX || !get_residue_part_read(&f, &residue, residue_type, blocksize / 2, &part_read))
+      return 0;
+   *required = (unsigned int) size;
+   #ifdef STB_VORBIS_DIVIDES_IN_RESIDUE
+   {
+      vorb *decoder = &f;
+      int **classifications = (int **) temp_block_array(decoder, channels, part_read.row_capacity * sizeof(**classifications));
+      int row;
+      if (classifications == NULL)
+         return 0;
+      for (row = 0; row < channels; ++row)
+         write_residue_classifications(classifications[row], part_read.row_capacity-classwords, classwords, 2, 15);
+      return 1;
+   }
+   #else
+   return 0;
+   #endif
+}
+
+static int stb_vorbis_test_valid_residue_layout_inputs(int residue_type, int channels, int n, char *arena, int arena_length, int *logical_partitions, int *row_capacity, int *channel0_samples, int *channel1_samples, int *bits_consumed)
+{
+   return residue_type >= 0 && residue_type <= 2 && channels > 0 && channels <= 2 && n > 0 && n <= 4096 && arena != NULL && arena_length > 0 && logical_partitions != NULL && row_capacity != NULL && channel0_samples != NULL && channel1_samples != NULL && bits_consumed != NULL;
+}
+
+static void stb_vorbis_test_prepare_residue_layout(vorb *f, Residue *residue, Codebook *codebooks, uint8 *packet, uint8 **classdata, int16 (*residue_books)[8], uint8 *codeword_lengths, uint32 *codewords, codetype *multiplicands, int residue_type, int channels, int blocksize, unsigned int end, char *arena, int arena_length)
+{
+   memset(f, 0, sizeof(*f));
+   memset(residue, 0, sizeof(*residue));
+   memset(codebooks, 0, sizeof(Codebook) * 2);
+   memset(residue_books, 0xff, sizeof(int16) * 8);
+   memset(packet, 0, 641);
+   packet[640] = 0xa5;
+   f->channels = channels;
+   f->blocksize_1 = blocksize;
+   f->codebook_count = 2;
+   f->residue_count = 1;
+   f->residue_config = residue;
+   f->residue_types[0] = (uint16) residue_type;
+   f->codebooks = codebooks;
+   f->alloc.alloc_buffer = arena;
+   f->alloc.alloc_buffer_length_in_bytes = arena_length;
+   f->temp_offset = arena_length;
+   f->stream = packet;
+   f->stream_start = packet;
+   f->stream_end = packet + 641;
+   f->stream_len = 641;
+   f->segment_count = 3;
+   f->segments[0] = 255;
+   f->segments[1] = 255;
+   f->segments[2] = 131;
+   f->next_seg = 0;
+   residue->end = end;
+   residue->part_size = 1;
+   residue->classifications = 1;
+   residue->classbook = 0;
+   residue->classdata = classdata;
+   residue->residue_books = residue_books;
+   codebooks[0].dimensions = 4;
+   codebooks[0].entries = 1;
+   codebooks[0].codeword_lengths = codeword_lengths;
+   codebooks[0].codewords = codewords;
+   codebooks[1].dimensions = 1;
+   codebooks[1].entries = 1;
+   codebooks[1].codeword_lengths = codeword_lengths;
+   codebooks[1].codewords = codewords;
+   codebooks[1].lookup_type = 1;
+   codebooks[1].lookup_values = 1;
+   codebooks[1].multiplicands = multiplicands;
+   compute_accelerated_huffman(&codebooks[0]);
+   compute_accelerated_huffman(&codebooks[1]);
+   residue_books[0][0] = 1;
+}
+
+int stb_vorbis_test_decode_residue_layout(int residue_type, int channels, int blocksize, int n, unsigned int end, char *arena, int arena_length, int *logical_partitions, int *row_capacity, int *channel0_samples, int *channel1_samples, int *bits_consumed)
+{
+   enum { packet_payload_bytes = 640, packet_size = packet_payload_bytes + 1, sample_capacity = 4096 };
+   vorb f;
+   Residue residue;
+   Codebook codebooks[2];
+   uint8 codeword_lengths[1] = { 1 };
+   uint32 codewords[1] = { 0 };
+   uint8 classdata_row[4] = { 0, 0, 0, 0 };
+   uint8 *classdata[1] = { classdata_row };
+   codetype multiplicands[1] = { 1.0f };
+   int16 residue_books[1][8];
+   uint8 packet[packet_size];
+   float samples[2][sample_capacity];
+   float *residue_buffers[2];
+   uint8 do_not_decode[2] = { 0, 0 };
+   ResiduePartRead layout;
+   const float canary = -1234.0f;
+   int temp_offset;
+   int channel;
+   int sample;
+   int decoded[2] = { 0, 0 };
+
+   if (!stb_vorbis_test_valid_residue_layout_inputs(residue_type, channels, n, arena, arena_length, logical_partitions, row_capacity, channel0_samples, channel1_samples, bits_consumed))
+      return 0;
+   stb_vorbis_test_prepare_residue_layout(&f, &residue, codebooks, packet, classdata, residue_books, codeword_lengths, codewords, multiplicands, residue_type, channels, blocksize, end, arena, arena_length);
+   for (channel = 0; channel < 2; ++channel)
+      for (sample = 0; sample < sample_capacity; ++sample)
+         samples[channel][sample] = canary;
+   for (channel = 0; channel < channels; ++channel)
+      residue_buffers[channel] = samples[channel];
+   if (!get_residue_part_read(&f, &residue, residue_type, n, &layout))
+      return 0;
+   temp_offset = f.temp_offset;
+   decode_residue(&f, residue_buffers, channels, n, 0, do_not_decode);
+   if (f.error != VORBIS__no_error || f.temp_offset != temp_offset || packet[packet_payload_bytes] != 0xa5)
+      return 0;
+   for (channel = 0; channel < channels; ++channel) {
+      for (sample = 0; sample < n; ++sample)
+         if (samples[channel][sample] == 1.0f)
+            ++decoded[channel];
+      for (sample = n; sample < sample_capacity; ++sample)
+         if (samples[channel][sample] != canary)
+            return 0;
+   }
+   *logical_partitions = layout.logical_part_read;
+   *row_capacity = layout.row_capacity;
+   *channel0_samples = decoded[0];
+   *channel1_samples = decoded[1];
+   *bits_consumed = 8 * f.packet_bytes - f.valid_bits;
+   return 1;
+}
+
+int stb_vorbis_test_outofmem_error(void)
+{
+   return VORBIS_outofmem;
+}
+#endif
 
 static void *setup_malloc(vorb *f, int sz)
 {
@@ -974,6 +1323,9 @@ static void *setup_temp_malloc(vorb *f, int sz)
       f->temp_offset -= sz;
       return (char *) f->alloc.alloc_buffer + f->temp_offset;
    }
+   #ifdef AUDIO_DECODER_TESTING
+   ++stb_vorbis_test_temp_allocation_count;
+   #endif
    return malloc(sz);
 }
 
@@ -1401,7 +1753,7 @@ static int set_file_offset(stb_vorbis *f, unsigned int loc)
    #endif
    f->eof = 0;
    if (USE_MEMORY(f)) {
-      if (f->stream_start + loc >= f->stream_end || f->stream_start + loc < f->stream_start) {
+      if (loc >= f->stream_len) {
          f->stream = f->stream_end;
          f->eof = 1;
          return 0;
@@ -1424,6 +1776,31 @@ static int set_file_offset(stb_vorbis *f, unsigned int loc)
    return 0;
    #endif
 }
+
+#ifdef AUDIO_DECODER_TESTING
+int stb_vorbis_test_memory_seek_sequence(const unsigned char *data, int length, const unsigned int *locations, int location_count, int *success, int *eof, unsigned int *offsets)
+{
+   stb_vorbis f;
+   int index;
+
+   if (data == NULL || length <= 0 || locations == NULL || location_count <= 0 || success == NULL || eof == NULL || offsets == NULL)
+      return 0;
+
+   memset(&f, 0, sizeof(f));
+   f.stream = (uint8 *) data;
+   f.stream_start = (uint8 *) data;
+   f.stream_end = (uint8 *) data + length;
+   f.stream_len = (uint32) length;
+
+   for (index = 0; index < location_count; ++index) {
+      success[index] = set_file_offset(&f, locations[index]);
+      eof[index] = f.eof;
+      offsets[index] = (unsigned int) (f.stream - f.stream_start);
+   }
+
+   return 1;
+}
+#endif
 
 
 static uint8 ogg_page_header[4] = { 0x4f, 0x67, 0x67, 0x53 };
@@ -2111,13 +2488,14 @@ static void decode_residue(vorb *f, float *residue_buffers[], int ch, int n, int
    unsigned int actual_size = rtype == 2 ? n*2 : n;
    unsigned int limit_r_begin = (r->begin < actual_size ? r->begin : actual_size);
    unsigned int limit_r_end   = (r->end   < actual_size ? r->end   : actual_size);
-   int n_read = limit_r_end - limit_r_begin;
-   int part_read = n_read / r->part_size;
+   ResiduePartRead part_read;
    int temp_alloc_point = temp_alloc_save(f);
+   if (!get_residue_part_read(f, r, rtype, n, &part_read))
+      return;
    #ifndef STB_VORBIS_DIVIDES_IN_RESIDUE
-   uint8 ***part_classdata = (uint8 ***) temp_block_array(f,f->channels, part_read * sizeof(**part_classdata));
+   uint8 ***part_classdata = (uint8 ***) temp_block_array(f,f->channels, part_read.row_capacity * sizeof(**part_classdata));
    #else
-   int **classifications = (int **) temp_block_array(f,f->channels, part_read * sizeof(**classifications));
+   int **classifications = (int **) temp_block_array(f,f->channels, part_read.row_capacity * sizeof(**classifications));
    #endif
 
    CHECK(f);
@@ -2136,7 +2514,7 @@ static void decode_residue(vorb *f, float *residue_buffers[], int ch, int n, int
       for (pass=0; pass < 8; ++pass) {
          int pcount = 0, class_set = 0;
          if (ch == 2) {
-            while (pcount < part_read) {
+            while (pcount < part_read.logical_part_read) {
                int z = r->begin + pcount*r->part_size;
                int c_inter = (z & 1), p_inter = z>>1;
                if (pass == 0) {
@@ -2147,13 +2525,10 @@ static void decode_residue(vorb *f, float *residue_buffers[], int ch, int n, int
                   #ifndef STB_VORBIS_DIVIDES_IN_RESIDUE
                   part_classdata[0][class_set] = r->classdata[q];
                   #else
-                  for (i=classwords-1; i >= 0; --i) {
-                     classifications[0][i+pcount] = q % r->classifications;
-                     q /= r->classifications;
-                  }
+                  write_residue_classifications(classifications[0], pcount, classwords, r->classifications, q);
                   #endif
                }
-               for (i=0; i < classwords && pcount < part_read; ++i, ++pcount) {
+               for (i=0; i < classwords && pcount < part_read.logical_part_read; ++i, ++pcount) {
                   int z = r->begin + pcount*r->part_size;
                   #ifndef STB_VORBIS_DIVIDES_IN_RESIDUE
                   int c = part_classdata[0][class_set][i];
@@ -2182,7 +2557,7 @@ static void decode_residue(vorb *f, float *residue_buffers[], int ch, int n, int
                #endif
             }
          } else if (ch > 2) {
-            while (pcount < part_read) {
+            while (pcount < part_read.logical_part_read) {
                int z = r->begin + pcount*r->part_size;
                int c_inter = z % ch, p_inter = z/ch;
                if (pass == 0) {
@@ -2193,13 +2568,10 @@ static void decode_residue(vorb *f, float *residue_buffers[], int ch, int n, int
                   #ifndef STB_VORBIS_DIVIDES_IN_RESIDUE
                   part_classdata[0][class_set] = r->classdata[q];
                   #else
-                  for (i=classwords-1; i >= 0; --i) {
-                     classifications[0][i+pcount] = q % r->classifications;
-                     q /= r->classifications;
-                  }
+                  write_residue_classifications(classifications[0], pcount, classwords, r->classifications, q);
                   #endif
                }
-               for (i=0; i < classwords && pcount < part_read; ++i, ++pcount) {
+               for (i=0; i < classwords && pcount < part_read.logical_part_read; ++i, ++pcount) {
                   int z = r->begin + pcount*r->part_size;
                   #ifndef STB_VORBIS_DIVIDES_IN_RESIDUE
                   int c = part_classdata[0][class_set][i];
@@ -2229,7 +2601,7 @@ static void decode_residue(vorb *f, float *residue_buffers[], int ch, int n, int
 
    for (pass=0; pass < 8; ++pass) {
       int pcount = 0, class_set=0;
-      while (pcount < part_read) {
+      while (pcount < part_read.logical_part_read) {
          if (pass == 0) {
             for (j=0; j < ch; ++j) {
                if (!do_not_decode[j]) {
@@ -2240,15 +2612,12 @@ static void decode_residue(vorb *f, float *residue_buffers[], int ch, int n, int
                   #ifndef STB_VORBIS_DIVIDES_IN_RESIDUE
                   part_classdata[j][class_set] = r->classdata[temp];
                   #else
-                  for (i=classwords-1; i >= 0; --i) {
-                     classifications[j][i+pcount] = temp % r->classifications;
-                     temp /= r->classifications;
-                  }
+                  write_residue_classifications(classifications[j], pcount, classwords, r->classifications, temp);
                   #endif
                }
             }
          }
-         for (i=0; i < classwords && pcount < part_read; ++i, ++pcount) {
+         for (i=0; i < classwords && pcount < part_read.logical_part_read; ++i, ++pcount) {
             for (j=0; j < ch; ++j) {
                if (!do_not_decode[j]) {
                   #ifndef STB_VORBIS_DIVIDES_IN_RESIDUE
@@ -4152,41 +4521,28 @@ static int start_decoder(vorb *f)
             integer_divide_table[i][j] = i / j;
 #endif
 
-   // compute how much temporary memory is needed
-
-   // 1.
    {
-      uint32 imdct_mem = (f->blocksize_1 * sizeof(float) >> 1);
-      uint32 classify_mem;
-      int i,max_part_read=0;
-      for (i=0; i < f->residue_count; ++i) {
-         Residue *r = f->residue_config + i;
-         unsigned int actual_size = f->blocksize_1 / 2;
-         unsigned int limit_r_begin = r->begin < actual_size ? r->begin : actual_size;
-         unsigned int limit_r_end   = r->end   < actual_size ? r->end   : actual_size;
-         int n_read = limit_r_end - limit_r_begin;
-         int part_read = n_read / r->part_size;
-         if (part_read > max_part_read)
-            max_part_read = part_read;
-      }
-      #ifndef STB_VORBIS_DIVIDES_IN_RESIDUE
-      classify_mem = f->channels * (sizeof(void*) + max_part_read * sizeof(uint8 *));
-      #else
-      classify_mem = f->channels * (sizeof(void*) + max_part_read * sizeof(int *));
-      #endif
-
-      // maximum reasonable partition size is f->blocksize_1
-
-      f->temp_memory_required = classify_mem;
-      if (imdct_mem > f->temp_memory_required)
-         f->temp_memory_required = imdct_mem;
+      size_t temp_memory_required;
+      if (!get_temp_memory_required(f, &temp_memory_required))
+         return error(f, VORBIS_invalid_setup);
+      f->temp_memory_required = (unsigned int) temp_memory_required;
    }
 
 
    if (f->alloc.alloc_buffer) {
       assert(f->temp_offset == f->alloc.alloc_buffer_length_in_bytes);
       // check if there's enough temp memory so we don't error later
-      if (f->setup_offset + sizeof(*f) + f->temp_memory_required > (unsigned) f->temp_offset)
+      if (f->setup_offset > f->temp_offset ||
+          f->temp_memory_required > (size_t) -1 - sizeof(*f) ||
+          (size_t) (f->temp_offset - f->setup_offset) < sizeof(*f) + f->temp_memory_required)
+         return error(f, VORBIS_outofmem);
+   } else {
+      #ifdef AUDIO_DECODER_TESTING
+      if (stb_vorbis_test_scratch_allocation_failure)
+         return error(f, VORBIS_outofmem);
+      #endif
+      f->temp_memory = setup_temp_malloc(f, (int) f->temp_memory_required);
+      if (f->temp_memory == NULL)
          return error(f, VORBIS_outofmem);
    }
 
@@ -4208,7 +4564,18 @@ static int start_decoder(vorb *f)
 static void vorbis_deinit(stb_vorbis *p)
 {
    int i,j;
+   int temp_offset = p->temp_offset;
 
+   if (!p->alloc.alloc_buffer && p->temp_memory) {
+      #ifdef AUDIO_DECODER_TESTING
+      ++stb_vorbis_test_scratch_free_count;
+      #endif
+      setup_temp_free(p, p->temp_memory, p->temp_memory_required);
+   }
+   #ifdef AUDIO_DECODER_TESTING
+   if (p->alloc.alloc_buffer && p->temp_offset != temp_offset)
+      stb_vorbis_test_arena_offset_stable = 0;
+   #endif
    setup_free(p, p->vendor);
    for (i=0; i < p->comment_list_length; ++i) {
       setup_free(p, p->comment_list[i]);
@@ -4267,6 +4634,24 @@ static void vorbis_deinit(stb_vorbis *p)
    if (p->close_on_free) fclose(p->f);
    #endif
 }
+
+#ifdef AUDIO_DECODER_TESTING
+int stb_vorbis_test_arena_deinit_offset(int temp_offset, int *offset_stable)
+{
+   stb_vorbis p;
+   char arena;
+
+   if (offset_stable == NULL)
+      return 0;
+   memset(&p, 0, sizeof(p));
+   p.alloc.alloc_buffer = &arena;
+   p.temp_offset = temp_offset;
+   stb_vorbis_test_arena_offset_stable = 1;
+   vorbis_deinit(&p);
+   *offset_stable = stb_vorbis_test_arena_offset_stable && p.temp_offset == temp_offset;
+   return 1;
+}
+#endif
 
 void stb_vorbis_close(stb_vorbis *p)
 {
@@ -4332,6 +4717,10 @@ int stb_vorbis_get_error(stb_vorbis *f)
 
 static stb_vorbis * vorbis_alloc(stb_vorbis *f)
 {
+   #ifdef AUDIO_DECODER_TESTING
+   if (stb_vorbis_test_handle_allocation_failure)
+      return NULL;
+   #endif
    stb_vorbis *p = (stb_vorbis *) setup_malloc(f, sizeof(*p));
    return p;
 }
@@ -4536,6 +4925,8 @@ stb_vorbis *stb_vorbis_open_pushdata(
       *error = 0;
       return f;
    } else {
+      p.error = VORBIS_outofmem;
+      *error = p.error;
       vorbis_deinit(&p);
       return NULL;
    }
@@ -5064,6 +5455,7 @@ stb_vorbis * stb_vorbis_open_file_section(FILE *file, int close_on_free, int *er
          vorbis_pump_first_frame(f);
          return f;
       }
+      p.error = VORBIS_outofmem;
    }
    if (error) *error = p.error;
    vorbis_deinit(&p);
@@ -5117,6 +5509,7 @@ stb_vorbis * stb_vorbis_open_memory(const unsigned char *data, int len, int *err
          if (error) *error = VORBIS__no_error;
          return f;
       }
+      p.error = VORBIS_outofmem;
    }
    if (error) *error = p.error;
    vorbis_deinit(&p);

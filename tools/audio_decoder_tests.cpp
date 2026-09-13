@@ -2,6 +2,14 @@
 #include "audio_timetag.h"
 
 #include <climits>
+#include <fcntl.h>
+#ifdef _WIN32
+#include <io.h>
+#include <process.h>
+#else
+#include <errno.h>
+#include <unistd.h>
+#endif
 #include <stdint.h>
 #include <limits>
 #include <stdio.h>
@@ -32,6 +40,362 @@ namespace
 	{
 		AppendLE16 (bytes, value & 0xffff);
 		AppendLE16 (bytes, value >> 16);
+	}
+
+	void AppendLE64 (std::vector<unsigned char> &bytes, unsigned long long value)
+	{
+		AppendLE32 (bytes, (unsigned int)value);
+		AppendLE32 (bytes, (unsigned int)(value >> 32));
+	}
+
+	unsigned int OggCRC (const unsigned char *data, std::size_t bytes)
+	{
+		unsigned int crc = 0;
+		for (std::size_t index = 0; index < bytes; ++index)
+		{
+			crc ^= (unsigned int)data[index] << 24;
+			for (unsigned int bit = 0; bit < 8; ++bit)
+			{
+				crc = (crc << 1) ^ ((crc & 0x80000000U) != 0 ? 0x04c11db7U : 0);
+			}
+		}
+		return crc;
+	}
+
+	bool AppendOggPacketPage (std::vector<unsigned char> *output, const std::vector<unsigned char> &packet, unsigned int headerType, unsigned long long granulePosition, unsigned int serialNumber, unsigned int sequenceNumber)
+	{
+		std::vector<unsigned char> lacing;
+		std::size_t remaining = packet.size ();
+		std::size_t pageStart;
+		unsigned int crc;
+		while (remaining >= 255)
+		{
+			lacing.push_back (255);
+			remaining -= 255;
+		}
+		lacing.push_back ((unsigned char)remaining);
+		if (lacing.size () > 255)
+		{
+			return false;
+		}
+		pageStart = output->size ();
+		output->insert (output->end (), "OggS", "OggS" + 4);
+		output->push_back (0);
+		output->push_back ((unsigned char)headerType);
+		AppendLE64 (*output, granulePosition);
+		AppendLE32 (*output, serialNumber);
+		AppendLE32 (*output, sequenceNumber);
+		AppendLE32 (*output, 0);
+		output->push_back ((unsigned char)lacing.size ());
+		output->insert (output->end (), lacing.begin (), lacing.end ());
+		output->insert (output->end (), packet.begin (), packet.end ());
+		crc = OggCRC (&(*output)[pageStart], output->size () - pageStart);
+		(*output)[pageStart + 22] = (unsigned char)crc;
+		(*output)[pageStart + 23] = (unsigned char)(crc >> 8);
+		(*output)[pageStart + 24] = (unsigned char)(crc >> 16);
+		(*output)[pageStart + 25] = (unsigned char)(crc >> 24);
+		return true;
+	}
+
+	void AppendBE16 (std::vector<unsigned char> &bytes, unsigned int value)
+	{
+		bytes.push_back ((unsigned char)(value >> 8));
+		bytes.push_back ((unsigned char)value);
+	}
+
+	void AppendBE24 (std::vector<unsigned char> &bytes, unsigned int value)
+	{
+		bytes.push_back ((unsigned char)(value >> 16));
+		bytes.push_back ((unsigned char)(value >> 8));
+		bytes.push_back ((unsigned char)value);
+	}
+
+	void AppendBE64 (std::vector<unsigned char> &bytes, unsigned long long value)
+	{
+		AppendBE16 (bytes, (unsigned int)(value >> 48));
+		AppendBE16 (bytes, (unsigned int)(value >> 32));
+		AppendBE16 (bytes, (unsigned int)(value >> 16));
+		AppendBE16 (bytes, (unsigned int)value);
+	}
+
+	struct FlacMetadataBlock
+	{
+		std::size_t Offset;
+		std::size_t Bytes;
+		unsigned char Type;
+		bool IsLast;
+	};
+
+	struct FixtureFlacFrame
+	{
+		std::size_t Offset;
+		std::size_t Bytes;
+		unsigned int PCMFrames;
+		const unsigned char *Header;
+		std::size_t HeaderBytes;
+	};
+
+	bool ParseNativeFlacMetadata (const std::vector<unsigned char> &nativeFlac, std::vector<FlacMetadataBlock> *blocks, std::size_t *audioOffset)
+	{
+		std::size_t offset = 4;
+		if (blocks == NULL || audioOffset == NULL || nativeFlac.size () < 8 || memcmp (&nativeFlac[0], "fLaC", 4) != 0)
+		{
+			return false;
+		}
+		blocks->clear ();
+		while (offset <= nativeFlac.size () - 4)
+		{
+			FlacMetadataBlock block;
+			unsigned int length = ((unsigned int)nativeFlac[offset + 1] << 16) | ((unsigned int)nativeFlac[offset + 2] << 8) | nativeFlac[offset + 3];
+			if (length > nativeFlac.size () - offset - 4)
+			{
+				return false;
+			}
+			block.Offset = offset;
+			block.Bytes = 4 + length;
+			block.Type = nativeFlac[offset] & 0x7f;
+			block.IsLast = (nativeFlac[offset] & 0x80) != 0;
+			blocks->push_back (block);
+			offset += block.Bytes;
+			if (block.IsLast)
+			{
+				*audioOffset = offset;
+				return offset < nativeFlac.size ();
+			}
+		}
+		return false;
+	}
+
+	bool GetFixtureFlacFrames (const std::vector<unsigned char> &nativeFlac, std::size_t audioOffset, std::vector<FixtureFlacFrame> *frames)
+	{
+		static const unsigned char firstFrameHeader[] = { 0xff, 0xf8, 0x94, 0x08, 0x00, 0x20 };
+		static const unsigned char secondFrameHeader[] = { 0xff, 0xf8, 0x64, 0x08, 0x01, 0x10, 0x86 };
+		static const FixtureFlacFrame fixtureFrames[] =
+		{
+			{ 0, 546, 512, firstFrameHeader, sizeof (firstFrameHeader) },
+			{ 546, 52, 17, secondFrameHeader, sizeof (secondFrameHeader) }
+		};
+		if (frames == NULL || audioOffset > nativeFlac.size () || nativeFlac.size () - audioOffset != 598)
+		{
+			return false;
+		}
+		frames->clear ();
+		for (std::size_t index = 0; index < sizeof (fixtureFrames) / sizeof (fixtureFrames[0]); ++index)
+		{
+			const FixtureFlacFrame &frame = fixtureFrames[index];
+			if (frame.Offset > nativeFlac.size () - audioOffset || frame.Bytes > nativeFlac.size () - audioOffset - frame.Offset || frame.HeaderBytes > frame.Bytes || memcmp (&nativeFlac[audioOffset + frame.Offset], frame.Header, frame.HeaderBytes) != 0)
+			{
+				return false;
+			}
+			frames->push_back (frame);
+		}
+		return true;
+	}
+
+	bool MakeFlacWithSeektable (const std::vector<unsigned char> &nativeFlac, std::vector<unsigned char> *seektableFlac)
+	{
+		std::vector<FlacMetadataBlock> blocks;
+		std::size_t audioOffset;
+		std::size_t commentIndex = (std::size_t)-1;
+		if (seektableFlac == NULL || !ParseNativeFlacMetadata (nativeFlac, &blocks, &audioOffset) || blocks.empty () || blocks[0].Type != 0 || blocks[0].Bytes != 38)
+		{
+			return false;
+		}
+		for (std::size_t index = 1; index < blocks.size (); ++index)
+		{
+			if (blocks[index].Type == 4)
+			{
+				commentIndex = index;
+				break;
+			}
+		}
+		if (commentIndex == (std::size_t)-1)
+		{
+			return false;
+		}
+		seektableFlac->clear ();
+		seektableFlac->insert (seektableFlac->end (), "fLaC", "fLaC" + 4);
+		seektableFlac->insert (seektableFlac->end (), nativeFlac.begin () + blocks[0].Offset, nativeFlac.begin () + blocks[0].Offset + blocks[0].Bytes);
+		(*seektableFlac)[4] &= 0x7f;
+		seektableFlac->insert (seektableFlac->end (), nativeFlac.begin () + blocks[commentIndex].Offset, nativeFlac.begin () + blocks[commentIndex].Offset + blocks[commentIndex].Bytes);
+		(*seektableFlac)[4 + blocks[0].Bytes] &= 0x7f;
+		seektableFlac->push_back (0x83);
+		AppendBE24 (*seektableFlac, 18);
+		AppendBE64 (*seektableFlac, 0);
+		AppendBE64 (*seektableFlac, 0);
+		AppendBE16 (*seektableFlac, 512);
+		seektableFlac->insert (seektableFlac->end (), nativeFlac.begin () + audioOffset, nativeFlac.end ());
+		return true;
+	}
+
+	bool MakeOggFlac (const std::vector<unsigned char> &nativeFlac, unsigned long long totalPCMFrames, std::vector<unsigned char> *oggFlac)
+	{
+		std::vector<unsigned char> mapping;
+		std::vector<FlacMetadataBlock> blocks;
+		std::vector<FixtureFlacFrame> frames;
+		std::size_t audioOffset;
+		unsigned int sequenceNumber = 0;
+		unsigned long long granulePosition = 0;
+		if (oggFlac == NULL || !ParseNativeFlacMetadata (nativeFlac, &blocks, &audioOffset) || !GetFixtureFlacFrames (nativeFlac, audioOffset, &frames) || blocks.empty () || blocks[0].Type != 0 || blocks[0].Bytes != 38 || blocks.size () - 1 > 0xffff)
+		{
+			return false;
+		}
+		mapping.push_back (0x7f);
+		mapping.insert (mapping.end (), "FLAC", "FLAC" + 4);
+		mapping.push_back (1);
+		mapping.push_back (0);
+		AppendBE16 (mapping, (unsigned int)(blocks.size () - 1));
+		mapping.insert (mapping.end (), "fLaC", "fLaC" + 4);
+		mapping.insert (mapping.end (), nativeFlac.begin () + blocks[0].Offset, nativeFlac.begin () + blocks[0].Offset + blocks[0].Bytes);
+		oggFlac->clear ();
+		if (!AppendOggPacketPage (oggFlac, mapping, 0x02, 0, 0x1a2b3c4dU, sequenceNumber++))
+		{
+			return false;
+		}
+		for (std::size_t index = 1; index < blocks.size (); ++index)
+		{
+			std::vector<unsigned char> metadata (nativeFlac.begin () + blocks[index].Offset, nativeFlac.begin () + blocks[index].Offset + blocks[index].Bytes);
+			if (!AppendOggPacketPage (oggFlac, metadata, 0, 0, 0x1a2b3c4dU, sequenceNumber++))
+			{
+				return false;
+			}
+		}
+		for (std::size_t index = 0; index < frames.size (); ++index)
+		{
+			const FixtureFlacFrame &frame = frames[index];
+			const std::vector<unsigned char> audio (nativeFlac.begin () + audioOffset + frame.Offset, nativeFlac.begin () + audioOffset + frame.Offset + frame.Bytes);
+			granulePosition += frame.PCMFrames;
+			if (!AppendOggPacketPage (oggFlac, audio, index + 1 == frames.size () ? 0x04 : 0, granulePosition, 0x1a2b3c4dU, sequenceNumber++))
+			{
+				return false;
+			}
+		}
+		return granulePosition == totalPCMFrames;
+	}
+
+	unsigned int ReadLE32 (const unsigned char *data)
+	{
+		return (unsigned int)data[0] | ((unsigned int)data[1] << 8) | ((unsigned int)data[2] << 16) | ((unsigned int)data[3] << 24);
+	}
+
+	unsigned long long ReadLE64 (const unsigned char *data)
+	{
+		return (unsigned long long)ReadLE32 (data) | ((unsigned long long)ReadLE32 (data + 4) << 32);
+	}
+
+	unsigned int OggPageCRC (const unsigned char *data, std::size_t bytes)
+	{
+		unsigned int crc = 0;
+		for (std::size_t index = 0; index < bytes; ++index)
+		{
+			unsigned char value = index >= 22 && index < 26 ? 0 : data[index];
+			crc ^= (unsigned int)value << 24;
+			for (unsigned int bit = 0; bit < 8; ++bit)
+			{
+				crc = (crc << 1) ^ ((crc & 0x80000000U) != 0 ? 0x04c11db7U : 0);
+			}
+		}
+		return crc;
+	}
+
+	struct OggPacketPage
+	{
+		const unsigned char *Packet;
+		std::size_t PacketBytes;
+		unsigned char HeaderType;
+		unsigned long long GranulePosition;
+	};
+
+	bool ReadOggPacketPage (const std::vector<unsigned char> &oggFlac, std::size_t *offset, unsigned int sequenceNumber, OggPacketPage *page)
+	{
+		std::size_t lacingBytes;
+		std::size_t packetBytes = 0;
+		std::size_t headerBytes;
+		if (offset == NULL || page == NULL || *offset > oggFlac.size () || oggFlac.size () - *offset < 27 || memcmp (&oggFlac[*offset], "OggS", 4) != 0 || oggFlac[*offset + 4] != 0)
+		{
+			return false;
+		}
+		lacingBytes = oggFlac[*offset + 26];
+		headerBytes = 27 + lacingBytes;
+		if (lacingBytes == 0 || headerBytes > oggFlac.size () - *offset)
+		{
+			return false;
+		}
+		for (std::size_t laceIndex = 0; laceIndex < lacingBytes; ++laceIndex)
+		{
+			packetBytes += oggFlac[*offset + 27 + laceIndex];
+		}
+		if (packetBytes > oggFlac.size () - *offset - headerBytes || OggPageCRC (&oggFlac[*offset], headerBytes + packetBytes) != ReadLE32 (&oggFlac[*offset + 22]) || ReadLE32 (&oggFlac[*offset + 14]) != 0x1a2b3c4dU || ReadLE32 (&oggFlac[*offset + 18]) != sequenceNumber)
+		{
+			return false;
+		}
+		page->Packet = &oggFlac[*offset + headerBytes];
+		page->PacketBytes = packetBytes;
+		page->HeaderType = oggFlac[*offset + 5];
+		page->GranulePosition = ReadLE64 (&oggFlac[*offset + 6]);
+		*offset += headerBytes + packetBytes;
+		return true;
+	}
+
+	bool ValidateOggFlacHeaderPage (const OggPacketPage &page, const std::vector<FlacMetadataBlock> &blocks, const std::vector<unsigned char> &nativeFlac)
+	{
+		return page.HeaderType == 0x02 && page.GranulePosition == 0 && page.PacketBytes == 51 && page.Packet[0] == 0x7f && memcmp (page.Packet + 1, "FLAC", 4) == 0 && page.Packet[5] == 1 && page.Packet[6] == 0 && page.Packet[7] == 0 && page.Packet[8] == blocks.size () - 1 && memcmp (page.Packet + 9, "fLaC", 4) == 0 && memcmp (page.Packet + 13, &nativeFlac[blocks[0].Offset], blocks[0].Bytes) == 0 && (page.Packet[13] & 0x80) == 0;
+	}
+
+	bool ValidateOggFlacMetadataPage (const OggPacketPage &page, const FlacMetadataBlock &block, std::size_t pageIndex, const std::vector<unsigned char> &nativeFlac)
+	{
+		return page.HeaderType == 0 && page.GranulePosition == 0 && page.PacketBytes == block.Bytes && memcmp (page.Packet, &nativeFlac[block.Offset], block.Bytes) == 0 && (pageIndex != 1 || (block.Type == 4 && !block.IsLast)) && ((page.Packet[0] & 0x80) != 0) == block.IsLast;
+	}
+
+	bool ValidateOggFlacAudioPage (const OggPacketPage &page, const FixtureFlacFrame &frame, std::size_t pageIndex, std::size_t pageCount, std::size_t nativeAudioOffset, const std::vector<unsigned char> &nativeFlac, unsigned long long *granulePosition)
+	{
+		*granulePosition += frame.PCMFrames;
+		return page.HeaderType == (pageIndex + 1 == pageCount ? 0x04 : 0) && page.GranulePosition == *granulePosition && page.PacketBytes == frame.Bytes && memcmp (page.Packet, &nativeFlac[nativeAudioOffset + frame.Offset], frame.Bytes) == 0;
+	}
+
+	bool ValidateOggFlac (const std::vector<unsigned char> &oggFlac, const std::vector<unsigned char> &nativeFlac, unsigned long long totalPCMFrames)
+	{
+		std::vector<FlacMetadataBlock> blocks;
+		std::vector<FixtureFlacFrame> frames;
+		std::size_t nativeAudioOffset;
+		std::size_t offset = 0;
+		unsigned long long granulePosition = 0;
+		if (!ParseNativeFlacMetadata (nativeFlac, &blocks, &nativeAudioOffset) || !GetFixtureFlacFrames (nativeFlac, nativeAudioOffset, &frames) || blocks.size () < 2)
+		{
+			return false;
+		}
+		for (std::size_t pageIndex = 0; pageIndex < blocks.size () + frames.size (); ++pageIndex)
+		{
+			OggPacketPage page;
+			if (!ReadOggPacketPage (oggFlac, &offset, (unsigned int)pageIndex, &page))
+			{
+				return false;
+			}
+			if (pageIndex == 0)
+			{
+				if (!ValidateOggFlacHeaderPage (page, blocks, nativeFlac))
+				{
+					return false;
+				}
+			}
+			else if (pageIndex < blocks.size ())
+			{
+				const FlacMetadataBlock &block = blocks[pageIndex];
+				if (!ValidateOggFlacMetadataPage (page, block, pageIndex, nativeFlac))
+				{
+					return false;
+				}
+			}
+			else
+			{
+				const FixtureFlacFrame &frame = frames[pageIndex - blocks.size ()];
+				if (!ValidateOggFlacAudioPage (page, frame, pageIndex, blocks.size () + frames.size (), nativeAudioOffset, nativeFlac, &granulePosition))
+				{
+					return false;
+				}
+			}
+		}
+		return granulePosition == totalPCMFrames && offset == oggFlac.size ();
 	}
 
 	std::vector<unsigned char> MakeWave (unsigned int format)
@@ -74,6 +438,185 @@ namespace
 		}
 		return bytes;
 	}
+
+	std::vector<unsigned char> MakeReaderWave (unsigned int format, unsigned int bitsPerSample, unsigned long long sampleBits, std::size_t dataBytes)
+	{
+		std::vector<unsigned char> bytes;
+		std::vector<unsigned char> sample;
+		unsigned int bytesPerSample = bitsPerSample / 8;
+		bytes.insert (bytes.end (), "RIFF", "RIFF" + 4);
+		AppendLE32 (bytes, (unsigned int)(36 + dataBytes));
+		bytes.insert (bytes.end (), "WAVEfmt ", "WAVEfmt " + 8);
+		AppendLE32 (bytes, 16);
+		AppendLE16 (bytes, format);
+		AppendLE16 (bytes, 1);
+		AppendLE32 (bytes, 8000);
+		AppendLE32 (bytes, 8000 * bytesPerSample);
+		AppendLE16 (bytes, bytesPerSample);
+		AppendLE16 (bytes, bitsPerSample);
+		bytes.insert (bytes.end (), "data", "data" + 4);
+		AppendLE32 (bytes, (unsigned int)dataBytes);
+		for (unsigned int index = 0; index < bytesPerSample; ++index)
+		{
+			sample.push_back ((unsigned char)(sampleBits >> (index * 8)));
+		}
+		for (std::size_t index = 0; index < dataBytes; ++index)
+		{
+			bytes.push_back (sample[index % sample.size ()]);
+		}
+		return bytes;
+	}
+
+	unsigned long FixtureProcessId ()
+	{
+#ifdef _WIN32
+		return (unsigned long)_getpid ();
+#else
+		return (unsigned long)getpid ();
+#endif
+	}
+
+	int OpenFixtureFile (const char *name)
+	{
+#ifdef _WIN32
+		return _open (name, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
+		return open (name, O_WRONLY | O_CREAT | O_EXCL, 0600);
+#endif
+	}
+
+	bool WriteFixtureBytes (int fileDescriptor, const std::vector<unsigned char> &bytes)
+	{
+		if (bytes.empty ())
+		{
+			return true;
+		}
+#ifdef _WIN32
+		if (bytes.size () > UINT_MAX)
+		{
+			return false;
+		}
+		{
+			int bytesWritten = _write (fileDescriptor, &bytes[0], (unsigned int)bytes.size ());
+			return bytesWritten >= 0 && (unsigned int)bytesWritten == (unsigned int)bytes.size ();
+		}
+#else
+		const unsigned char *data = &bytes[0];
+		std::size_t remaining = bytes.size ();
+		while (remaining > 0)
+		{
+			ssize_t bytesWritten = write (fileDescriptor, data, remaining);
+			if (bytesWritten <= 0)
+			{
+				return false;
+			}
+			data += bytesWritten;
+			remaining -= (std::size_t)bytesWritten;
+		}
+		return true;
+#endif
+	}
+
+	void CloseFixtureFile (int fileDescriptor)
+	{
+#ifdef _WIN32
+		_close (fileDescriptor);
+#else
+		close (fileDescriptor);
+#endif
+	}
+
+	bool FixtureFileAlreadyExists ()
+	{
+		return errno == EEXIST;
+	}
+
+	bool WriteUniqueTemporaryFixture (const std::vector<unsigned char> &bytes, const char *kind, const char *directory, unsigned int *sequence, std::string *path)
+	{
+		int fileDescriptor;
+		char name[128];
+		for (unsigned int attempt = 0; attempt < 64; ++attempt)
+		{
+			if (directory != NULL)
+			{
+				sprintf (name, "%s/audio_decoder_fallback_%lu_%u_%s.wav", directory, FixtureProcessId (), ++*sequence, kind);
+			}
+			else
+			{
+				sprintf (name, "audio_decoder_fallback_%lu_%u_%s.wav", FixtureProcessId (), ++*sequence, kind);
+			}
+			fileDescriptor = OpenFixtureFile (name);
+			if (fileDescriptor >= 0)
+			{
+				break;
+			}
+			if (!FixtureFileAlreadyExists ())
+			{
+				return false;
+			}
+		}
+		if (fileDescriptor < 0)
+		{
+			return false;
+		}
+		if (!WriteFixtureBytes (fileDescriptor, bytes))
+		{
+			CloseFixtureFile (fileDescriptor);
+			remove (name);
+			return false;
+		}
+		CloseFixtureFile (fileDescriptor);
+		try
+		{
+			*path = name;
+		}
+		catch (...)
+		{
+			remove (name);
+			throw;
+		}
+		return true;
+	}
+
+	class TemporaryFixtureFiles
+	{
+	public:
+		TemporaryFixtureFiles () : Sequence (0)
+		{
+		}
+
+		~TemporaryFixtureFiles ()
+		{
+			for (std::vector<std::string>::const_iterator path = Paths.begin (); path != Paths.end (); ++path)
+			{
+				remove (path->c_str ());
+			}
+		}
+
+		bool Write (const std::vector<unsigned char> &bytes, const char *kind, std::string *path)
+		{
+			std::string createdPath;
+			if (!WriteUniqueTemporaryFixture (bytes, kind, NULL, &Sequence, &createdPath))
+			{
+				return false;
+			}
+			try
+			{
+				Paths.push_back (createdPath);
+			}
+			catch (...)
+			{
+				remove (createdPath.c_str ());
+				throw;
+			}
+			*path = createdPath;
+			return true;
+		}
+
+	private:
+		std::vector<std::string> Paths;
+		unsigned int Sequence;
+	};
 
 	std::vector<unsigned char> MakeMpeg ()
 	{
@@ -604,6 +1147,224 @@ namespace
 		Check (CreateAudioDecoder (source, probe, &decoder) == AUDIO_DECODE_INVALID_SOURCE && decoder == NULL, "WAVE input cannot fall back from FLAC probe");
 	}
 
+	template<typename T> const unsigned char *MakeUnalignedSamples (const T *samples, std::size_t sampleCount, std::vector<unsigned char> *bytes)
+	{
+		bytes->assign (sampleCount * sizeof (*samples) + 1, 0);
+		memcpy (&(*bytes)[1], samples, sampleCount * sizeof (*samples));
+		return &(*bytes)[1];
+	}
+
+	void TestMiniaudioPCM16Conversion ()
+	{
+		const short pcm16[] = { -32768, -1, 0, 32767 };
+		std::vector<unsigned char> bytes;
+		short s16[6] = { 123, 123, 123, 123, 123, 123 };
+		float f32[6] = { 123.0f, 123.0f, 123.0f, 123.0f, 123.0f, 123.0f };
+		int s32[6] = { 123, 123, 123, 123, 123, 123 };
+		const unsigned char *input = MakeUnalignedSamples (pcm16, sizeof (pcm16) / sizeof (pcm16[0]), &bytes);
+		AudioDecoderTestMiniaudioPCMToS16 (s16, input, 4, sizeof (pcm16[0]));
+		AudioDecoderTestMiniaudioPCMToF32 (f32, input, 4, sizeof (pcm16[0]));
+		AudioDecoderTestMiniaudioPCMToS32 (s32, input, 4, sizeof (pcm16[0]));
+		Check (s16[0] == -32768 && s16[1] == -1 && s16[2] == 0 && s16[3] == 32767, "miniaudio PCM16 unaligned conversion to s16");
+		Check (f32[0] == -1.0f && f32[1] == -0.000030517578125f && f32[2] == 0.0f && f32[3] == 0.999969482421875f, "miniaudio PCM16 unaligned conversion to f32");
+		Check (s32[0] == INT_MIN && s32[1] == -65536 && s32[2] == 0 && s32[3] == 2147418112, "miniaudio PCM16 unaligned conversion to s32");
+	}
+
+	void TestMiniaudioPCM32Conversion ()
+	{
+		const int pcm32[] = { INT_MIN, -65536, 0, INT_MAX };
+		std::vector<unsigned char> bytes;
+		short s16[6] = { 123, 123, 123, 123, 123, 123 };
+		float f32[6] = { 123.0f, 123.0f, 123.0f, 123.0f, 123.0f, 123.0f };
+		int s32[6] = { 123, 123, 123, 123, 123, 123 };
+		const unsigned char *input = MakeUnalignedSamples (pcm32, sizeof (pcm32) / sizeof (pcm32[0]), &bytes);
+		AudioDecoderTestMiniaudioPCMToS16 (s16, input, 4, sizeof (pcm32[0]));
+		AudioDecoderTestMiniaudioPCMToF32 (f32, input, 4, sizeof (pcm32[0]));
+		AudioDecoderTestMiniaudioPCMToS32 (s32, input, 4, sizeof (pcm32[0]));
+		Check (s16[0] == -32768 && s16[1] == -1 && s16[2] == 0 && s16[3] == 32767, "miniaudio PCM32 unaligned conversion and rounding to s16");
+		Check (f32[0] == -1.0f && f32[1] == -0.000030517578125f && f32[2] == 0.0f && f32[3] > 0.9999f, "miniaudio PCM32 unaligned conversion to f32");
+		Check (s32[0] == INT_MIN && s32[1] == -65536 && s32[2] == 0 && s32[3] == INT_MAX, "miniaudio PCM32 unaligned conversion to s32");
+	}
+
+	void TestMiniaudioIEEE32Conversion ()
+	{
+		const float float32[] = { -2.0f, -1.0f, 0.0f, 0.5f, 1.0f, 2.0f };
+		std::vector<unsigned char> bytes;
+		short s16[6] = { 123, 123, 123, 123, 123, 123 };
+		float f32[6] = { 123.0f, 123.0f, 123.0f, 123.0f, 123.0f, 123.0f };
+		int s32[6] = { 123, 123, 123, 123, 123, 123 };
+		const unsigned char *input = MakeUnalignedSamples (float32, sizeof (float32) / sizeof (float32[0]), &bytes);
+		AudioDecoderTestMiniaudioIEEEToS16 (s16, input, 6, sizeof (float32[0]));
+		AudioDecoderTestMiniaudioIEEEToF32 (f32, input, 6, sizeof (float32[0]));
+		AudioDecoderTestMiniaudioIEEEToS32 (s32, input, 6, sizeof (float32[0]));
+		Check (s16[0] == -32768 && s16[1] == -32768 && s16[2] == -1 && s16[3] == 16383 && s16[4] == 32767 && s16[5] == 32767, "miniaudio IEEE float32 unaligned clamp and rounding to s16");
+		Check (f32[0] == -2.0f && f32[1] == -1.0f && f32[2] == 0.0f && f32[3] == 0.5f && f32[4] == 1.0f && f32[5] == 2.0f, "miniaudio IEEE float32 unaligned conversion to f32");
+		Check (s32[0] == INT_MIN && s32[1] == INT_MIN && s32[2] == 0 && s32[3] == 1073741824 && s32[4] == INT_MIN && s32[5] == INT_MIN, "miniaudio IEEE float32 unaligned clamp and rounding to s32");
+	}
+
+	void TestMiniaudioIEEE64Conversion ()
+	{
+		const short pcm16[] = { -32768, -1, 0, 32767 };
+		const double float64[] = { -2.0, -1.0, 0.0, 0.5, 1.0, 2.0 };
+		std::vector<unsigned char> bytes;
+		short s16[6] = { 123, 123, 123, 123, 123, 123 };
+		float f32[6] = { 123.0f, 123.0f, 123.0f, 123.0f, 123.0f, 123.0f };
+		int s32[6] = { 123, 123, 123, 123, 123, 123 };
+		const unsigned char *input = MakeUnalignedSamples (float64, sizeof (float64) / sizeof (float64[0]), &bytes);
+		AudioDecoderTestMiniaudioIEEEToS16 (s16, input, 6, sizeof (float64[0]));
+		AudioDecoderTestMiniaudioIEEEToF32 (f32, input, 6, sizeof (float64[0]));
+		AudioDecoderTestMiniaudioIEEEToS32 (s32, input, 6, sizeof (float64[0]));
+		Check (s16[0] == -32768 && s16[1] == -32768 && s16[2] == -1 && s16[3] == 16383 && s16[4] == 32767 && s16[5] == 32767, "miniaudio IEEE float64 unaligned clamp and rounding to s16");
+		Check (f32[0] == -2.0f && f32[1] == -1.0f && f32[2] == 0.0f && f32[3] == 0.5f && f32[4] == 1.0f && f32[5] == 2.0f, "miniaudio IEEE float64 unaligned conversion to f32");
+		Check (s32[0] == INT_MIN && s32[1] == INT_MIN && s32[2] == 0 && s32[3] == 1073741824 && s32[4] == INT_MIN && s32[5] == INT_MIN, "miniaudio IEEE float64 unaligned clamp and rounding to s32");
+		AudioDecoderTestMiniaudioPCMToS16 (s16, input, 0, sizeof (pcm16[0]));
+		AudioDecoderTestMiniaudioPCMToF32 (f32, input, 0, sizeof (pcm16[0]));
+		AudioDecoderTestMiniaudioPCMToS32 (s32, input, 0, sizeof (pcm16[0]));
+		AudioDecoderTestMiniaudioIEEEToS16 (s16, input, 0, sizeof (float64[0]));
+		AudioDecoderTestMiniaudioIEEEToF32 (f32, input, 0, sizeof (float64[0]));
+		AudioDecoderTestMiniaudioIEEEToS32 (s32, input, 0, sizeof (float64[0]));
+		Check (s16[0] == -32768 && f32[0] == -2.0f && s32[0] == INT_MIN, "miniaudio zero-sample conversion preserves output");
+	}
+
+	void TestMiniaudioWavConversionHelpers ()
+	{
+		TestMiniaudioPCM16Conversion ();
+		TestMiniaudioPCM32Conversion ();
+		TestMiniaudioIEEE32Conversion ();
+		TestMiniaudioIEEE64Conversion ();
+	}
+
+	void TestMiniaudioWavReaderBoundaries ()
+	{
+		const std::size_t pcm16Sizes[] = { 4095, 4096, 4097 };
+		const std::size_t pcm32Sizes[] = { 4093, 4094, 4095, 4096, 4097 };
+		const std::size_t ieee64Sizes[] = { 4089, 4090, 4091, 4092, 4093, 4094, 4095, 4096, 4097 };
+		const std::size_t *sizes[] = { pcm16Sizes, pcm32Sizes, ieee64Sizes };
+		const std::size_t counts[] = { sizeof (pcm16Sizes) / sizeof (pcm16Sizes[0]), sizeof (pcm32Sizes) / sizeof (pcm32Sizes[0]), sizeof (ieee64Sizes) / sizeof (ieee64Sizes[0]) };
+		const unsigned int formats[] = { 1, 1, 3 };
+		const unsigned int widths[] = { 16, 32, 64 };
+		const unsigned long long samples[] = { 0x8000, 0x80000000ULL, 0xbff0000000000000ULL };
+		for (unsigned int formatIndex = 0; formatIndex < 3; ++formatIndex)
+		{
+			for (std::size_t sizeIndex = 0; sizeIndex < counts[formatIndex]; ++sizeIndex)
+			{
+				std::size_t dataBytes = sizes[formatIndex][sizeIndex];
+				std::size_t bytesPerSample = widths[formatIndex] / 8;
+				std::vector<unsigned char> wave = MakeReaderWave (formats[formatIndex], widths[formatIndex], samples[formatIndex], dataBytes);
+				std::vector<short> output (dataBytes / bytesPerSample + 1, 12345);
+				std::size_t framesRead = AudioDecoderTestMiniaudioReadWavS16 (&wave[0], wave.size (), &output[0], output.size ());
+				Check (framesRead == dataBytes / bytesPerSample && output[framesRead] == 12345, "miniaudio WAV reader preserves partial sample and output canary");
+				Check (framesRead == 0 || output[0] == -32768, "miniaudio WAV reader converts unaligned scalar sample");
+			}
+		}
+	}
+
+	void TestTemporaryFixtureCollisionExhaustion (const std::vector<unsigned char> &bytes)
+	{
+		unsigned int sequence = 0;
+		std::string createdPath;
+		std::vector<std::string> collisionPaths;
+		for (unsigned int collision = 0; collision < 64; ++collision)
+		{
+			char name[128];
+			sprintf (name, "audio_decoder_fallback_%lu_%u_exhaustion.wav", FixtureProcessId (), collision + 1);
+			int fileDescriptor = OpenFixtureFile (name);
+			if (fileDescriptor < 0)
+			{
+				break;
+			}
+			if (!WriteFixtureBytes (fileDescriptor, bytes))
+			{
+				CloseFixtureFile (fileDescriptor);
+				remove (name);
+				break;
+			}
+			CloseFixtureFile (fileDescriptor);
+			collisionPaths.push_back (name);
+		}
+		if (collisionPaths.size () != 64)
+		{
+			for (std::vector<std::string>::const_iterator path = collisionPaths.begin (); path != collisionPaths.end (); ++path)
+			{
+				remove (path->c_str ());
+			}
+			return;
+		}
+		Check (!WriteUniqueTemporaryFixture (bytes, "exhaustion", NULL, &sequence, &createdPath), "temporary fixture stops after 64 name collisions");
+		for (std::vector<std::string>::const_iterator path = collisionPaths.begin (); path != collisionPaths.end (); ++path)
+		{
+			std::vector<unsigned char> marker;
+			Check (ReadFileBytes (path->c_str (), &marker) && marker == bytes, "temporary fixture collision marker remains unchanged");
+			remove (path->c_str ());
+		}
+	}
+
+	void TestTemporaryFixtureCreationFailures ()
+	{
+		try
+		{
+			const unsigned char data[] = { 0, 1, 2, 3 };
+			const std::vector<unsigned char> bytes (data, data + sizeof (data));
+			unsigned int sequence = 0;
+			char collisionPath[128];
+			bool collisionPathOwned;
+			bool collisionReady;
+			std::string createdPath;
+			std::vector<unsigned char> initialMarker;
+			sprintf (collisionPath, "audio_decoder_fallback_%lu_%u_collision.wav", FixtureProcessId (), sequence + 1);
+			int fileDescriptor = OpenFixtureFile (collisionPath);
+			collisionPathOwned = fileDescriptor >= 0;
+			collisionReady = false;
+			if (collisionPathOwned)
+			{
+				collisionReady = WriteFixtureBytes (fileDescriptor, bytes);
+				CloseFixtureFile (fileDescriptor);
+			}
+			if (collisionReady)
+			{
+				bool fixtureCreated = WriteUniqueTemporaryFixture (bytes, "collision", NULL, &sequence, &createdPath);
+				Check (fixtureCreated && createdPath != collisionPath, "temporary fixture skips a known name collision");
+				Check (ReadFileBytes (collisionPath, &initialMarker) && initialMarker == bytes, "initial collision fixture remains unchanged");
+				if (fixtureCreated)
+				{
+					remove (createdPath.c_str ());
+				}
+			}
+			if (collisionPathOwned)
+			{
+				remove (collisionPath);
+			}
+			sequence = 0;
+			Check (!WriteUniqueTemporaryFixture (bytes, "invalid", "audio_decoder_tests_missing_fixture_directory", &sequence, &createdPath), "temporary fixture stops after a non-collision create failure");
+			TestTemporaryFixtureCollisionExhaustion (bytes);
+		}
+		catch (...)
+		{
+			Check (false, "temporary fixture failure test setup");
+		}
+	}
+
+	void TestMiniaudioAutoDetectionFallback ()
+	{
+		std::vector<unsigned char> bytes;
+		TemporaryFixtureFiles temporaryFixtures;
+		std::string flacPath = FixturePath ("flac_mono.flac");
+		std::string mp3Path = FixturePath ("mp3_mono.mp3");
+		std::string fallbackPath;
+		std::wstring wideFallbackPath;
+		const unsigned char invalid[] = { 0, 1, 2, 3 };
+		Check (ReadFileBytes (flacPath.c_str (), &bytes) && AudioDecoderTestMiniaudioAutoDetectMemory (&bytes[0], bytes.size ()), "miniaudio WAV failure falls back to FLAC from memory");
+		Check (ReadFileBytes (mp3Path.c_str (), &bytes) && AudioDecoderTestMiniaudioAutoDetectMemory (&bytes[0], bytes.size ()), "miniaudio WAV and FLAC failures fall back to MP3 from memory");
+		Check (ReadFileBytes (flacPath.c_str (), &bytes) && temporaryFixtures.Write (bytes, "flac", &fallbackPath) && AudioDecoderTestMiniaudioAutoDetectFile (fallbackPath.c_str ()), "miniaudio WAV-first file fallback opens FLAC fixture");
+		wideFallbackPath.assign (fallbackPath.begin (), fallbackPath.end ());
+		Check (!wideFallbackPath.empty () && AudioDecoderTestMiniaudioAutoDetectWideFile (wideFallbackPath.c_str ()), "miniaudio WAV-first wide-file fallback opens FLAC fixture");
+		Check (ReadFileBytes (mp3Path.c_str (), &bytes) && temporaryFixtures.Write (bytes, "mp3", &fallbackPath) && AudioDecoderTestMiniaudioAutoDetectFile (fallbackPath.c_str ()), "miniaudio WAV-first file fallback opens MP3 fixture");
+		wideFallbackPath.assign (fallbackPath.begin (), fallbackPath.end ());
+		Check (!wideFallbackPath.empty () && AudioDecoderTestMiniaudioAutoDetectWideFile (wideFallbackPath.c_str ()), "miniaudio WAV-first wide-file fallback opens MP3 fixture");
+		Check (temporaryFixtures.Write (std::vector<unsigned char> (invalid, invalid + sizeof (invalid)), "invalid", &fallbackPath) && !AudioDecoderTestMiniaudioAutoDetectFile (fallbackPath.c_str ()) && !AudioDecoderTestMiniaudioAutoDetectWideFile (std::wstring (fallbackPath.begin (), fallbackPath.end ()).c_str ()), "miniaudio WAV-first file and wide-file reject input unsupported by every fallback decoder");
+		Check (!AudioDecoderTestMiniaudioAutoDetectMemory (invalid, sizeof (invalid)), "miniaudio rejects input unsupported by every fallback decoder");
+	}
+
 	void TestCodecFixtures ()
 	{
 		TestFixtureParity ("pcm16_stereo.wav", AUDIO_FORMAT_WAVE_PCM, 8000, 2, 529, 0xbd9ea28d7d1f5ebeULL, "PCM WAVE fixture parity");
@@ -642,6 +1403,407 @@ namespace
 		Check (AudioDecoderTestVorbisCanReadFrames (maxVorbisFrames, maxVorbisFrames - 1, 1) && !AudioDecoderTestVorbisCanReadFrames (maxVorbisFrames, maxVorbisFrames, 1) && AudioDecoderTestVorbisCanReadFrames (maxVorbisFrames, maxVorbisFrames, 0), "Vorbis final-frame read boundary");
 		Check (AudioDecoderTestVorbisCanSeekFrame (maxVorbisFrames, maxVorbisFrames - 1) && AudioDecoderTestVorbisCanSeekFrame (maxVorbisFrames, maxVorbisFrames) && AudioDecoderTestVorbisIsLogicalEOF (maxVorbisFrames, maxVorbisFrames), "Vorbis exact logical EOF seek");
 		Check (!AudioDecoderTestVorbisCanSeekFrame (maxVorbisFrames, 0xfffffffeU) && !AudioDecoderTestVorbisCanSeekFrame (maxVorbisFrames, 0xffffffffU) && !AudioDecoderTestVorbisCanUseLoopEndpoint (maxVorbisFrames, 0xfffffffeU) && !AudioDecoderTestVorbisCanUseLoopEndpoint (maxVorbisFrames, 0xffffffffU), "Vorbis reserved sentinel seek and loop endpoints rejected");
+	}
+
+	void TestMiniaudioFlacAllocationBounds ()
+	{
+		std::size_t allocationSize = 0;
+		std::size_t decodedSamplesOffset = 0;
+		std::size_t decodedSampleCount = 0;
+		std::size_t seekpointsOffset = 0;
+		Check (AudioDecoderTestMiniaudioFlacAllocationLayout (4096, 2, 3, false, &allocationSize, &decodedSamplesOffset, &decodedSampleCount, &seekpointsOffset), "miniaudio FLAC allocation layout accepts stereo stream");
+		Check (allocationSize >= decodedSamplesOffset + decodedSampleCount * sizeof (int) && seekpointsOffset >= decodedSamplesOffset + decodedSampleCount * sizeof (int) && allocationSize >= seekpointsOffset + 3 * 18, "miniaudio FLAC allocation layout reserves SIMD alignment margin");
+		Check (!AudioDecoderTestMiniaudioFlacAllocationLayout (UINT_MAX, UINT_MAX, UINT_MAX, false, &allocationSize, &decodedSamplesOffset, &decodedSampleCount, &seekpointsOffset), "miniaudio FLAC allocation layout rejects overflow");
+		Check (AudioDecoderTestMiniaudioFlacAllocationLayout (65535, 8, 932067, false, &allocationSize, &decodedSamplesOffset, &decodedSampleCount, &seekpointsOffset) && decodedSampleCount == (std::size_t)65536 * 8 && seekpointsOffset >= decodedSamplesOffset + decodedSampleCount * sizeof (int) && allocationSize >= seekpointsOffset + (std::size_t)932067 * 18, "miniaudio native FLAC maximum layout rounds block size and retains seekpoints");
+		Check (AudioDecoderTestMiniaudioFlacAllocationLayout (65535, 8, 932067, true, &allocationSize, &decodedSamplesOffset, &decodedSampleCount, &seekpointsOffset) && decodedSampleCount == (std::size_t)65536 * 8 && seekpointsOffset >= decodedSamplesOffset + decodedSampleCount * sizeof (int) && allocationSize >= seekpointsOffset + (std::size_t)932067 * 18, "miniaudio Ogg-FLAC maximum layout rounds block size and retains seekpoints");
+	}
+
+	void TestMiniaudioFlacAllocationOwnership (std::vector<unsigned char> &flac)
+	{
+		std::size_t allocationCount = 0;
+		std::size_t freeCount = 0;
+		Check (ReadFileBytes (FixturePath ("flac_mono.flac").c_str (), &flac) && AudioDecoderTestMiniaudioFlacAllocationOwnership (&flac[0], flac.size (), &allocationCount, &freeCount), "miniaudio FLAC preserves callback parent allocation ownership");
+		Check (allocationCount == 1 && freeCount == 1, "miniaudio FLAC releases its parent allocation once");
+	}
+
+	void TestMiniaudioFlacNativeFixtureLayout (const std::vector<unsigned char> &flac)
+	{
+		unsigned long long firstPCMFrame = 0;
+		unsigned long long flacFrameOffset = 0;
+		unsigned int pcmFrameCount = 0;
+		unsigned int nativePCMFrameCount = 0;
+		unsigned int metadataRawDataSize = 0;
+		std::size_t nativeAudioOffset = 0;
+		std::vector<FlacMetadataBlock> nativeMetadata;
+		Check (!flac.empty () && AudioDecoderTestMiniaudioFlacOpenSeektable (&flac[0], flac.size (), false, &pcmFrameCount, &firstPCMFrame, &flacFrameOffset, &nativePCMFrameCount, &metadataRawDataSize) && pcmFrameCount == 0, "miniaudio native FLAC opens without a seektable");
+		Check (ParseNativeFlacMetadata (flac, &nativeMetadata, &nativeAudioOffset) && nativeMetadata.size () == 3 && nativeMetadata[0].Offset == 4 && nativeMetadata[0].Bytes == 38 && nativeMetadata[0].Type == 0 && !nativeMetadata[0].IsLast && nativeMetadata[1].Offset == 42 && nativeMetadata[1].Bytes == 18 && nativeMetadata[1].Type == 4 && !nativeMetadata[1].IsLast && nativeMetadata[2].Offset == 60 && nativeMetadata[2].Bytes == 8196 && nativeMetadata[2].Type == 1 && nativeMetadata[2].IsLast && nativeAudioOffset == 8256 && (((unsigned int)flac[10] << 8) | flac[11]) == 512, "native FLAC metadata walk finds comment, final padding, and audio frame offset");
+	}
+
+	void TestMiniaudioFlacValidSeektableOpen (const std::vector<unsigned char> &flac, std::vector<unsigned char> &seektableFlac);
+	void TestMiniaudioFlacValidSeektableMetadata (const std::vector<unsigned char> &seektableFlac);
+	void TestMiniaudioFlacValidSeektableDecode (const std::vector<unsigned char> &seektableFlac, AudioDecodedPCM16 &nativePCM);
+	void TestMiniaudioOggFlacSeektableDecode (const std::vector<unsigned char> &seektableFlac, std::vector<unsigned char> &oggFlac, const AudioDecodedPCM16 &nativePCM);
+	void TestMiniaudioOggFlacSeektableTemporaryOOM (const std::vector<unsigned char> &oggFlac);
+	void TestMiniaudioOggFlacSeektableParentOOM (const std::vector<unsigned char> &oggFlac);
+
+	void TestMiniaudioFlacValidSeektable (const std::vector<unsigned char> &flac, std::vector<unsigned char> &seektableFlac, AudioDecodedPCM16 &nativePCM)
+	{
+		TestMiniaudioFlacValidSeektableOpen (flac, seektableFlac);
+		TestMiniaudioFlacValidSeektableMetadata (seektableFlac);
+		TestMiniaudioFlacValidSeektableDecode (seektableFlac, nativePCM);
+	}
+
+	void TestMiniaudioFlacValidSeektableOpen (const std::vector<unsigned char> &flac, std::vector<unsigned char> &seektableFlac)
+	{
+		unsigned long long firstPCMFrame = 0;
+		unsigned long long flacFrameOffset = 0;
+		unsigned int pcmFrameCount = 0;
+		unsigned int nativePCMFrameCount = 0;
+		unsigned int metadataRawDataSize = 0;
+		Check (MakeFlacWithSeektable (flac, &seektableFlac) && AudioDecoderTestMiniaudioFlacOpenSeektable (&seektableFlac[0], seektableFlac.size (), false, &pcmFrameCount, &firstPCMFrame, &flacFrameOffset, &nativePCMFrameCount, &metadataRawDataSize) && pcmFrameCount == 1 && firstPCMFrame == 0 && flacFrameOffset == 0 && nativePCMFrameCount == 512, "miniaudio native FLAC opens valid seektable at frame zero");
+	}
+
+	void TestMiniaudioFlacValidSeektableMetadata (const std::vector<unsigned char> &seektableFlac)
+	{
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		Check (AudioDecoderTestMiniaudioFlacCallbackOpen (&seektableFlac[0], seektableFlac.size (), true, false, 0, (std::size_t)-1, 0, (std::size_t)-1, &callbacks) && callbacks.Opened && callbacks.MetadataSeektableCount == 1 && callbacks.MetadataRawDataMatchesSeekpoints && callbacks.MetadataRawDataSize == 18 && callbacks.MetadataSeekpointCount == 1 && callbacks.MetadataFirstPCMFrame == 0 && callbacks.MetadataFlacFrameOffset == 0 && callbacks.MetadataPCMFrameCount == 512, "miniaudio native FLAC metadata callback reports valid seektable");
+	}
+
+	void TestMiniaudioFlacValidSeektableDecode (const std::vector<unsigned char> &seektableFlac, AudioDecodedPCM16 &nativePCM)
+	{
+		{
+			AudioMemorySource source (&seektableFlac[0], seektableFlac.size ());
+			AudioProbeResult probe = ProbeAudioFormat (source);
+			AudioDecoder *decoder = NULL;
+			std::size_t framesRead = 0;
+			short seekedSample = 0;
+			Check (probe.Status == AUDIO_PROBE_RECOGNIZED && probe.Format == AUDIO_FORMAT_FLAC && DecodeAudioToPCM16 (source, probe, &nativePCM) == AUDIO_DECODE_OK && nativePCM.Samples.size () == 529 && HashPCM16 (nativePCM) == 0xae1a6ff7e4b9ff1bULL, "miniaudio native FLAC seektable decodes full fixture PCM");
+			source.Assign (&seektableFlac[0], seektableFlac.size ());
+			Check (CreateAudioDecoder (source, ProbeAudioFormat (source), &decoder) == AUDIO_DECODE_OK && decoder != NULL && decoder->SeekFrame (264) == AUDIO_DECODER_SEEK_OK && decoder->ReadFrames (&seekedSample, 1, &framesRead) == AUDIO_DECODER_DATA && framesRead == 1 && nativePCM.Samples.size () > 264 && seekedSample == nativePCM.Samples[264], "miniaudio native FLAC seektable seek reads reference sample");
+			delete decoder;
+		}
+	}
+
+	void TestMiniaudioOggFlacSeektable (const std::vector<unsigned char> &seektableFlac, const AudioDecodedPCM16 &nativePCM)
+	{
+		std::vector<unsigned char> oggFlac;
+		TestMiniaudioOggFlacSeektableDecode (seektableFlac, oggFlac, nativePCM);
+		TestMiniaudioOggFlacSeektableTemporaryOOM (oggFlac);
+		TestMiniaudioOggFlacSeektableParentOOM (oggFlac);
+	}
+
+	void TestMiniaudioOggFlacSeektableDecode (const std::vector<unsigned char> &seektableFlac, std::vector<unsigned char> &oggFlac, const AudioDecodedPCM16 &nativePCM)
+	{
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		unsigned long long totalPCMFrames = 0;
+		unsigned long long pcmHash = 0;
+		short firstSample = 0;
+		short seekSample = 0;
+		bool prerequisites = MakeOggFlac (seektableFlac, 529, &oggFlac) && ValidateOggFlac (oggFlac, seektableFlac, 529);
+		if (!prerequisites)
+		{
+			Check (false, "miniaudio Ogg-FLAC decodes valid packets, seeks, and reaches EOF through the low-level memory path");
+			return;
+		}
+		bool decodeResult = AudioDecoderTestMiniaudioOggFlacDecode (&oggFlac[0], oggFlac.size (), 264, 0, &totalPCMFrames, &pcmHash, &firstSample, &seekSample, &callbacks);
+		if (!decodeResult)
+		{
+			Check (false, "miniaudio Ogg-FLAC decodes valid packets, seeks, and reaches EOF through the low-level memory path");
+			return;
+		}
+		Check (callbacks.Opened && totalPCMFrames == 529 && pcmHash == 0xae1a6ff7e4b9ff1bULL && nativePCM.Samples.size () > 264 && firstSample == nativePCM.Samples[0] && seekSample == nativePCM.Samples[264], "miniaudio Ogg-FLAC decodes valid packets, seeks, and reaches EOF through the low-level memory path");
+		Check (callbacks.MallocCount == 2 && callbacks.ReallocCount == 0 && callbacks.FreeCount == 2 && callbacks.AllocationPointers[0] != callbacks.AllocationPointers[1] && callbacks.AllocationPointers[0] == callbacks.FreePointers[0] && callbacks.AllocationPointers[1] == callbacks.FreePointers[1] && callbacks.CanaryIntact, "miniaudio Ogg-FLAC transfers temporary Ogg state into one parent allocation");
+	}
+
+	void TestMiniaudioOggFlacSeektableTemporaryOOM (const std::vector<unsigned char> &oggFlac)
+	{
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		unsigned long long totalPCMFrames = 0;
+		unsigned long long pcmHash = 0;
+		short firstSample = 0;
+		short seekSample = 0;
+		Check (AudioDecoderTestMiniaudioOggFlacDecode (&oggFlac[0], oggFlac.size (), 0, 1, &totalPCMFrames, &pcmHash, &firstSample, &seekSample, &callbacks) && !callbacks.Opened && callbacks.MallocCount == 1 && callbacks.FreeCount == 0 && callbacks.CanaryIntact, "miniaudio Ogg-FLAC temporary allocation OOM returns null without free");
+	}
+
+	void TestMiniaudioOggFlacSeektableParentOOM (const std::vector<unsigned char> &oggFlac)
+	{
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		unsigned long long totalPCMFrames = 0;
+		unsigned long long pcmHash = 0;
+		short firstSample = 0;
+		short seekSample = 0;
+		Check (AudioDecoderTestMiniaudioOggFlacDecode (&oggFlac[0], oggFlac.size (), 0, 2, &totalPCMFrames, &pcmHash, &firstSample, &seekSample, &callbacks) && !callbacks.Opened && callbacks.MallocCount == 2 && callbacks.FreeCount == 1 && callbacks.AllocationPointers[0] == callbacks.FreePointers[0] && callbacks.CanaryIntact, "miniaudio Ogg-FLAC parent allocation OOM frees temporary state once");
+	}
+
+	void TestMiniaudioFlacSeekpointWire ()
+	{
+		const unsigned char seekpoint[] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0x13, 0x57 };
+		unsigned long long firstPCMFrame = 0;
+		unsigned long long flacFrameOffset = 0;
+		unsigned int pcmFrameCount = 0;
+		Check (AudioDecoderTestMiniaudioFlacDecodeSeekpoint (seekpoint, sizeof (seekpoint), &firstPCMFrame, &flacFrameOffset, &pcmFrameCount) && firstPCMFrame == 0x0123456789abcdefULL && flacFrameOffset == 0x1032547698badcfeULL && pcmFrameCount == 0x1357, "miniaudio FLAC seekpoint wire decoding");
+		Check (!AudioDecoderTestMiniaudioFlacDecodeSeekpoint (seekpoint, sizeof (seekpoint) - 1, &firstPCMFrame, &flacFrameOffset, &pcmFrameCount), "miniaudio FLAC seekpoint rejects short wire read");
+	}
+
+	void TestMiniaudioFlacCallbackWireScenarios (std::vector<unsigned char> &seektableFlac, std::vector<unsigned char> &shortSeektableFlac, unsigned long long *firstPCMFrame, unsigned long long *flacFrameOffset, unsigned int *pcmFrameCount, unsigned int *nativePCMFrameCount, unsigned int *metadataRawDataSize)
+	{
+		Check (AudioDecoderTestMiniaudioFlacOpenSeektable (&seektableFlac[0], seektableFlac.size (), false, pcmFrameCount, firstPCMFrame, flacFrameOffset, nativePCMFrameCount, metadataRawDataSize) && *pcmFrameCount == 1 && *firstPCMFrame == 0x0123456789abcdefULL && *flacFrameOffset == 0x1032547698badcfeULL && *nativePCMFrameCount == 0x1357, "miniaudio native FLAC open reads seektable wire fields");
+		Check (AudioDecoderTestMiniaudioFlacOpenSeektable (&seektableFlac[0], seektableFlac.size (), true, pcmFrameCount, firstPCMFrame, flacFrameOffset, nativePCMFrameCount, metadataRawDataSize) && *pcmFrameCount == 1 && *metadataRawDataSize == 18, "miniaudio native FLAC metadata seektable retains wire size");
+	}
+
+	void TestMiniaudioFlacCallbackMetadataScenarios (const std::vector<unsigned char> &seektableFlac, const std::vector<unsigned char> &emptySeektableFlac, AudioDecoderTestMiniaudioFlacCallbackReport *callbacks)
+	{
+		Check (AudioDecoderTestMiniaudioFlacCallbackOpen (&seektableFlac[0], seektableFlac.size (), true, false, 0, (std::size_t)-1, 0, (std::size_t)-1, callbacks) && callbacks->Opened && callbacks->MetadataSeektableCount == 1 && callbacks->MetadataRawDataMatchesSeekpoints && callbacks->MetadataRawDataSize == 18 && callbacks->MetadataSeekpointCount == 1 && callbacks->MetadataFirstPCMFrame == 0x0123456789abcdefULL && callbacks->MetadataFlacFrameOffset == 0x1032547698badcfeULL && callbacks->MetadataPCMFrameCount == 0x1357, "miniaudio native FLAC metadata callback exposes seekpoint array and wire size");
+		Check (AudioDecoderTestMiniaudioFlacCallbackOpen (&emptySeektableFlac[0], emptySeektableFlac.size (), true, false, 0, (std::size_t)-1, 0, (std::size_t)-1, callbacks) && callbacks->Opened && callbacks->MetadataSeektableCount == 1 && callbacks->MetadataRawDataMatchesSeekpoints && callbacks->MetadataRawDataSize == 0 && callbacks->MetadataSeekpointCount == 0 && callbacks->MallocCount == 1 && callbacks->FreeCount == 1 && callbacks->CanaryIntact, "miniaudio native FLAC metadata callback exposes empty seektable without allocation");
+	}
+
+	void TestMiniaudioFlacCallbackAllocatorScenarios (const std::vector<unsigned char> &seektableFlac, AudioDecoderTestMiniaudioFlacCallbackReport *callbacks)
+	{
+		Check (AudioDecoderTestMiniaudioFlacCallbackOpen (&seektableFlac[0], seektableFlac.size (), false, false, 0, (std::size_t)-1, 0, (std::size_t)-1, callbacks) && callbacks->Opened && callbacks->MallocCount == 1 && callbacks->ReallocCount == 0 && callbacks->FreeCount == 1 && callbacks->AllocationPointers[0] == callbacks->FreePointers[0] && callbacks->CanaryIntact, "miniaudio native FLAC malloc parent allocation is freed once");
+		Check (AudioDecoderTestMiniaudioFlacCallbackOpen (&seektableFlac[0], seektableFlac.size (), false, false, 1, (std::size_t)-1, 0, (std::size_t)-1, callbacks) && !callbacks->Opened && callbacks->MallocCount == 1 && callbacks->FreeCount == 0, "miniaudio native FLAC failed parent malloc returns null without free");
+		Check (AudioDecoderTestMiniaudioFlacCallbackOpen (&seektableFlac[0], seektableFlac.size (), false, true, 0, (std::size_t)-1, 0, (std::size_t)-1, callbacks) && callbacks->Opened && callbacks->MallocCount == 0 && callbacks->ReallocCount == 1 && callbacks->FreeCount == 1 && !callbacks->ReallocExistingPointer && callbacks->AllocationPointers[0] == callbacks->FreePointers[0] && callbacks->CanaryIntact, "miniaudio native FLAC realloc-only allocator routes null realloc and free");
+		Check (AudioDecoderTestMiniaudioFlacCallbackOpen (&seektableFlac[0], seektableFlac.size (), false, true, 1, (std::size_t)-1, 0, (std::size_t)-1, callbacks) && !callbacks->Opened && callbacks->ReallocCount == 1 && callbacks->FreeCount == 0, "miniaudio native FLAC failed realloc-only parent allocation returns null");
+	}
+
+	void TestMiniaudioFlacCallbackFailureScenarios (const std::vector<unsigned char> &seektableFlac, AudioDecoderTestMiniaudioFlacCallbackReport *callbacks)
+	{
+		Check (AudioDecoderTestMiniaudioFlacCallbackOpen (&seektableFlac[0], seektableFlac.size (), true, false, 0, (std::size_t)-1, 0, (std::size_t)-1, callbacks) && callbacks->Opened && callbacks->MallocCount == 2 && callbacks->FreeCount == 2 && callbacks->AllocationPointers[0] == callbacks->FreePointers[0] && callbacks->AllocationPointers[1] == callbacks->FreePointers[1] && callbacks->CanaryIntact, "miniaudio native FLAC metadata temporary allocation and parent free sequentially");
+		Check (AudioDecoderTestMiniaudioFlacCallbackOpen (&seektableFlac[0], seektableFlac.size (), true, false, 1, (std::size_t)-1, 0, (std::size_t)-1, callbacks) && !callbacks->Opened && callbacks->MallocCount == 1 && callbacks->FreeCount == 0, "miniaudio native FLAC metadata temporary allocation OOM returns null");
+	}
+
+	void TestMiniaudioFlacCallbackMetadataParentAllocationOOM (const std::vector<unsigned char> &seektableFlac)
+	{
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		bool callbackResult = AudioDecoderTestMiniaudioFlacCallbackOpen (&seektableFlac[0], seektableFlac.size (), true, false, 2, (std::size_t)-1, 0, (std::size_t)-1, &callbacks);
+		if (!callbackResult)
+		{
+			Check (false, "miniaudio native FLAC metadata callback completes before parent allocation OOM frees temporary state");
+			return;
+		}
+		Check (!callbacks.Opened, "miniaudio native FLAC metadata callback completes before parent allocation OOM frees temporary state");
+		Check (callbacks.MallocCount == 2, "miniaudio native FLAC metadata parent allocation OOM allocation count");
+		Check (callbacks.ReallocCount == 0, "miniaudio native FLAC metadata parent allocation OOM realloc count");
+		Check (callbacks.FreeCount == 1, "miniaudio native FLAC metadata parent allocation OOM free count");
+		Check (callbacks.CanaryIntact, "miniaudio native FLAC metadata parent allocation OOM canary");
+		Check (callbacks.MetadataSeektableCount == 1, "miniaudio native FLAC metadata parent allocation OOM seektable count");
+		Check (callbacks.MetadataRawDataMatchesSeekpoints, "miniaudio native FLAC metadata parent allocation OOM raw data");
+		Check (callbacks.MetadataRawDataSize == 18, "miniaudio native FLAC metadata parent allocation OOM raw data size");
+		Check (callbacks.MetadataSeekpointCount == 1, "miniaudio native FLAC metadata parent allocation OOM seekpoint count");
+		Check (callbacks.MetadataFirstPCMFrame == 0x0123456789abcdefULL, "miniaudio native FLAC metadata parent allocation OOM first PCM frame");
+		Check (callbacks.MetadataFlacFrameOffset == 0x1032547698badcfeULL, "miniaudio native FLAC metadata parent allocation OOM FLAC frame offset");
+		Check (callbacks.MetadataPCMFrameCount == 0x1357, "miniaudio native FLAC metadata parent allocation OOM PCM frame count");
+		Check (callbacks.AllocationPointers[0] != NULL, "miniaudio native FLAC metadata parent allocation OOM temporary allocation");
+		Check (callbacks.AllocationPointers[0] == callbacks.FreePointers[0], "miniaudio native FLAC metadata parent allocation OOM temporary free");
+		Check (callbacks.AllocationPointers[1] == NULL, "miniaudio native FLAC metadata parent allocation OOM parent allocation");
+	}
+
+	void TestMiniaudioFlacCallbackMetadataShortRead (const std::vector<unsigned char> &seektableFlac)
+	{
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		bool callbackResult = AudioDecoderTestMiniaudioFlacCallbackOpen (&seektableFlac[0], seektableFlac.size (), true, false, 0, 46, 0, (std::size_t)-1, &callbacks);
+		if (!callbackResult)
+		{
+			Check (false, "miniaudio native FLAC metadata seektable short read frees temporary state before parent allocation");
+			return;
+		}
+		Check (!callbacks.Opened, "miniaudio native FLAC metadata seektable short read frees temporary state before parent allocation");
+		Check (callbacks.MallocCount == 1, "miniaudio native FLAC metadata short read allocation count");
+		Check (callbacks.ReallocCount == 0, "miniaudio native FLAC metadata short read realloc count");
+		Check (callbacks.FreeCount == 1, "miniaudio native FLAC metadata short read free count");
+		Check (callbacks.CanaryIntact, "miniaudio native FLAC metadata short read canary");
+		Check (callbacks.MetadataSeektableCount == 0, "miniaudio native FLAC metadata short read seektable count");
+		Check (callbacks.MetadataRawDataSize == 0, "miniaudio native FLAC metadata short read raw data size");
+		Check (callbacks.MetadataSeekpointCount == 0, "miniaudio native FLAC metadata short read seekpoint count");
+		Check (callbacks.MetadataFirstPCMFrame == 0, "miniaudio native FLAC metadata short read first PCM frame");
+		Check (callbacks.MetadataFlacFrameOffset == 0, "miniaudio native FLAC metadata short read FLAC frame offset");
+		Check (callbacks.MetadataPCMFrameCount == 0, "miniaudio native FLAC metadata short read PCM frame count");
+		Check (callbacks.AllocationPointers[0] != NULL, "miniaudio native FLAC metadata short read temporary allocation");
+		Check (callbacks.AllocationPointers[0] == callbacks.FreePointers[0], "miniaudio native FLAC metadata short read temporary free");
+		Check (callbacks.AllocationPointers[1] == NULL, "miniaudio native FLAC metadata short read parent allocation");
+	}
+
+	void TestMiniaudioFlacCallbackCanaryDamage (const std::vector<unsigned char> &seektableFlac)
+	{
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		Check (AudioDecoderTestMiniaudioFlacCallbackOpen (&seektableFlac[0], seektableFlac.size (), true, false, 0, (std::size_t)-1, 0, (std::size_t)-1, &callbacks, true) && callbacks.Opened && !callbacks.CanaryIntact && callbacks.MallocCount == 2 && callbacks.FreeCount == 2, "miniaudio native FLAC callback report observes canary damage during close");
+	}
+
+	void TestMiniaudioFlacCallbackInitialSeekFailure (const std::vector<unsigned char> &seektableFlac)
+	{
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		Check (AudioDecoderTestMiniaudioFlacCallbackOpen (&seektableFlac[0], seektableFlac.size (), false, false, 0, (std::size_t)-1, 0, 46, &callbacks) && callbacks.Opened && callbacks.SeekpointCount == 0 && callbacks.SeekCount == 2 && callbacks.SeekPositions[0] == 64 && callbacks.SeekPositions[1] == 46 && callbacks.FreeCount == 1, "miniaudio native FLAC first seektable seek failure disables table");
+	}
+
+	void TestMiniaudioFlacCallbackReturnSeekFailure (const std::vector<unsigned char> &seektableFlac)
+	{
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		Check (AudioDecoderTestMiniaudioFlacCallbackOpen (&seektableFlac[0], seektableFlac.size (), false, false, 0, (std::size_t)-1, 0, 64, &callbacks) && !callbacks.Opened && callbacks.SeekCount == 3 && callbacks.SeekPositions[0] == 64 && callbacks.SeekPositions[1] == 46 && callbacks.SeekPositions[2] == 64 && callbacks.FreeCount == 1 && callbacks.CanaryIntact, "miniaudio native FLAC seektable recovery seek failure frees parent once");
+	}
+
+	void TestMiniaudioFlacCallbackShortRead (const std::vector<unsigned char> &seektableFlac)
+	{
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		Check (AudioDecoderTestMiniaudioFlacCallbackOpen (&seektableFlac[0], seektableFlac.size (), false, false, 0, 46, 0, (std::size_t)-1, &callbacks) && callbacks.Opened && callbacks.SeekpointCount == 0 && callbacks.FreeCount == 1 && callbacks.ReadCount > 0 && callbacks.ReadPositions[callbacks.ReadCount - 1] == 46, "miniaudio native FLAC short seekpoint wire read disables table");
+	}
+
+	void TestMiniaudioFlacCallbackScenarios ()
+	{
+		const unsigned char seekpoint[] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0x13, 0x57 };
+		std::vector<unsigned char> flac;
+		std::vector<unsigned char> seektableFlac;
+		std::vector<unsigned char> emptySeektableFlac;
+		std::vector<unsigned char> shortSeektableFlac;
+		unsigned long long firstPCMFrame = 0;
+		unsigned long long flacFrameOffset = 0;
+		unsigned int pcmFrameCount = 0;
+		unsigned int nativePCMFrameCount = 0;
+		unsigned int metadataRawDataSize = 0;
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		if (ReadFileBytes (FixturePath ("flac_mono.flac").c_str (), &flac) && flac.size () > 42)
+		{
+			seektableFlac.assign (flac.begin (), flac.begin () + 42);
+			seektableFlac[4] &= 0x7f;
+			seektableFlac.push_back (0x83);
+			seektableFlac.push_back (0);
+			seektableFlac.push_back (0);
+			seektableFlac.push_back (18);
+			seektableFlac.insert (seektableFlac.end (), seekpoint, seekpoint + sizeof (seekpoint));
+			seektableFlac.insert (seektableFlac.end (), flac.begin () + 42, flac.end ());
+			TestMiniaudioFlacCallbackWireScenarios (seektableFlac, shortSeektableFlac, &firstPCMFrame, &flacFrameOffset, &pcmFrameCount, &nativePCMFrameCount, &metadataRawDataSize);
+			emptySeektableFlac.assign (flac.begin (), flac.begin () + 42);
+			emptySeektableFlac[4] &= 0x7f;
+			emptySeektableFlac.push_back (0x83);
+			emptySeektableFlac.push_back (0);
+			emptySeektableFlac.push_back (0);
+			emptySeektableFlac.push_back (0);
+			emptySeektableFlac.insert (emptySeektableFlac.end (), flac.begin () + 42, flac.end ());
+			TestMiniaudioFlacCallbackMetadataScenarios (seektableFlac, emptySeektableFlac, &callbacks);
+			TestMiniaudioFlacCallbackAllocatorScenarios (seektableFlac, &callbacks);
+			TestMiniaudioFlacCallbackFailureScenarios (seektableFlac, &callbacks);
+			TestMiniaudioFlacCallbackMetadataParentAllocationOOM (seektableFlac);
+			TestMiniaudioFlacCallbackMetadataShortRead (seektableFlac);
+			TestMiniaudioFlacCallbackCanaryDamage (seektableFlac);
+			TestMiniaudioFlacCallbackInitialSeekFailure (seektableFlac);
+			TestMiniaudioFlacCallbackReturnSeekFailure (seektableFlac);
+			TestMiniaudioFlacCallbackShortRead (seektableFlac);
+			shortSeektableFlac = seektableFlac;
+			shortSeektableFlac.resize (42 + 4 + 17);
+			Check (!AudioDecoderTestMiniaudioFlacOpenSeektable (&shortSeektableFlac[0], shortSeektableFlac.size (), true, &pcmFrameCount, &firstPCMFrame, &flacFrameOffset, &nativePCMFrameCount, &metadataRawDataSize), "miniaudio native FLAC metadata seektable rejects short read");
+			seektableFlac[45] = 17;
+			Check (!AudioDecoderTestMiniaudioFlacOpenSeektable (&seektableFlac[0], seektableFlac.size (), false, &pcmFrameCount, &firstPCMFrame, &flacFrameOffset, &nativePCMFrameCount, &metadataRawDataSize), "miniaudio native FLAC rejects malformed seektable length");
+		}
+	}
+
+	void TestMiniaudioFlacAllocationLayout ()
+	{
+		std::vector<unsigned char> flac;
+		std::vector<unsigned char> seektableFlac;
+		AudioDecodedPCM16 nativePCM;
+		TestMiniaudioFlacAllocationBounds ();
+		TestMiniaudioFlacAllocationOwnership (flac);
+		TestMiniaudioFlacNativeFixtureLayout (flac);
+		TestMiniaudioFlacValidSeektable (flac, seektableFlac, nativePCM);
+		TestMiniaudioOggFlacSeektable (seektableFlac, nativePCM);
+		TestMiniaudioFlacSeekpointWire ();
+		TestMiniaudioFlacCallbackScenarios ();
+	}
+
+	void TestVorbisMemorySeekBoundaries ()
+	{
+		const unsigned char data[] = { 0, 1, 2, 3 };
+		const unsigned int locations[] = { 0, 3, 4, 0, 5, UINT_MAX };
+		int success[sizeof (locations) / sizeof (locations[0])] = { 0 };
+		int eof[sizeof (locations) / sizeof (locations[0])] = { 0 };
+		unsigned int offsets[sizeof (locations) / sizeof (locations[0])] = { 0 };
+		Check (stb_vorbis_test_memory_seek_sequence (data, sizeof (data), locations, sizeof (locations) / sizeof (locations[0]), success, eof, offsets) != 0, "Vorbis memory seek test setup");
+		Check (success[0] && !eof[0] && offsets[0] == 0, "Vorbis memory seek offset zero");
+		Check (success[1] && !eof[1] && offsets[1] == 3, "Vorbis memory seek final byte");
+		Check (!success[2] && eof[2] && offsets[2] == 4, "Vorbis memory seek length rejected");
+		Check (success[3] && !eof[3] && offsets[3] == 0, "Vorbis memory seek recovers after rejection");
+		Check (!success[4] && eof[4] && offsets[4] == 4, "Vorbis memory seek past length rejected");
+		Check (!success[5] && eof[5] && offsets[5] == 4, "Vorbis memory seek unsigned maximum rejected");
+	}
+
+	void TestVorbisTemporaryMemoryRequirements ()
+	{
+		unsigned int required = 0;
+		Check (stb_vorbis_test_temp_memory_required (16, 8192, 2, 0, 8192, 1, 1, &required) && required == 1048704, "Vorbis type-2 maximum temporary memory");
+		Check (stb_vorbis_test_temp_memory_required (16, 8192, 0, 0, 8192, 1, 1, &required) && required == 524416, "Vorbis type-0 temporary memory");
+		Check (stb_vorbis_test_temp_memory_required (16, 8192, 1, 0, 8192, 1, 1, &required) && required == 524416, "Vorbis type-1 temporary memory");
+		Check (stb_vorbis_test_temp_memory_required (16, 8192, 2, 8192, UINT_MAX, 1, 1, &required) && required == 16384, "Vorbis temporary memory clamp");
+		Check (!stb_vorbis_test_temp_memory_required (16, 8192, 2, 0, 8192, 0, 1, &required), "Vorbis zero partition size rejected");
+		Check (!stb_vorbis_test_temp_memory_required (16, INT_MAX, 2, 0, UINT_MAX, 1, 1, &required), "Vorbis temporary memory overflow rejected");
+	}
+
+	void TestVorbisResidueShortBlockLayout (std::vector<char> *arena, int arenaLength, int *logicalPartitions, int *rowCapacity, int *channel0Samples, int *channel1Samples, int *bitsConsumed)
+	{
+		memset (&(*arena)[arenaLength], 0xa5, 8);
+		Check (stb_vorbis_test_decode_residue_layout (1, 2, 8192, 128, 4096, &(*arena)[0], arenaLength, logicalPartitions, rowCapacity, channel0Samples, channel1Samples, bitsConsumed) && *logicalPartitions == 128 && *rowCapacity == 128 && *channel0Samples == 128 && *channel1Samples == 128 && *bitsConsumed == 320, "Vorbis type-1 short-block residue decodes each channel within the current frame");
+		Check (memcmp (&(*arena)[arenaLength], "\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", 8) == 0, "Vorbis type-1 short-block residue preserves bounded arena canary");
+	}
+
+	void TestVorbisResidueMaximumType1Layout (std::vector<char> *arena, int arenaLength, int *logicalPartitions, int *rowCapacity, int *channel0Samples, int *channel1Samples, int *bitsConsumed)
+	{
+		memset (&(*arena)[0], 0, arenaLength);
+		memset (&(*arena)[arenaLength], 0xa5, 8);
+		Check (stb_vorbis_test_decode_residue_layout (1, 1, 8192, 4096, 4095, &(*arena)[0], arenaLength, logicalPartitions, rowCapacity, channel0Samples, channel1Samples, bitsConsumed) && *logicalPartitions == 4095 && *rowCapacity == 4095 && *channel0Samples == 4095 && *bitsConsumed == 5119, "Vorbis type-1 residue excludes rounded classification padding from decode");
+	}
+
+	void TestVorbisResidueType2Layout (std::vector<char> *arena, int arenaLength, int *logicalPartitions, int *rowCapacity, int *channel0Samples, int *channel1Samples, int *bitsConsumed)
+	{
+		Check (stb_vorbis_test_decode_residue_layout (2, 2, 8192, 128, 4096, &(*arena)[0], arenaLength, logicalPartitions, rowCapacity, channel0Samples, channel1Samples, bitsConsumed) && *logicalPartitions == 256 && *rowCapacity == 256 && *channel0Samples == 128 && *channel1Samples == 128 && *bitsConsumed == 320, "Vorbis type-2 short-block residue interleaves both channels within the current frame");
+		Check (stb_vorbis_test_decode_residue_layout (2, 2, 8192, 4096, 4095, &(*arena)[0], arenaLength, logicalPartitions, rowCapacity, channel0Samples, channel1Samples, bitsConsumed) && *logicalPartitions == 4095 && *rowCapacity == 4095 && *channel0Samples == 2048 && *channel1Samples == 2047 && *bitsConsumed == 5119, "Vorbis type-2 residue excludes rounded classification padding from decode");
+	}
+
+	void TestVorbisResidueType0Layout (std::vector<char> *arena, int arenaLength, int *logicalPartitions, int *rowCapacity, int *channel0Samples, int *channel1Samples, int *bitsConsumed)
+	{
+		Check (stb_vorbis_test_decode_residue_layout (0, 2, 8192, 128, 4096, &(*arena)[0], arenaLength, logicalPartitions, rowCapacity, channel0Samples, channel1Samples, bitsConsumed) && *logicalPartitions == 128 && *rowCapacity == 128 && *bitsConsumed == 320, "Vorbis type-0 residue preserves packet consumption and bounds coverage");
+		Check (stb_vorbis_test_decode_residue_layout (0, 1, 8192, 4096, 4095, &(*arena)[0], arenaLength, logicalPartitions, rowCapacity, channel0Samples, channel1Samples, bitsConsumed) && *logicalPartitions == 4095 && *rowCapacity == 4095 && *bitsConsumed == 5119, "Vorbis type-0 residue preserves logical packet consumption without a PCM oracle");
+	}
+
+	void TestVorbisResidueMaximumLayout (std::vector<char> *arena, int arenaLength, int *logicalPartitions, int *rowCapacity, int *channel0Samples, int *channel1Samples, int *bitsConsumed)
+	{
+		TestVorbisResidueMaximumType1Layout (arena, arenaLength, logicalPartitions, rowCapacity, channel0Samples, channel1Samples, bitsConsumed);
+		TestVorbisResidueType2Layout (arena, arenaLength, logicalPartitions, rowCapacity, channel0Samples, channel1Samples, bitsConsumed);
+		TestVorbisResidueType0Layout (arena, arenaLength, logicalPartitions, rowCapacity, channel0Samples, channel1Samples, bitsConsumed);
+		Check (memcmp (&(*arena)[arenaLength], "\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", 8) == 0, "Vorbis residue runtime fixture preserves bounded arena canary");
+	}
+
+	void TestVorbisResidueRuntimeLayout ()
+	{
+		const int arenaLength = 65536;
+		std::vector<char> arena (arenaLength + 8, 0);
+		int logicalPartitions = 0;
+		int rowCapacity = 0;
+		int channel0Samples = 0;
+		int channel1Samples = 0;
+		int bitsConsumed = 0;
+		TestVorbisResidueShortBlockLayout (&arena, arenaLength, &logicalPartitions, &rowCapacity, &channel0Samples, &channel1Samples, &bitsConsumed);
+		TestVorbisResidueMaximumLayout (&arena, arenaLength, &logicalPartitions, &rowCapacity, &channel0Samples, &channel1Samples, &bitsConsumed);
+	}
+
+	void TestVorbisPersistentScratch ()
+	{
+		std::vector<unsigned char> bytes;
+		std::vector<char> arena;
+		unsigned int arenaRequired = 0;
+		int error = 0;
+		int scratchFreeCount = 0;
+		int allocationsStable = 0;
+		int arenaOffsetStable = 0;
+		std::string path = FixturePath ("vorbis_mono.ogg");
+		Check (ReadFileBytes (path.c_str (), &bytes) && !bytes.empty (), "Vorbis persistent scratch fixture loads");
+		if (bytes.empty ())
+		{
+			return;
+		}
+		Check (stb_vorbis_test_open_memory_scratch (&bytes[0], (int)bytes.size (), NULL, 0, 0, &arenaRequired, &error, &scratchFreeCount, &allocationsStable, NULL) && error == 0 && scratchFreeCount == 1 && allocationsStable, "Vorbis persistent scratch normal allocation");
+		arena.assign (arenaRequired, 0);
+		Check (!arena.empty () && stb_vorbis_test_open_memory_scratch (&bytes[0], (int)bytes.size (), &arena[0], (int)arena.size (), 0, NULL, &error, &scratchFreeCount, &allocationsStable, &arenaOffsetStable) && error == 0 && scratchFreeCount == 0 && arenaOffsetStable, "Vorbis persistent scratch exact arena");
+		Check (arena.size () > 8 && !stb_vorbis_test_open_memory_scratch (&bytes[0], (int)bytes.size (), &arena[0], (int)arena.size () - 8, 0, NULL, &error, &scratchFreeCount, &allocationsStable, &arenaOffsetStable) && error == stb_vorbis_test_outofmem_error () && scratchFreeCount == 0 && arenaOffsetStable, "Vorbis persistent scratch undersized arena");
+		Check (!stb_vorbis_test_open_memory_scratch (&bytes[0], (int)bytes.size (), NULL, 0, 1, NULL, &error, &scratchFreeCount, &allocationsStable, NULL) && error == stb_vorbis_test_outofmem_error () && scratchFreeCount == 0, "Vorbis persistent scratch allocation failure");
+		Check (!stb_vorbis_test_open_memory_scratch (&bytes[0], (int)bytes.size (), NULL, 0, 2, NULL, &error, &scratchFreeCount, &allocationsStable, NULL) && error == stb_vorbis_test_outofmem_error () && scratchFreeCount == 1, "Vorbis persistent scratch handle allocation failure");
+		Check (stb_vorbis_test_arena_deinit_offset (INT_MAX - 7, &arenaOffsetStable) && arenaOffsetStable, "Vorbis persistent scratch arena close preserves near-limit offset");
 	}
 
 	void TestTimeTags ()
@@ -722,7 +1884,16 @@ int main ()
 	TestId3ProbeContracts ();
 	TestDecoderContract ();
 	TestWavDecoder ();
+	TestMiniaudioWavConversionHelpers ();
+	TestMiniaudioWavReaderBoundaries ();
+	TestTemporaryFixtureCreationFailures ();
+	TestMiniaudioAutoDetectionFallback ();
 	TestCodecFixtures ();
+	TestMiniaudioFlacAllocationLayout ();
+	TestVorbisMemorySeekBoundaries ();
+	TestVorbisTemporaryMemoryRequirements ();
+	TestVorbisResidueRuntimeLayout ();
+	TestVorbisPersistentScratch ();
 	TestTimeTags ();
 	TestVorbisLoopComments ();
 	remove (path);
