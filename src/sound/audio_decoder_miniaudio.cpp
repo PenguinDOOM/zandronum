@@ -310,6 +310,11 @@ bool AudioDecoderTestMiniaudioFlacAllocationLayout (unsigned int maxBlockSize, u
 	return true;
 }
 
+bool AudioDecoderTestMiniaudioFlacCuesheetAlignSize (std::size_t value, std::size_t alignment, std::size_t *result)
+{
+	return ma_dr_flac__cuesheet_align_size (value, alignment, result) != MA_FALSE;
+}
+
 namespace
 {
 	struct FlacSeekpointReader
@@ -323,6 +328,23 @@ namespace
 	{
 		std::size_t SeektableCount;
 		bool RawDataMatchesSeekpoints;
+		std::size_t CuesheetCount;
+		bool CuesheetRawDataLive;
+		std::size_t CuesheetRawDataSize;
+		unsigned int CuesheetTrackCount;
+		bool CuesheetTrackDataAligned;
+		bool CuesheetIndexDataAligned;
+		bool CuesheetIteratorNullOutputAdvanced;
+		bool CuesheetIteratorEOF;
+		unsigned long long CuesheetLeadInSampleCount;
+		unsigned long long CuesheetFirstTrackOffset;
+		unsigned long long CuesheetFirstIndexOffset;
+		unsigned int CuesheetFirstTrackNumber;
+		unsigned int CuesheetFirstIndexNumber;
+		unsigned int CuesheetSecondTrackNumber;
+		bool CuesheetFirstTrackIsAudio;
+		bool CuesheetFirstTrackPreEmphasis;
+		char CuesheetFirstTrackISRC[13];
 		unsigned int SeekpointCount;
 		std::size_t RawDataSize;
 		unsigned long long FirstPCMFrame;
@@ -514,10 +536,135 @@ namespace
 		}
 	}
 
+	struct CuesheetAllocationProbe
+	{
+		std::size_t AllocationCount;
+		std::size_t FreeCount;
+		void *HostPointers[5];
+		void *RawPointers[5];
+		std::size_t AllocationSizes[5];
+		void *FreePointers[5];
+		bool CanaryIntact;
+		std::size_t FailAllocationOrdinal;
+	};
+
+	void *CuesheetAllocationProbeMalloc (std::size_t size, void *userData)
+	{
+		CuesheetAllocationProbe *probe = static_cast<CuesheetAllocationProbe *> (userData);
+		std::size_t allocationOrdinal = ++probe->AllocationCount;
+		unsigned char *host;
+		uintptr_t address;
+		unsigned char *raw;
+		if (probe->FailAllocationOrdinal == allocationOrdinal || allocationOrdinal > 5)
+		{
+			return NULL;
+		}
+		host = static_cast<unsigned char *> (malloc (size + 79));
+		if (host == NULL)
+		{
+			return NULL;
+		}
+		address = ((uintptr_t)host + 15) & ~(uintptr_t)15;
+		if (address % 64 == 0)
+		{
+			address += 16;
+		}
+		raw = reinterpret_cast<unsigned char *> (address);
+		probe->HostPointers[allocationOrdinal - 1] = host;
+		probe->RawPointers[allocationOrdinal - 1] = raw;
+		probe->AllocationSizes[allocationOrdinal - 1] = size;
+		memset (raw + size, 0xa5, 8);
+		return raw;
+	}
+
+	void CuesheetAllocationProbeFree (void *pointer, void *userData)
+	{
+		CuesheetAllocationProbe *probe = static_cast<CuesheetAllocationProbe *> (userData);
+		++probe->FreeCount;
+		if (probe->FreeCount <= 5)
+		{
+			probe->FreePointers[probe->FreeCount - 1] = pointer;
+		}
+		for (std::size_t allocationIndex = 0; allocationIndex < 5; ++allocationIndex)
+		{
+			if (pointer == probe->RawPointers[allocationIndex] && probe->HostPointers[allocationIndex] != NULL)
+			{
+				probe->CanaryIntact = probe->CanaryIntact && memcmp (static_cast<unsigned char *> (pointer) + probe->AllocationSizes[allocationIndex], "\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", 8) == 0;
+				free (probe->HostPointers[allocationIndex]);
+				probe->HostPointers[allocationIndex] = NULL;
+				return;
+			}
+		}
+		probe->CanaryIntact = false;
+	}
+
+	bool CuesheetAllocationProbeHasLiveAllocations (const CuesheetAllocationProbe *probe)
+	{
+		for (std::size_t allocationIndex = 0; allocationIndex < 5; ++allocationIndex)
+		{
+			if (probe->HostPointers[allocationIndex] != NULL)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void CuesheetAllocationProbeReleaseLiveAllocations (CuesheetAllocationProbe *probe)
+	{
+		for (std::size_t allocationIndex = 0; allocationIndex < 5; ++allocationIndex)
+		{
+			if (probe->HostPointers[allocationIndex] != NULL)
+			{
+				free (probe->HostPointers[allocationIndex]);
+				probe->HostPointers[allocationIndex] = NULL;
+			}
+		}
+	}
+
+	struct CuesheetCallbackProbe
+	{
+		CuesheetAllocationProbe Allocation;
+		const unsigned char *Data;
+		std::size_t Bytes;
+		std::size_t Position;
+		bool CallbackObserved;
+		bool RawDataLive;
+		unsigned int TrackCount;
+		bool TrackDataAligned;
+		bool IndexDataAligned;
+		bool IteratorNullOutputAdvanced;
+		bool IteratorEOF;
+		const unsigned char *ExpectedRawData;
+		std::size_t ExpectedRawDataSize;
+		bool RawDataMatchesExpected;
+		std::size_t RawDataSize;
+		bool IsCD;
+		char Catalog[129];
+		unsigned long long LeadInSampleCount;
+		unsigned long long FirstTrackOffset;
+		unsigned long long FirstIndexOffset;
+		unsigned int FirstTrackNumber;
+		unsigned int FirstIndexNumber;
+		unsigned int FirstTrackIndexCount;
+		bool FirstTrackIndexPointerNull;
+		bool FirstTrackIsAudio;
+		bool FirstTrackPreEmphasis;
+		char FirstTrackISRC[13];
+		unsigned long long SecondTrackOffset;
+		unsigned int SecondTrackNumber;
+		unsigned int SecondTrackIndexCount;
+		bool SecondTrackIndexPointerNull;
+		bool SecondTrackIsAudio;
+		bool SecondTrackPreEmphasis;
+		char SecondTrackISRC[13];
+	};
+
 	struct FlacCallbackProbe
 	{
 		FlacAllocationProbe Allocation;
 		FlacMetadataProbe Metadata;
+		CuesheetCallbackProbe Cuesheet;
 		const unsigned char *Data;
 		std::size_t Bytes;
 		std::size_t Position;
@@ -529,6 +676,134 @@ namespace
 		std::size_t ReadPositions[16];
 		std::size_t SeekPositions[16];
 	};
+
+	bool IsLiveCuesheetRawData (const ma_dr_flac_metadata *metadata, const void *const *rawPointers, const void *const *hostPointers, std::size_t allocationCount)
+	{
+		for (std::size_t index = 0; index < allocationCount; ++index)
+		{
+			if (metadata->pRawData == rawPointers[index] && hostPointers[index] != NULL)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool IsLiveCuesheetRange (const void *pointer, std::size_t bytes, const void *const *rawPointers, const void *const *hostPointers, const std::size_t *allocationSizes, std::size_t allocationCount)
+	{
+		uintptr_t begin = reinterpret_cast<uintptr_t> (pointer);
+		for (std::size_t index = 0; index < allocationCount; ++index)
+		{
+			uintptr_t allocationBegin = reinterpret_cast<uintptr_t> (rawPointers[index]);
+			if (hostPointers[index] != NULL && begin >= allocationBegin && begin - allocationBegin <= allocationSizes[index] && bytes <= allocationSizes[index] - (begin - allocationBegin))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void ObserveCuesheetMetadata (ma_dr_flac_metadata *metadata, bool rawDataLive, const void *const *rawPointers, const void *const *hostPointers, const std::size_t *allocationSizes, std::size_t allocationCount, CuesheetCallbackProbe *probe)
+	{
+		ma_dr_flac_cuesheet_track_iterator iterator;
+		ma_dr_flac_cuesheet_track track;
+		if (metadata->type != MA_DR_FLAC_METADATA_BLOCK_TYPE_CUESHEET)
+		{
+			return;
+		}
+		probe->CallbackObserved = true;
+		probe->TrackCount = metadata->data.cuesheet.trackCount;
+		probe->RawDataLive = rawDataLive;
+		probe->RawDataSize = metadata->rawDataSize;
+		if (!probe->RawDataLive)
+		{
+			return;
+		}
+		probe->RawDataMatchesExpected = probe->ExpectedRawData != NULL && probe->RawDataSize == probe->ExpectedRawDataSize && memcmp (metadata->pRawData, probe->ExpectedRawData, probe->RawDataSize) == 0;
+		probe->IsCD = metadata->data.cuesheet.isCD != 0;
+		probe->LeadInSampleCount = metadata->data.cuesheet.leadInSampleCount;
+		memcpy (probe->Catalog, metadata->data.cuesheet.catalog, 128);
+		probe->Catalog[128] = '\0';
+		probe->TrackDataAligned = probe->TrackCount == 0 || (metadata->data.cuesheet.pTrackData != NULL && (reinterpret_cast<uintptr_t> (metadata->data.cuesheet.pTrackData) % alignof (ma_dr_flac_cuesheet_track)) == 0 && IsLiveCuesheetRange (metadata->data.cuesheet.pTrackData, (std::size_t)probe->TrackCount * sizeof (ma_dr_flac_cuesheet_track), rawPointers, hostPointers, allocationSizes, allocationCount));
+		if (!probe->TrackDataAligned)
+		{
+			return;
+		}
+		ma_dr_flac_init_cuesheet_track_iterator (&iterator, probe->TrackCount, metadata->data.cuesheet.pTrackData);
+		if (ma_dr_flac_next_cuesheet_track (&iterator, &track))
+		{
+			probe->FirstTrackOffset = track.offset;
+			probe->FirstTrackNumber = track.trackNumber;
+			probe->FirstTrackIndexCount = track.indexCount;
+			probe->FirstTrackIndexPointerNull = track.pIndexPoints == NULL;
+			probe->FirstTrackIsAudio = track.isAudio != 0;
+			probe->FirstTrackPreEmphasis = track.preEmphasis != 0;
+			memcpy (probe->FirstTrackISRC, track.ISRC, sizeof (track.ISRC));
+			probe->FirstTrackISRC[sizeof (track.ISRC)] = '\0';
+			if (track.indexCount == 0)
+			{
+				probe->IndexDataAligned = track.pIndexPoints == NULL;
+			}
+			else if (track.pIndexPoints != NULL && (reinterpret_cast<uintptr_t> (track.pIndexPoints) % alignof (ma_dr_flac_cuesheet_track_index)) == 0 && IsLiveCuesheetRange (track.pIndexPoints, (std::size_t)track.indexCount * sizeof (ma_dr_flac_cuesheet_track_index), rawPointers, hostPointers, allocationSizes, allocationCount))
+			{
+				probe->IndexDataAligned = true;
+				probe->FirstIndexOffset = track.pIndexPoints[0].offset;
+				probe->FirstIndexNumber = track.pIndexPoints[0].index;
+			}
+			else
+			{
+				return;
+			}
+		}
+		ma_dr_flac_init_cuesheet_track_iterator (&iterator, probe->TrackCount, metadata->data.cuesheet.pTrackData);
+		if (ma_dr_flac_next_cuesheet_track (&iterator, NULL) && ma_dr_flac_next_cuesheet_track (&iterator, &track))
+		{
+			probe->SecondTrackOffset = track.offset;
+			probe->SecondTrackNumber = track.trackNumber;
+			probe->SecondTrackIndexCount = track.indexCount;
+			probe->SecondTrackIndexPointerNull = track.pIndexPoints == NULL;
+			probe->SecondTrackIsAudio = track.isAudio != 0;
+			probe->SecondTrackPreEmphasis = track.preEmphasis != 0;
+			memcpy (probe->SecondTrackISRC, track.ISRC, sizeof (track.ISRC));
+			probe->SecondTrackISRC[sizeof (track.ISRC)] = '\0';
+			probe->IteratorNullOutputAdvanced = true;
+		}
+		probe->IteratorEOF = ma_dr_flac_next_cuesheet_track (&iterator, NULL) == MA_FALSE;
+	}
+
+	size_t CuesheetCallbackProbeRead (void *userData, void *output, size_t bytes)
+	{
+		CuesheetCallbackProbe *probe = static_cast<CuesheetCallbackProbe *> (userData);
+		std::size_t available = probe->Bytes - probe->Position;
+		std::size_t count = available < bytes ? available : bytes;
+		memcpy (output, probe->Data + probe->Position, count);
+		probe->Position += count;
+		return count;
+	}
+
+	ma_bool32 CuesheetCallbackProbeSeek (void *userData, int offset, ma_dr_flac_seek_origin origin)
+	{
+		CuesheetCallbackProbe *probe = static_cast<CuesheetCallbackProbe *> (userData);
+		long long position = origin == MA_DR_FLAC_SEEK_SET ? offset : (long long)probe->Position + offset;
+		if (position < 0 || (unsigned long long)position > probe->Bytes)
+		{
+			return MA_FALSE;
+		}
+		probe->Position = (std::size_t)position;
+		return MA_TRUE;
+	}
+
+	ma_bool32 CuesheetCallbackProbeTell (void *userData, ma_int64 *position)
+	{
+		*position = (ma_int64)static_cast<CuesheetCallbackProbe *> (userData)->Position;
+		return MA_TRUE;
+	}
+
+	void CuesheetCallbackProbeMetadata (void *userData, ma_dr_flac_metadata *metadata)
+	{
+		CuesheetCallbackProbe *probe = static_cast<CuesheetCallbackProbe *> (userData);
+				ObserveCuesheetMetadata (metadata, IsLiveCuesheetRawData (metadata, probe->Allocation.RawPointers, probe->Allocation.HostPointers, 5), probe->Allocation.RawPointers, probe->Allocation.HostPointers, probe->Allocation.AllocationSizes, 5, probe);
+	}
 
 	size_t FlacCallbackProbeRead (void *userData, void *output, size_t bytes)
 	{
@@ -588,6 +863,46 @@ namespace
 				probe->Metadata.PCMFrameCount = metadata->data.seektable.pSeekpoints[0].pcmFrameCount;
 			}
 		}
+		else if (metadata->type == MA_DR_FLAC_METADATA_BLOCK_TYPE_CUESHEET)
+		{
+			++probe->Metadata.CuesheetCount;
+			ObserveCuesheetMetadata (metadata, IsLiveCuesheetRawData (metadata, probe->Allocation.RawPointers, probe->Allocation.HostPointers, 4), probe->Allocation.RawPointers, probe->Allocation.HostPointers, probe->Allocation.AllocationSizes, 4, &probe->Cuesheet);
+		}
+	}
+
+	void CopyCuesheetMetadataReport (AudioDecoderTestMiniaudioFlacCallbackReport *report, const CuesheetCallbackProbe *probe)
+	{
+		report->MetadataCuesheetRawDataLive = probe->RawDataLive;
+		report->MetadataCuesheetRawDataSize = probe->RawDataSize;
+		report->MetadataCuesheetTrackCount = probe->TrackCount;
+		report->MetadataCuesheetTrackDataAligned = probe->TrackDataAligned;
+		report->MetadataCuesheetIndexDataAligned = probe->IndexDataAligned;
+		report->MetadataCuesheetIteratorNullOutputAdvanced = probe->IteratorNullOutputAdvanced;
+		report->MetadataCuesheetIteratorEOF = probe->IteratorEOF;
+		report->MetadataCuesheetLeadInSampleCount = probe->LeadInSampleCount;
+		report->MetadataCuesheetFirstTrackOffset = probe->FirstTrackOffset;
+		report->MetadataCuesheetFirstIndexOffset = probe->FirstIndexOffset;
+		report->MetadataCuesheetFirstTrackNumber = probe->FirstTrackNumber;
+		report->MetadataCuesheetFirstIndexNumber = probe->FirstIndexNumber;
+		report->MetadataCuesheetSecondTrackNumber = probe->SecondTrackNumber;
+		report->MetadataCuesheetFirstTrackIsAudio = probe->FirstTrackIsAudio;
+		report->MetadataCuesheetFirstTrackPreEmphasis = probe->FirstTrackPreEmphasis;
+		memcpy (report->MetadataCuesheetFirstTrackISRC, probe->FirstTrackISRC, sizeof (report->MetadataCuesheetFirstTrackISRC));
+	}
+
+	void CopyCuesheetMetadataDetails (AudioDecoderTestMiniaudioFlacCallbackReport *report, const CuesheetCallbackProbe *probe)
+	{
+		report->MetadataCuesheetRawDataMatchesExpected = probe->RawDataMatchesExpected;
+		report->MetadataCuesheetIsCD = probe->IsCD;
+		memcpy (report->MetadataCuesheetCatalog, probe->Catalog, sizeof (report->MetadataCuesheetCatalog));
+		report->MetadataCuesheetFirstTrackIndexCount = probe->FirstTrackIndexCount;
+		report->MetadataCuesheetFirstTrackIndexPointerNull = probe->FirstTrackIndexPointerNull;
+		report->MetadataCuesheetSecondTrackOffset = probe->SecondTrackOffset;
+		report->MetadataCuesheetSecondTrackIsAudio = probe->SecondTrackIsAudio;
+		report->MetadataCuesheetSecondTrackPreEmphasis = probe->SecondTrackPreEmphasis;
+		memcpy (report->MetadataCuesheetSecondTrackISRC, probe->SecondTrackISRC, sizeof (report->MetadataCuesheetSecondTrackISRC));
+		report->MetadataCuesheetSecondTrackIndexCount = probe->SecondTrackIndexCount;
+		report->MetadataCuesheetSecondTrackIndexPointerNull = probe->SecondTrackIndexPointerNull;
 	}
 }
 
@@ -615,15 +930,24 @@ bool AudioDecoderTestMiniaudioFlacAllocationOwnership (const unsigned char *data
 	return aligned && probe.CanaryIntact && probe.AllocationCount == 1 && probe.FreeCount == 1 && probe.FreePointers[0] == probe.RawPointers[0];
 }
 
-bool AudioDecoderTestMiniaudioFlacCallbackOpen (const unsigned char *data, std::size_t bytes, bool withMetadata, bool reallocOnly, std::size_t failAllocationOrdinal, std::size_t failReadPosition, std::size_t failSeekOrdinal, std::size_t failSeekPosition, AudioDecoderTestMiniaudioFlacCallbackReport *report, bool corruptCanaryBeforeClose)
+bool AudioDecoderTestMiniaudioFlacCallbackOpen (const unsigned char *data, std::size_t bytes, bool withMetadata, bool reallocOnly, std::size_t failAllocationOrdinal, std::size_t failReadPosition, std::size_t failSeekOrdinal, std::size_t failSeekPosition, AudioDecoderTestMiniaudioFlacCallbackReport *report, bool corruptCanaryBeforeClose, const unsigned char *expectedCuesheetRawData, std::size_t expectedCuesheetRawDataSize)
 {
-	FlacCallbackProbe probe = { { 0, 0, 0, { NULL }, { NULL }, { 0 }, { NULL }, true, false, failAllocationOrdinal }, { 0, false, 0, 0, 0, 0, 0 }, data, bytes, 0, 0, 0, failReadPosition, failSeekOrdinal, failSeekPosition, { 0 }, { 0 } };
+	FlacCallbackProbe probe = {};
 	ma_allocation_callbacks callbacks;
 	ma_dr_flac *flac;
 	if (data == NULL || report == NULL)
 	{
 		return false;
 	}
+	probe.Allocation.CanaryIntact = true;
+	probe.Allocation.FailAllocationOrdinal = failAllocationOrdinal;
+	probe.Data = data;
+	probe.Bytes = bytes;
+	probe.FailReadPosition = failReadPosition;
+	probe.FailSeekOrdinal = failSeekOrdinal;
+	probe.FailSeekPosition = failSeekPosition;
+	probe.Cuesheet.ExpectedRawData = expectedCuesheetRawData;
+	probe.Cuesheet.ExpectedRawDataSize = expectedCuesheetRawDataSize;
 	callbacks.pUserData = &probe;
 	callbacks.onMalloc = reallocOnly ? NULL : FlacAllocationProbeMalloc;
 	callbacks.onRealloc = reallocOnly ? FlacAllocationProbeRealloc : NULL;
@@ -635,6 +959,9 @@ bool AudioDecoderTestMiniaudioFlacCallbackOpen (const unsigned char *data, std::
 	report->SeekpointCount = flac == NULL ? 0 : flac->seekpointCount;
 	report->MetadataSeektableCount = probe.Metadata.SeektableCount;
 	report->MetadataRawDataMatchesSeekpoints = probe.Metadata.RawDataMatchesSeekpoints;
+	report->MetadataCuesheetCount = probe.Metadata.CuesheetCount;
+	CopyCuesheetMetadataReport (report, &probe.Cuesheet);
+	CopyCuesheetMetadataDetails (report, &probe.Cuesheet);
 	report->MetadataRawDataSize = probe.Metadata.RawDataSize;
 	report->MetadataSeekpointCount = probe.Metadata.SeekpointCount;
 	report->MetadataFirstPCMFrame = probe.Metadata.FirstPCMFrame;
@@ -661,6 +988,70 @@ bool AudioDecoderTestMiniaudioFlacCallbackOpen (const unsigned char *data, std::
 	bool allocationsReleased = !FlacAllocationProbeHasLiveAllocations (&probe.Allocation);
 	FlacAllocationProbeReleaseLiveAllocations (&probe.Allocation);
 	return allocationsReleased && FlacAllocationProbeVerifyStaleRawPointerReuse ();
+}
+
+bool AudioDecoderTestMiniaudioOggFlacCuesheetCallbackOpen (const unsigned char *data, std::size_t bytes, std::size_t failAllocationOrdinal, AudioDecoderTestMiniaudioCuesheetCallbackReport *report, const unsigned char *expectedCuesheetRawData, std::size_t expectedCuesheetRawDataSize)
+{
+	CuesheetCallbackProbe probe = {};
+	ma_allocation_callbacks callbacks;
+	ma_dr_flac *flac;
+	if (data == NULL || report == NULL)
+	{
+		return false;
+	}
+	probe.Allocation.CanaryIntact = true;
+	probe.Allocation.FailAllocationOrdinal = failAllocationOrdinal;
+	probe.Data = data;
+	probe.Bytes = bytes;
+	probe.ExpectedRawData = expectedCuesheetRawData;
+	probe.ExpectedRawDataSize = expectedCuesheetRawDataSize;
+	callbacks.pUserData = &probe;
+	callbacks.onMalloc = CuesheetAllocationProbeMalloc;
+	callbacks.onRealloc = NULL;
+	callbacks.onFree = CuesheetAllocationProbeFree;
+	flac = ma_dr_flac_open_with_metadata (CuesheetCallbackProbeRead, CuesheetCallbackProbeSeek, CuesheetCallbackProbeTell, CuesheetCallbackProbeMetadata, &probe, &callbacks);
+	memset (report, 0, sizeof (*report));
+	report->Opened = flac != NULL;
+	if (flac != NULL)
+	{
+		ma_dr_flac_close (flac);
+	}
+	report->CallbackObserved = probe.CallbackObserved;
+	report->CanaryIntact = probe.Allocation.CanaryIntact;
+	report->MallocCount = probe.Allocation.AllocationCount;
+	report->FreeCount = probe.Allocation.FreeCount;
+	report->MetadataRawDataLive = probe.RawDataLive;
+	report->MetadataTrackCount = probe.TrackCount;
+	report->MetadataTrackDataAligned = probe.TrackDataAligned;
+	report->MetadataIndexDataAligned = probe.IndexDataAligned;
+	report->MetadataIteratorNullOutputAdvanced = probe.IteratorNullOutputAdvanced;
+	report->MetadataIteratorEOF = probe.IteratorEOF;
+	report->MetadataRawDataMatchesExpected = probe.RawDataMatchesExpected;
+	report->MetadataRawDataSize = probe.RawDataSize;
+	report->MetadataIsCD = probe.IsCD;
+	memcpy (report->MetadataCatalog, probe.Catalog, sizeof (report->MetadataCatalog));
+	report->MetadataLeadInSampleCount = probe.LeadInSampleCount;
+	report->MetadataFirstTrackOffset = probe.FirstTrackOffset;
+	report->MetadataFirstIndexOffset = probe.FirstIndexOffset;
+	report->MetadataFirstTrackNumber = probe.FirstTrackNumber;
+	report->MetadataFirstIndexNumber = probe.FirstIndexNumber;
+	report->MetadataFirstTrackIndexCount = probe.FirstTrackIndexCount;
+	report->MetadataFirstTrackIndexPointerNull = probe.FirstTrackIndexPointerNull;
+	report->MetadataFirstTrackIsAudio = probe.FirstTrackIsAudio;
+	report->MetadataFirstTrackPreEmphasis = probe.FirstTrackPreEmphasis;
+	memcpy (report->MetadataFirstTrackISRC, probe.FirstTrackISRC, sizeof (report->MetadataFirstTrackISRC));
+	report->MetadataSecondTrackOffset = probe.SecondTrackOffset;
+	report->MetadataSecondTrackNumber = probe.SecondTrackNumber;
+	report->MetadataSecondTrackIndexCount = probe.SecondTrackIndexCount;
+	report->MetadataSecondTrackIndexPointerNull = probe.SecondTrackIndexPointerNull;
+	report->MetadataSecondTrackIsAudio = probe.SecondTrackIsAudio;
+	report->MetadataSecondTrackPreEmphasis = probe.SecondTrackPreEmphasis;
+	memcpy (report->MetadataSecondTrackISRC, probe.SecondTrackISRC, sizeof (report->MetadataSecondTrackISRC));
+	memcpy (report->AllocationPointers, probe.Allocation.RawPointers, sizeof (report->AllocationPointers));
+	memcpy (report->FreePointers, probe.Allocation.FreePointers, sizeof (report->FreePointers));
+	bool allocationsReleased = !CuesheetAllocationProbeHasLiveAllocations (&probe.Allocation);
+	CuesheetAllocationProbeReleaseLiveAllocations (&probe.Allocation);
+	return allocationsReleased;
 }
 
 bool AudioDecoderTestMiniaudioOggFlacDecode (const unsigned char *data, std::size_t bytes, unsigned long long seekFrame, std::size_t failAllocationOrdinal, unsigned long long *totalPCMFrames, unsigned long long *pcmHash, short *firstSample, short *seekSample, AudioDecoderTestMiniaudioFlacCallbackReport *report)
@@ -743,7 +1134,7 @@ bool AudioDecoderTestMiniaudioFlacDecodeSeekpoint (const unsigned char *data, st
 
 bool AudioDecoderTestMiniaudioFlacOpenSeektable (const unsigned char *data, std::size_t bytes, bool withMetadata, unsigned int *seekpointCount, unsigned long long *firstPCMFrame, unsigned long long *flacFrameOffset, unsigned int *pcmFrameCount, unsigned int *metadataRawDataSize)
 {
-	FlacMetadataProbe metadata = { 0, false, 0, 0, 0, 0, 0 };
+	FlacMetadataProbe metadata = {};
 	ma_dr_flac *flac = withMetadata ? ma_dr_flac_open_memory_with_metadata (data, bytes, FlacMetadataProbeCallback, &metadata, NULL) : ma_dr_flac_open_memory (data, bytes, NULL);
 	if (flac == NULL)
 	{

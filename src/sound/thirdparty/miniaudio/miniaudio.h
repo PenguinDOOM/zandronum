@@ -88729,6 +88729,110 @@ static ma_bool32 ma_dr_flac__read_seekpoint(ma_dr_flac_read_proc onRead, void* p
     pSeekpoint->pcmFrameCount   = ma_dr_flac__be2host_16(pcmFrameCount);
     return MA_TRUE;
 }
+#ifdef __cplusplus
+    #define MA_DR_FLAC_CUESHEET_ALIGN_OF(type) alignof(type)
+#elif defined(_MSC_VER)
+    #define MA_DR_FLAC_CUESHEET_ALIGN_OF(type) __alignof(type)
+#else
+    #define MA_DR_FLAC_CUESHEET_ALIGN_OF(type) __alignof__(type)
+#endif
+static ma_bool32 ma_dr_flac__cuesheet_add_size(size_t a, size_t b, size_t* pResult)
+{
+    if (a > MA_SIZE_MAX - b) {
+        return MA_FALSE;
+    }
+    *pResult = a + b;
+    return MA_TRUE;
+}
+static ma_bool32 ma_dr_flac__cuesheet_multiply_size(size_t a, size_t b, size_t* pResult)
+{
+    if (a != 0 && b > MA_SIZE_MAX / a) {
+        return MA_FALSE;
+    }
+    *pResult = a * b;
+    return MA_TRUE;
+}
+static ma_bool32 ma_dr_flac__cuesheet_align_size(size_t value, size_t alignment, size_t* pResult)
+{
+    size_t remainder;
+    if (alignment == 0) {
+        return MA_FALSE;
+    }
+    remainder = value % alignment;
+    if (remainder == 0) {
+        *pResult = value;
+        return MA_TRUE;
+    }
+    return ma_dr_flac__cuesheet_add_size(value, alignment - remainder, pResult);
+}
+static ma_bool32 ma_dr_flac__cuesheet_validate(const ma_uint8* pData, size_t dataSize, ma_uint8 trackCount, size_t* pIndexCount)
+{
+    size_t remaining;
+    size_t indexCount = 0;
+    ma_uint8 iTrack;
+    if (dataSize < 396) {
+        return MA_FALSE;
+    }
+    pData += 396;
+    remaining = dataSize - 396;
+    for (iTrack = 0; iTrack < trackCount; ++iTrack) {
+        ma_uint8 trackIndexCount;
+        if (remaining < MA_DR_FLAC_CUESHEET_TRACK_SIZE_IN_BYTES) {
+            return MA_FALSE;
+        }
+        trackIndexCount = pData[35];
+        if (trackIndexCount > (remaining - MA_DR_FLAC_CUESHEET_TRACK_SIZE_IN_BYTES) / MA_DR_FLAC_CUESHEET_TRACK_INDEX_SIZE_IN_BYTES || !ma_dr_flac__cuesheet_add_size(indexCount, trackIndexCount, &indexCount)) {
+            return MA_FALSE;
+        }
+        pData += MA_DR_FLAC_CUESHEET_TRACK_SIZE_IN_BYTES + trackIndexCount * MA_DR_FLAC_CUESHEET_TRACK_INDEX_SIZE_IN_BYTES;
+        remaining -= MA_DR_FLAC_CUESHEET_TRACK_SIZE_IN_BYTES + trackIndexCount * MA_DR_FLAC_CUESHEET_TRACK_INDEX_SIZE_IN_BYTES;
+    }
+    *pIndexCount = indexCount;
+    return MA_TRUE;
+}
+static ma_bool32 ma_dr_flac__cuesheet_storage_size(size_t trackCount, size_t indexCount, size_t* pIndexOffset, size_t* pStorageSize)
+{
+    size_t trackBytes;
+    size_t indexBytes;
+    size_t alignment = MA_DR_FLAC_CUESHEET_ALIGN_OF(ma_dr_flac_cuesheet_track);
+    if (alignment < MA_DR_FLAC_CUESHEET_ALIGN_OF(ma_dr_flac_cuesheet_track_index)) {
+        alignment = MA_DR_FLAC_CUESHEET_ALIGN_OF(ma_dr_flac_cuesheet_track_index);
+    }
+    if (!ma_dr_flac__cuesheet_multiply_size(trackCount, sizeof(ma_dr_flac_cuesheet_track), &trackBytes) || !ma_dr_flac__cuesheet_multiply_size(indexCount, sizeof(ma_dr_flac_cuesheet_track_index), &indexBytes) || !ma_dr_flac__cuesheet_align_size(trackBytes, MA_DR_FLAC_CUESHEET_ALIGN_OF(ma_dr_flac_cuesheet_track_index), pIndexOffset) || !ma_dr_flac__cuesheet_add_size(*pIndexOffset, indexBytes, pStorageSize)) {
+        return MA_FALSE;
+    }
+    return ma_dr_flac__cuesheet_add_size(*pStorageSize, alignment - 1, pStorageSize);
+}
+static ma_uint64 ma_dr_flac__cuesheet_read_uint64(const ma_uint8* pData)
+{
+    ma_uint64 value;
+    MA_DR_FLAC_COPY_MEMORY(&value, pData, sizeof(value));
+    return ma_dr_flac__be2host_64(value);
+}
+static void ma_dr_flac__cuesheet_decode_tracks(const ma_uint8* pData, ma_uint8 trackCount, ma_dr_flac_cuesheet_track* pTracks, ma_dr_flac_cuesheet_track_index* pIndices)
+{
+    ma_uint8 iTrack;
+    pData += 396;
+    for (iTrack = 0; iTrack < trackCount; ++iTrack) {
+        ma_dr_flac_cuesheet_track* pTrack = pTracks + iTrack;
+        ma_uint8 iIndex;
+        pTrack->offset = ma_dr_flac__cuesheet_read_uint64(pData);
+        pTrack->trackNumber = pData[8];
+        MA_DR_FLAC_COPY_MEMORY(pTrack->ISRC, pData + 9, sizeof(pTrack->ISRC));
+        pTrack->isAudio = (pData[21] & 0x80) != 0;
+        pTrack->preEmphasis = (pData[21] & 0x40) != 0;
+        pTrack->indexCount = pData[35];
+        pTrack->pIndexPoints = pTrack->indexCount == 0 ? NULL : pIndices;
+        pData += MA_DR_FLAC_CUESHEET_TRACK_SIZE_IN_BYTES;
+        for (iIndex = 0; iIndex < pTrack->indexCount; ++iIndex) {
+            pIndices->offset = ma_dr_flac__cuesheet_read_uint64(pData);
+            pIndices->index = pData[8];
+            MA_DR_FLAC_COPY_MEMORY(pIndices->reserved, pData + 9, sizeof(pIndices->reserved));
+            pData += MA_DR_FLAC_CUESHEET_TRACK_INDEX_SIZE_IN_BYTES;
+            pIndices += 1;
+        }
+    }
+}
 static ma_bool32 ma_dr_flac__read_and_decode_metadata(ma_dr_flac_read_proc onRead, ma_dr_flac_seek_proc onSeek, ma_dr_flac_tell_proc onTell, ma_dr_flac_meta_proc onMeta, void* pUserData, void* pUserDataMD, ma_uint64* pFirstFramePos, ma_uint64* pSeektablePos, ma_uint32* pSeekpointCount, ma_allocation_callbacks* pAllocationCallbacks)
 {
     ma_uint64 runningFilePos = 42;
@@ -88871,13 +88975,15 @@ static ma_bool32 ma_dr_flac__read_and_decode_metadata(ma_dr_flac_read_proc onRea
                     return MA_FALSE;
                 }
                 if (onMeta) {
-                    void* pRawData;
-                    const char* pRunningData;
-                    const char* pRunningDataEnd;
-                    size_t bufferSize;
-                    ma_uint8 iTrack;
-                    ma_uint8 iIndex;
-                    void* pTrackData;
+                    void* pRawData = NULL;
+                    void* pTrackData = NULL;
+                    ma_uint8* pStorage;
+                    ma_dr_flac_cuesheet_track* pTracks;
+                    ma_dr_flac_cuesheet_track_index* pIndices;
+                    size_t indexCount;
+                    size_t indexOffset;
+                    size_t storageSize;
+                    size_t alignment;
                     pRawData = ma_dr_flac__malloc_from_callbacks(blockSize, pAllocationCallbacks);
                     if (pRawData == NULL) {
                         return MA_FALSE;
@@ -88888,67 +88994,47 @@ static ma_bool32 ma_dr_flac__read_and_decode_metadata(ma_dr_flac_read_proc onRea
                     }
                     metadata.pRawData = pRawData;
                     metadata.rawDataSize = blockSize;
-                    pRunningData    = (const char*)pRawData;
-                    pRunningDataEnd = (const char*)pRawData + blockSize;
-                    MA_DR_FLAC_COPY_MEMORY(metadata.data.cuesheet.catalog, pRunningData, 128);                              pRunningData += 128;
-                    metadata.data.cuesheet.leadInSampleCount = ma_dr_flac__be2host_64(*(const ma_uint64*)pRunningData); pRunningData += 8;
-                    metadata.data.cuesheet.isCD              = (pRunningData[0] & 0x80) != 0;                           pRunningData += 259;
-                    metadata.data.cuesheet.trackCount        = pRunningData[0];                                         pRunningData += 1;
+                    MA_DR_FLAC_COPY_MEMORY(metadata.data.cuesheet.catalog, pRawData, sizeof(metadata.data.cuesheet.catalog));
+                    metadata.data.cuesheet.leadInSampleCount = ma_dr_flac__cuesheet_read_uint64((const ma_uint8*)pRawData + 128);
+                    metadata.data.cuesheet.isCD = (((const ma_uint8*)pRawData)[136] & 0x80) != 0;
+                    metadata.data.cuesheet.trackCount = ((const ma_uint8*)pRawData)[395];
                     metadata.data.cuesheet.pTrackData        = NULL;
-                    {
-                        const char* pRunningDataSaved = pRunningData;
-                        bufferSize = metadata.data.cuesheet.trackCount * MA_DR_FLAC_CUESHEET_TRACK_SIZE_IN_BYTES;
-                        for (iTrack = 0; iTrack < metadata.data.cuesheet.trackCount; ++iTrack) {
-                            ma_uint8 indexCount;
-                            ma_uint32 indexPointSize;
-                            if (pRunningDataEnd - pRunningData < MA_DR_FLAC_CUESHEET_TRACK_SIZE_IN_BYTES) {
-                                ma_dr_flac__free_from_callbacks(pRawData, pAllocationCallbacks);
-                                return MA_FALSE;
-                            }
-                            pRunningData += 35;
-                            indexCount = pRunningData[0];
-                            pRunningData += 1;
-                            bufferSize += indexCount * sizeof(ma_dr_flac_cuesheet_track_index);
-                            indexPointSize = indexCount * MA_DR_FLAC_CUESHEET_TRACK_INDEX_SIZE_IN_BYTES;
-                            if (pRunningDataEnd - pRunningData < (ma_int64)indexPointSize) {
-                                ma_dr_flac__free_from_callbacks(pRawData, pAllocationCallbacks);
-                                return MA_FALSE;
-                            }
-                            pRunningData += indexPointSize;
-                        }
-                        pRunningData = pRunningDataSaved;
+                    if (!ma_dr_flac__cuesheet_validate((const ma_uint8*)pRawData, blockSize, metadata.data.cuesheet.trackCount, &indexCount)) {
+                        ma_dr_flac__free_from_callbacks(pRawData, pAllocationCallbacks);
+                        return MA_FALSE;
                     }
-                    {
-                        char* pRunningTrackData;
-                        pTrackData = ma_dr_flac__malloc_from_callbacks(bufferSize, pAllocationCallbacks);
+                    if (metadata.data.cuesheet.trackCount > 0 && !ma_dr_flac__cuesheet_storage_size(metadata.data.cuesheet.trackCount, indexCount, &indexOffset, &storageSize)) {
+                        ma_dr_flac__free_from_callbacks(pRawData, pAllocationCallbacks);
+                        return MA_FALSE;
+                    }
+                    if (metadata.data.cuesheet.trackCount > 0) {
+                        pTrackData = ma_dr_flac__malloc_from_callbacks(storageSize, pAllocationCallbacks);
                         if (pTrackData == NULL) {
                             ma_dr_flac__free_from_callbacks(pRawData, pAllocationCallbacks);
                             return MA_FALSE;
                         }
-                        pRunningTrackData = (char*)pTrackData;
-                        for (iTrack = 0; iTrack < metadata.data.cuesheet.trackCount; ++iTrack) {
-                            ma_uint8 indexCount;
-                            MA_DR_FLAC_COPY_MEMORY(pRunningTrackData, pRunningData, MA_DR_FLAC_CUESHEET_TRACK_SIZE_IN_BYTES);
-                            pRunningData      += MA_DR_FLAC_CUESHEET_TRACK_SIZE_IN_BYTES-1;
-                            pRunningTrackData += MA_DR_FLAC_CUESHEET_TRACK_SIZE_IN_BYTES-1;
-                            indexCount = pRunningData[0];
-                            pRunningData      += 1;
-                            pRunningTrackData += 1;
-                            for (iIndex = 0; iIndex < indexCount; ++iIndex) {
-                                ma_dr_flac_cuesheet_track_index* pTrackIndex = (ma_dr_flac_cuesheet_track_index*)pRunningTrackData;
-                                MA_DR_FLAC_COPY_MEMORY(pRunningTrackData, pRunningData, MA_DR_FLAC_CUESHEET_TRACK_INDEX_SIZE_IN_BYTES);
-                                pRunningData      += MA_DR_FLAC_CUESHEET_TRACK_INDEX_SIZE_IN_BYTES;
-                                pRunningTrackData += sizeof(ma_dr_flac_cuesheet_track_index);
-                                pTrackIndex->offset = ma_dr_flac__be2host_64(pTrackIndex->offset);
-                            }
+                        alignment = MA_DR_FLAC_CUESHEET_ALIGN_OF(ma_dr_flac_cuesheet_track);
+                        if (alignment < MA_DR_FLAC_CUESHEET_ALIGN_OF(ma_dr_flac_cuesheet_track_index)) {
+                            alignment = MA_DR_FLAC_CUESHEET_ALIGN_OF(ma_dr_flac_cuesheet_track_index);
                         }
-                        metadata.data.cuesheet.pTrackData = pTrackData;
+                        pStorage = (ma_uint8*)pTrackData;
+                        if ((ma_uintptr)pStorage % alignment != 0) {
+                            pStorage += alignment - (ma_uintptr)pStorage % alignment;
+                        }
+                    #ifdef __cplusplus
+                        pStorage = new (pStorage) ma_uint8[storageSize - (size_t)(pStorage - (ma_uint8*)pTrackData)];
+                        pTracks = new (pStorage) ma_dr_flac_cuesheet_track[metadata.data.cuesheet.trackCount];
+                        pIndices = indexCount == 0 ? NULL : new (pStorage + indexOffset) ma_dr_flac_cuesheet_track_index[indexCount];
+                    #else
+                        pTracks = (ma_dr_flac_cuesheet_track*)pStorage;
+                        pIndices = indexCount == 0 ? NULL : (ma_dr_flac_cuesheet_track_index*)(pStorage + indexOffset);
+                    #endif
+                        ma_dr_flac__cuesheet_decode_tracks((const ma_uint8*)pRawData, metadata.data.cuesheet.trackCount, pTracks, pIndices);
+                        metadata.data.cuesheet.pTrackData = pTracks;
                     }
-                    ma_dr_flac__free_from_callbacks(pRawData, pAllocationCallbacks);
-                    pRawData = NULL;
                     onMeta(pUserDataMD, &metadata);
                     ma_dr_flac__free_from_callbacks(pTrackData, pAllocationCallbacks);
-                    pTrackData = NULL;
+                    ma_dr_flac__free_from_callbacks(pRawData, pAllocationCallbacks);
                 }
             } break;
             case MA_DR_FLAC_METADATA_BLOCK_TYPE_PICTURE:
@@ -92852,27 +92938,15 @@ MA_API void ma_dr_flac_init_cuesheet_track_iterator(ma_dr_flac_cuesheet_track_it
 }
 MA_API ma_bool32 ma_dr_flac_next_cuesheet_track(ma_dr_flac_cuesheet_track_iterator* pIter, ma_dr_flac_cuesheet_track* pCuesheetTrack)
 {
-    ma_dr_flac_cuesheet_track cuesheetTrack;
-    const char* pRunningData;
-    ma_uint64 offsetHi;
-    ma_uint64 offsetLo;
+    const ma_dr_flac_cuesheet_track* pTrack;
     if (pIter == NULL || pIter->countRemaining == 0 || pIter->pRunningData == NULL) {
         return MA_FALSE;
     }
-    pRunningData = pIter->pRunningData;
-    offsetHi                   = ma_dr_flac__be2host_32(*(const ma_uint32*)pRunningData); pRunningData += 4;
-    offsetLo                   = ma_dr_flac__be2host_32(*(const ma_uint32*)pRunningData); pRunningData += 4;
-    cuesheetTrack.offset       = offsetLo | (offsetHi << 32);
-    cuesheetTrack.trackNumber  = pRunningData[0];                                         pRunningData += 1;
-    MA_DR_FLAC_COPY_MEMORY(cuesheetTrack.ISRC, pRunningData, sizeof(cuesheetTrack.ISRC));     pRunningData += 12;
-    cuesheetTrack.isAudio      = (pRunningData[0] & 0x80) != 0;
-    cuesheetTrack.preEmphasis  = (pRunningData[0] & 0x40) != 0;                           pRunningData += 14;
-    cuesheetTrack.indexCount   = pRunningData[0];                                         pRunningData += 1;
-    cuesheetTrack.pIndexPoints = (const ma_dr_flac_cuesheet_track_index*)pRunningData;        pRunningData += cuesheetTrack.indexCount * sizeof(ma_dr_flac_cuesheet_track_index);
-    pIter->pRunningData = pRunningData;
+    pTrack = (const ma_dr_flac_cuesheet_track*)pIter->pRunningData;
+    pIter->pRunningData = (const char*)(pTrack + 1);
     pIter->countRemaining -= 1;
     if (pCuesheetTrack) {
-        *pCuesheetTrack = cuesheetTrack;
+        *pCuesheetTrack = *pTrack;
     }
     return MA_TRUE;
 }

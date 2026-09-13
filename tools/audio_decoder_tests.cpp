@@ -228,6 +228,63 @@ namespace
 		return true;
 	}
 
+	bool MakeFlacWithCuesheet (const std::vector<unsigned char> &nativeFlac, std::vector<unsigned char> *cuesheetFlac, bool withIndexes = true)
+	{
+		std::vector<FlacMetadataBlock> blocks;
+		std::size_t audioOffset;
+		std::size_t commentIndex = (std::size_t)-1;
+		if (cuesheetFlac == NULL || !ParseNativeFlacMetadata (nativeFlac, &blocks, &audioOffset) || blocks.empty () || blocks[0].Type != 0 || blocks[0].Bytes != 38)
+		{
+			return false;
+		}
+		for (std::size_t index = 1; index < blocks.size (); ++index)
+		{
+			if (blocks[index].Type == 4)
+			{
+				commentIndex = index;
+				break;
+			}
+		}
+		if (commentIndex == (std::size_t)-1)
+		{
+			return false;
+		}
+		cuesheetFlac->clear ();
+		cuesheetFlac->insert (cuesheetFlac->end (), "fLaC", "fLaC" + 4);
+		cuesheetFlac->insert (cuesheetFlac->end (), nativeFlac.begin () + blocks[0].Offset, nativeFlac.begin () + blocks[0].Offset + blocks[0].Bytes);
+		(*cuesheetFlac)[4] &= 0x7f;
+		cuesheetFlac->insert (cuesheetFlac->end (), nativeFlac.begin () + blocks[commentIndex].Offset, nativeFlac.begin () + blocks[commentIndex].Offset + blocks[commentIndex].Bytes);
+		(*cuesheetFlac)[4 + blocks[0].Bytes] &= 0x7f;
+		cuesheetFlac->push_back (0x85);
+		AppendBE24 (*cuesheetFlac, withIndexes ? 480 : 468);
+		cuesheetFlac->insert (cuesheetFlac->end (), 128, 0);
+		(*cuesheetFlac)[cuesheetFlac->size () - 128] = 'C';
+		AppendBE64 (*cuesheetFlac, 0x0123456789abcdefULL);
+		cuesheetFlac->push_back (0x80);
+		cuesheetFlac->insert (cuesheetFlac->end (), 258, 0);
+		cuesheetFlac->push_back (2);
+		AppendBE64 (*cuesheetFlac, 0x1020304050607080ULL);
+		cuesheetFlac->push_back (1);
+		cuesheetFlac->insert (cuesheetFlac->end (), "CUESHEETISRC", "CUESHEETISRC" + 12);
+		cuesheetFlac->push_back (0xc0);
+		cuesheetFlac->insert (cuesheetFlac->end (), 13, 0);
+		cuesheetFlac->push_back (withIndexes ? 1 : 0);
+		if (withIndexes)
+		{
+			AppendBE64 (*cuesheetFlac, 0x8899aabbccddeeffULL);
+			cuesheetFlac->push_back (7);
+			cuesheetFlac->insert (cuesheetFlac->end (), 3, 0);
+		}
+		AppendBE64 (*cuesheetFlac, 0xfedcba9876543210ULL);
+		cuesheetFlac->push_back (170);
+		cuesheetFlac->insert (cuesheetFlac->end (), 12, 0);
+		cuesheetFlac->push_back (0);
+		cuesheetFlac->insert (cuesheetFlac->end (), 13, 0);
+		cuesheetFlac->push_back (0);
+		cuesheetFlac->insert (cuesheetFlac->end (), nativeFlac.begin () + audioOffset, nativeFlac.end ());
+		return true;
+	}
+
 	bool MakeOggFlac (const std::vector<unsigned char> &nativeFlac, unsigned long long totalPCMFrames, std::vector<unsigned char> *oggFlac)
 	{
 		std::vector<unsigned char> mapping;
@@ -1411,6 +1468,8 @@ namespace
 		std::size_t decodedSamplesOffset = 0;
 		std::size_t decodedSampleCount = 0;
 		std::size_t seekpointsOffset = 0;
+		std::size_t alignedSize = 123;
+		Check (AudioDecoderTestMiniaudioFlacCuesheetAlignSize (64, 8, &alignedSize) && alignedSize == 64, "miniaudio CUESHEET aligned storage size writes result");
 		Check (AudioDecoderTestMiniaudioFlacAllocationLayout (4096, 2, 3, false, &allocationSize, &decodedSamplesOffset, &decodedSampleCount, &seekpointsOffset), "miniaudio FLAC allocation layout accepts stereo stream");
 		Check (allocationSize >= decodedSamplesOffset + decodedSampleCount * sizeof (int) && seekpointsOffset >= decodedSamplesOffset + decodedSampleCount * sizeof (int) && allocationSize >= seekpointsOffset + 3 * 18, "miniaudio FLAC allocation layout reserves SIMD alignment margin");
 		Check (!AudioDecoderTestMiniaudioFlacAllocationLayout (UINT_MAX, UINT_MAX, UINT_MAX, false, &allocationSize, &decodedSamplesOffset, &decodedSampleCount, &seekpointsOffset), "miniaudio FLAC allocation layout rejects overflow");
@@ -1424,6 +1483,196 @@ namespace
 		std::size_t freeCount = 0;
 		Check (ReadFileBytes (FixturePath ("flac_mono.flac").c_str (), &flac) && AudioDecoderTestMiniaudioFlacAllocationOwnership (&flac[0], flac.size (), &allocationCount, &freeCount), "miniaudio FLAC preserves callback parent allocation ownership");
 		Check (allocationCount == 1 && freeCount == 1, "miniaudio FLAC releases its parent allocation once");
+	}
+
+	bool HasExpectedNativeCuesheetHeader (const AudioDecoderTestMiniaudioFlacCallbackReport &callbacks)
+	{
+		return callbacks.Opened && callbacks.MetadataCuesheetCount == 1 && callbacks.MetadataCuesheetRawDataSize == 480 && callbacks.MetadataCuesheetRawDataLive && callbacks.MetadataCuesheetRawDataMatchesExpected && callbacks.MetadataCuesheetIsCD && callbacks.MetadataCuesheetCatalog[0] == 'C' && callbacks.MetadataCuesheetTrackCount == 2 && callbacks.MetadataCuesheetTrackDataAligned && callbacks.MetadataCuesheetIndexDataAligned;
+	}
+
+	bool HasExpectedNativeCuesheetFirstTrack (const AudioDecoderTestMiniaudioFlacCallbackReport &callbacks)
+	{
+		return callbacks.MetadataCuesheetLeadInSampleCount == 0x0123456789abcdefULL && callbacks.MetadataCuesheetFirstTrackOffset == 0x1020304050607080ULL && callbacks.MetadataCuesheetFirstIndexOffset == 0x8899aabbccddeeffULL && callbacks.MetadataCuesheetFirstTrackNumber == 1 && callbacks.MetadataCuesheetFirstIndexNumber == 7 && callbacks.MetadataCuesheetFirstTrackIndexCount == 1 && !callbacks.MetadataCuesheetFirstTrackIndexPointerNull && callbacks.MetadataCuesheetFirstTrackIsAudio && callbacks.MetadataCuesheetFirstTrackPreEmphasis && strcmp (callbacks.MetadataCuesheetFirstTrackISRC, "CUESHEETISRC") == 0;
+	}
+
+	bool HasExpectedNativeCuesheetSecondTrack (const AudioDecoderTestMiniaudioFlacCallbackReport &callbacks)
+	{
+		return callbacks.MetadataCuesheetIteratorNullOutputAdvanced && callbacks.MetadataCuesheetSecondTrackOffset == 0xfedcba9876543210ULL && callbacks.MetadataCuesheetSecondTrackNumber == 170 && callbacks.MetadataCuesheetSecondTrackIndexCount == 0 && callbacks.MetadataCuesheetSecondTrackIndexPointerNull && !callbacks.MetadataCuesheetSecondTrackIsAudio && !callbacks.MetadataCuesheetSecondTrackPreEmphasis && callbacks.MetadataCuesheetSecondTrackISRC[0] == '\0' && callbacks.MetadataCuesheetIteratorEOF;
+	}
+
+	bool GetMiniaudioFlacCuesheetPayload (const std::vector<unsigned char> &cuesheetFlac, std::vector<unsigned char> &payload)
+	{
+		std::vector<FlacMetadataBlock> blocks;
+		std::size_t audioOffset;
+		if (!ParseNativeFlacMetadata (cuesheetFlac, &blocks, &audioOffset))
+		{
+			return false;
+		}
+		for (std::size_t index = 0; index < blocks.size (); ++index)
+		{
+			if (blocks[index].Type == 5 && blocks[index].Bytes >= 4)
+			{
+				payload.assign (cuesheetFlac.begin () + blocks[index].Offset + 4, cuesheetFlac.begin () + blocks[index].Offset + blocks[index].Bytes);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void TestMiniaudioFlacCuesheetRawLifetime (const std::vector<unsigned char> &flac)
+	{
+		std::vector<unsigned char> cuesheetFlac;
+		std::vector<unsigned char> payload;
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+				Check (MakeFlacWithCuesheet (flac, &cuesheetFlac) && GetMiniaudioFlacCuesheetPayload (cuesheetFlac, payload) && AudioDecoderTestMiniaudioFlacCallbackOpen (&cuesheetFlac[0], cuesheetFlac.size (), true, false, 0, (std::size_t)-1, 0, (std::size_t)-1, &callbacks, false, &payload[0], payload.size ()) && HasExpectedNativeCuesheetHeader (callbacks) && HasExpectedNativeCuesheetFirstTrack (callbacks) && HasExpectedNativeCuesheetSecondTrack (callbacks), "miniaudio CUESHEET metadata keeps source payload and complete typed storage live during callback");
+	}
+
+	bool MakeMiniaudioFlacCuesheetFailureFixture (const std::vector<unsigned char> &flac, std::vector<unsigned char> &cuesheetFlac)
+	{
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		bool fixtureReady = MakeFlacWithCuesheet (flac, &cuesheetFlac);
+		Check (fixtureReady && AudioDecoderTestMiniaudioFlacCallbackOpen (&cuesheetFlac[0], cuesheetFlac.size (), true, false, 2, (std::size_t)-1, 0, (std::size_t)-1, &callbacks) && !callbacks.Opened && callbacks.MallocCount == 2 && callbacks.FreeCount == 1, "miniaudio CUESHEET raw allocation OOM fails before ownership transfer");
+		Check (fixtureReady && AudioDecoderTestMiniaudioFlacCallbackOpen (&cuesheetFlac[0], cuesheetFlac.size (), true, false, 3, (std::size_t)-1, 0, (std::size_t)-1, &callbacks) && !callbacks.Opened && callbacks.MallocCount == 3 && callbacks.FreeCount == 2 && callbacks.AllocationPointers[1] == callbacks.FreePointers[1] && callbacks.CanaryIntact, "miniaudio CUESHEET typed allocation OOM releases raw storage once");
+		return fixtureReady;
+	}
+
+	bool FindMiniaudioFlacCuesheetBlock (const std::vector<unsigned char> &cuesheetFlac, std::vector<FlacMetadataBlock> &blocks, std::size_t &audioOffset, std::size_t &cuesheetIndex)
+	{
+		if (!ParseNativeFlacMetadata (cuesheetFlac, &blocks, &audioOffset))
+		{
+			Check (false, "miniaudio CUESHEET fixture metadata parses");
+			return false;
+		}
+		for (std::size_t index = 0; index < blocks.size (); ++index)
+		{
+			if (blocks[index].Type == 5)
+			{
+				cuesheetIndex = index;
+				break;
+			}
+		}
+		if (cuesheetIndex == (std::size_t)-1)
+		{
+			Check (false, "miniaudio CUESHEET fixture has a CUESHEET metadata block");
+			return false;
+		}
+		return true;
+	}
+
+	void TestMiniaudioFlacCuesheetZeroTrackFailure (const std::vector<unsigned char> &cuesheetFlac, const std::vector<FlacMetadataBlock> &blocks, std::size_t cuesheetIndex)
+	{
+		std::vector<unsigned char> zeroTrackFlac;
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		zeroTrackFlac = cuesheetFlac;
+		zeroTrackFlac[blocks[cuesheetIndex].Offset + 4 + 395] = 0;
+		Check (AudioDecoderTestMiniaudioFlacCallbackOpen (&zeroTrackFlac[0], zeroTrackFlac.size (), true, false, 0, (std::size_t)-1, 0, (std::size_t)-1, &callbacks) && callbacks.Opened && callbacks.MetadataCuesheetCount == 1 && callbacks.MetadataCuesheetTrackCount == 0 && callbacks.MallocCount == 3 && callbacks.FreeCount == 3 && callbacks.CanaryIntact, "miniaudio CUESHEET accepts zero tracks without typed allocation");
+	}
+
+	void TestMiniaudioFlacCuesheetZeroIndexFailure (const std::vector<unsigned char> &flac)
+	{
+		std::vector<unsigned char> zeroIndexFlac;
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		Check (MakeFlacWithCuesheet (flac, &zeroIndexFlac, false) && AudioDecoderTestMiniaudioFlacCallbackOpen (&zeroIndexFlac[0], zeroIndexFlac.size (), true, false, 0, (std::size_t)-1, 0, (std::size_t)-1, &callbacks) && callbacks.Opened && callbacks.MetadataCuesheetTrackCount == 2 && callbacks.MetadataCuesheetFirstTrackIndexCount == 0 && callbacks.MetadataCuesheetFirstTrackIndexPointerNull && callbacks.MetadataCuesheetSecondTrackIndexCount == 0 && callbacks.MetadataCuesheetSecondTrackIndexPointerNull, "miniaudio CUESHEET accepts two zero-index tracks without constructing index arrays");
+	}
+
+	bool MakeMiniaudioFlacCuesheetPayloadCut (const std::vector<unsigned char> &cuesheetFlac, const FlacMetadataBlock &block, std::size_t payloadBytes, std::vector<unsigned char> &shortCuesheetFlac)
+	{
+		shortCuesheetFlac = cuesheetFlac;
+		if (block.Bytes < 4 || payloadBytes < 396 || payloadBytes >= block.Bytes - 4)
+		{
+			return false;
+		}
+		shortCuesheetFlac.erase (shortCuesheetFlac.begin () + block.Offset + 4 + payloadBytes, shortCuesheetFlac.begin () + block.Offset + block.Bytes);
+		shortCuesheetFlac[block.Offset + 1] = (unsigned char)(payloadBytes >> 16);
+		shortCuesheetFlac[block.Offset + 2] = (unsigned char)(payloadBytes >> 8);
+		shortCuesheetFlac[block.Offset + 3] = (unsigned char)payloadBytes;
+		return true;
+	}
+
+	void TestMiniaudioFlacCuesheetDeclaredPayloadFailure (const std::vector<unsigned char> &cuesheetFlac, const std::vector<FlacMetadataBlock> &blocks, std::size_t cuesheetIndex)
+	{
+		std::vector<unsigned char> shortTrackFlac;
+		std::vector<unsigned char> shortIndexFlac;
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		Check (MakeMiniaudioFlacCuesheetPayloadCut (cuesheetFlac, blocks[cuesheetIndex], 479, shortTrackFlac) && AudioDecoderTestMiniaudioFlacCallbackOpen (&shortTrackFlac[0], shortTrackFlac.size (), true, false, 0, (std::size_t)-1, 0, (std::size_t)-1, &callbacks) && !callbacks.Opened && callbacks.MallocCount == 2 && callbacks.FreeCount == 2 && callbacks.CanaryIntact, "miniaudio CUESHEET rejects a declared payload cut through the second track header");
+		Check (MakeMiniaudioFlacCuesheetPayloadCut (cuesheetFlac, blocks[cuesheetIndex], 438, shortIndexFlac) && AudioDecoderTestMiniaudioFlacCallbackOpen (&shortIndexFlac[0], shortIndexFlac.size (), true, false, 0, (std::size_t)-1, 0, (std::size_t)-1, &callbacks) && !callbacks.Opened && callbacks.MallocCount == 2 && callbacks.FreeCount == 2 && callbacks.CanaryIntact, "miniaudio CUESHEET rejects a declared payload cut through the first index");
+	}
+
+	void TestMiniaudioFlacCuesheetTruncatedIndexFailure (std::vector<unsigned char> cuesheetFlac, std::size_t audioOffset)
+	{
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		cuesheetFlac.resize (audioOffset - 1);
+		AudioDecoderTestMiniaudioFlacCallbackOpen (&cuesheetFlac[0], cuesheetFlac.size (), true, false, 0, (std::size_t)-1, 0, (std::size_t)-1, &callbacks);
+		Check (!callbacks.Opened, "miniaudio CUESHEET rejects truncated index data");
+		Check (callbacks.MallocCount == 2, "miniaudio CUESHEET truncated index allocates only raw storage before validation");
+		Check (callbacks.FreeCount == 2, "miniaudio CUESHEET truncated index releases raw storage once");
+		Check (callbacks.CanaryIntact, "miniaudio CUESHEET truncated index cleanup preserves allocation canaries");
+	}
+
+	void TestMiniaudioFlacCuesheetFailures (const std::vector<unsigned char> &flac)
+	{
+		std::vector<unsigned char> cuesheetFlac;
+		std::vector<FlacMetadataBlock> blocks;
+		std::size_t audioOffset;
+		std::size_t cuesheetIndex = (std::size_t)-1;
+		if (!MakeMiniaudioFlacCuesheetFailureFixture (flac, cuesheetFlac) || !FindMiniaudioFlacCuesheetBlock (cuesheetFlac, blocks, audioOffset, cuesheetIndex))
+		{
+			return;
+		}
+		TestMiniaudioFlacCuesheetZeroTrackFailure (cuesheetFlac, blocks, cuesheetIndex);
+		TestMiniaudioFlacCuesheetZeroIndexFailure (flac);
+		TestMiniaudioFlacCuesheetDeclaredPayloadFailure (cuesheetFlac, blocks, cuesheetIndex);
+		TestMiniaudioFlacCuesheetTruncatedIndexFailure (cuesheetFlac, audioOffset);
+	}
+
+	bool HasExpectedOggFlacCuesheetMetadata (const AudioDecoderTestMiniaudioCuesheetCallbackReport &callbacks)
+	{
+		return callbacks.CallbackObserved && callbacks.MetadataRawDataLive && callbacks.MetadataRawDataMatchesExpected && callbacks.MetadataRawDataSize == 480 && callbacks.MetadataIsCD && callbacks.MetadataCatalog[0] == 'C' && callbacks.MetadataTrackCount == 2 && callbacks.MetadataTrackDataAligned && callbacks.MetadataIndexDataAligned && callbacks.MetadataLeadInSampleCount == 0x0123456789abcdefULL && callbacks.MetadataFirstTrackOffset == 0x1020304050607080ULL && callbacks.MetadataFirstIndexOffset == 0x8899aabbccddeeffULL && callbacks.MetadataFirstTrackNumber == 1 && callbacks.MetadataFirstIndexNumber == 7 && callbacks.MetadataFirstTrackIndexCount == 1 && !callbacks.MetadataFirstTrackIndexPointerNull && callbacks.MetadataFirstTrackIsAudio && callbacks.MetadataFirstTrackPreEmphasis && strcmp (callbacks.MetadataFirstTrackISRC, "CUESHEETISRC") == 0;
+	}
+
+	bool HasExpectedOggFlacCuesheetSecondTrack (const AudioDecoderTestMiniaudioCuesheetCallbackReport &callbacks)
+	{
+		return callbacks.MetadataIteratorNullOutputAdvanced && callbacks.MetadataSecondTrackOffset == 0xfedcba9876543210ULL && callbacks.MetadataSecondTrackNumber == 170 && callbacks.MetadataSecondTrackIndexCount == 0 && callbacks.MetadataSecondTrackIndexPointerNull && !callbacks.MetadataSecondTrackIsAudio && !callbacks.MetadataSecondTrackPreEmphasis && callbacks.MetadataSecondTrackISRC[0] == '\0' && callbacks.MetadataIteratorEOF;
+	}
+
+	bool HasExpectedOggFlacCuesheetReleaseOrder (const AudioDecoderTestMiniaudioCuesheetCallbackReport &callbacks)
+	{
+		return callbacks.MallocCount == 5 && callbacks.FreeCount == 5 && callbacks.FreePointers[0] == callbacks.AllocationPointers[1] && callbacks.FreePointers[1] == callbacks.AllocationPointers[3] && callbacks.FreePointers[2] == callbacks.AllocationPointers[2] && callbacks.FreePointers[3] == callbacks.AllocationPointers[0] && callbacks.FreePointers[4] == callbacks.AllocationPointers[4] && callbacks.CanaryIntact;
+	}
+
+	bool HasExpectedOggFlacCuesheetParentOOM (const AudioDecoderTestMiniaudioCuesheetCallbackReport &callbacks)
+	{
+		return !callbacks.Opened && callbacks.CallbackObserved && callbacks.MallocCount == 5 && callbacks.FreeCount == 4 && callbacks.FreePointers[0] == callbacks.AllocationPointers[1] && callbacks.FreePointers[1] == callbacks.AllocationPointers[3] && callbacks.FreePointers[2] == callbacks.AllocationPointers[2] && callbacks.FreePointers[3] == callbacks.AllocationPointers[0] && callbacks.CanaryIntact;
+	}
+
+	void TestMiniaudioOggFlacCuesheet (const std::vector<unsigned char> &flac)
+	{
+		std::vector<unsigned char> cuesheetFlac;
+		std::vector<unsigned char> oggFlac;
+				std::vector<unsigned char> payload;
+		AudioDecoderTestMiniaudioFlacCallbackReport callbacks;
+		AudioDecoderTestMiniaudioCuesheetCallbackReport cuesheetCallbacks;
+		bool opened;
+		unsigned long long totalPCMFrames = 0;
+		unsigned long long pcmHash = 0;
+		short firstSample = 0;
+		short seekSample = 0;
+		AudioMemorySource nativeSource;
+		AudioDecodedPCM16 nativePCM;
+		Check (MakeFlacWithCuesheet (flac, &cuesheetFlac), "miniaudio Ogg-FLAC CUESHEET creates native metadata fixture");
+		Check (!cuesheetFlac.empty () && MakeOggFlac (cuesheetFlac, 529, &oggFlac), "miniaudio Ogg-FLAC CUESHEET packages native metadata");
+		Check (!oggFlac.empty () && ValidateOggFlac (oggFlac, cuesheetFlac, 529), "miniaudio Ogg-FLAC CUESHEET fixture has valid packets and metadata order");
+		if (oggFlac.empty ())
+		{
+			return;
+		}
+				opened = GetMiniaudioFlacCuesheetPayload (cuesheetFlac, payload) && AudioDecoderTestMiniaudioOggFlacCuesheetCallbackOpen (&oggFlac[0], oggFlac.size (), 0, &cuesheetCallbacks, &payload[0], payload.size ());
+		Check (opened && cuesheetCallbacks.Opened, "miniaudio Ogg-FLAC CUESHEET opens with metadata callback");
+				Check (HasExpectedOggFlacCuesheetMetadata (cuesheetCallbacks) && HasExpectedOggFlacCuesheetSecondTrack (cuesheetCallbacks), "miniaudio Ogg-FLAC CUESHEET reports typed callback metadata");
+		Check (HasExpectedOggFlacCuesheetReleaseOrder (cuesheetCallbacks), "miniaudio Ogg-FLAC CUESHEET releases Ogg, raw, typed, and parent storage in order");
+		Check (AudioDecoderTestMiniaudioOggFlacCuesheetCallbackOpen (&oggFlac[0], oggFlac.size (), 5, &cuesheetCallbacks) && HasExpectedOggFlacCuesheetParentOOM (cuesheetCallbacks), "miniaudio Ogg-FLAC CUESHEET parent allocation OOM releases live metadata storage");
+		nativeSource.Assign (&cuesheetFlac[0], cuesheetFlac.size ());
+		Check (AudioDecoderTestMiniaudioOggFlacDecode (&oggFlac[0], oggFlac.size (), 264, 0, &totalPCMFrames, &pcmHash, &firstSample, &seekSample, &callbacks) && callbacks.Opened && totalPCMFrames == 529 && pcmHash == 0xae1a6ff7e4b9ff1bULL && DecodeAudioToPCM16 (nativeSource, ProbeAudioFormat (nativeSource), &nativePCM) == AUDIO_DECODE_OK && nativePCM.Samples.size () > 264 && firstSample == nativePCM.Samples[0] && seekSample == nativePCM.Samples[264] && callbacks.MallocCount == 2 && callbacks.FreeCount == 2 && callbacks.CanaryIntact, "miniaudio Ogg-FLAC CUESHEET preserves PCM seek and EOF");
 	}
 
 	void TestMiniaudioFlacNativeFixtureLayout (const std::vector<unsigned char> &flac)
@@ -1718,6 +1967,9 @@ namespace
 		AudioDecodedPCM16 nativePCM;
 		TestMiniaudioFlacAllocationBounds ();
 		TestMiniaudioFlacAllocationOwnership (flac);
+		TestMiniaudioFlacCuesheetRawLifetime (flac);
+		TestMiniaudioFlacCuesheetFailures (flac);
+		TestMiniaudioOggFlacCuesheet (flac);
 		TestMiniaudioFlacNativeFixtureLayout (flac);
 		TestMiniaudioFlacValidSeektable (flac, seektableFlac, nativePCM);
 		TestMiniaudioOggFlacSeektable (seektableFlac, nativePCM);

@@ -13,7 +13,7 @@ are locally patched and are not claimed to be byte-identical to upstream.
 - Commit URL: <https://github.com/mackron/miniaudio/commit/9634bedb5b5a2ca38c1ee7108a9358a4e233f14d>
 - Vendored source: `miniaudio/miniaudio.h`
 - Original upstream source SHA-256: `ac7af4de748b7e26b777f37e01cee313a308a7296a3eb080e2906b320cc55c89`
-- Current locally patched source SHA-256: `99925510ea204a3642703a52a10e6136a4dd7986e32a1e73ca31787b5058cb34`
+- Current locally patched source SHA-256: `ed718e371508c2c802eb2e6b1495eec42d36a86495f5605595ae2e3a5076d793`
 - License file: `miniaudio/LICENSE`
 - License SHA-256: `457f1b500e0adf6bc059edddfa78a2f62012e7c3bb43476c20e0bd23b25ba0eb`
 - Selected license: MIT-0 (MIT No Attribution)
@@ -60,6 +60,25 @@ not change the network protocol, FMOD behavior, or the OpenAL backend.
 - Valid native FLAC and Ogg-FLAC input remains covered by the decoder tests,
   including seektable metadata, callback ownership, Ogg state transfer, OOM,
   short reads, seek failures, and seek/PCM checks.
+- The CUESHEET patch validates the `36`-byte track and `12`-byte index wire
+  records, including remaining-length, count/product/sum, alignment-padding,
+  and overflow bounds. Scalar values are copied into typed locals before
+  endian conversion, and all public fields and reserved bytes are initialized.
+- CUESHEET raw storage is separate from the typed track and index storage. The
+  typed arrays use one checked, aligned allocation with C++ byte backing and
+  placement array construction where required; zero indexes produce a `NULL`
+  index pointer. Raw and typed storage remain alive through the metadata
+  callback and are released exactly once after callback use.
+- The producer and iterator use the same typed representation. Iterator
+  exhaustion returns `MA_FALSE` and advances no further. The private `pTrackData`
+  representation changed; old external packed construction or direct
+  interpretation is not supported across this revision, while public vendor
+  structures, function signatures, FLAC wire data, and PCM output remain
+  unchanged.
+- The CUESHEET implementation is covered by the existing four-slot V2R
+  allocation/lifetime checks plus a dedicated fifth probe for native Ogg
+  comment-first input. The dedicated adapter and test hooks are verification
+  support only and do not change the decoder's public ABI.
 
 ### Patch Details: stb_vorbis
 
@@ -112,14 +131,19 @@ that every warning or every vendor build mode is clean.
   the standalone probe did not declare its file wrapper; that probe result is
   recorded as unsupported for that harness, not as proof that all modes
   compile.
-- Lizard evidence for the current files reported 3,387 functions, including
-  78 new and 21 changed functions. The changed residue helpers include
-  functions above the repository's advisory thresholds; this is reported
-  rather than described as a warning-free result.
-- Current Cppcheck evidence is non-zero: miniaudio diagnostics were reported
-  as `108/109/108` and stb diagnostics as `2/2/2` across the recorded runs.
-  The latest recorded run exited `1`; these diagnostics are not claimed to be
-  fully resolved.
+- The current Lizard review reported 47 non-legacy new or changed functions;
+  all satisfy the inclusive review thresholds of CCN <= 20 and NLOC <= 80,
+  including functions with CCN 20. The legacy parser changed from `391` to
+  `370` NLOC and from `83` to `87` CCN; it remains explicitly above the
+  repository's advisory thresholds and was not cleaned. These figures are
+  advisory and are not a claim of a clean whole-repository total.
+- Current Cppcheck 2.21.0 evidence remains non-zero. The production,
+  adapter-test, and lifecycle translation-unit runs reported respectively
+  `105`, `106`, and `105` diagnostics and each exited `1`; the adapter run
+  included one independently reviewed local ownership diagnostic alongside
+  vendor diagnostics. These results are not claimed to be fully resolved or
+  globally clean. Historical stb_vorbis results remain `2/2/2` and were not
+  rescanned for this patch.
 - The broader pre-push gate was still failing with 48 failures, including
   unfinished V2B work. This document therefore does not declare the push gate
   green.
@@ -129,11 +153,16 @@ For the user-facing build and test path, use the repository's normal commands:
 ```text
 cmake -S . -B build-v143 -G "Visual Studio 17 2022" -A x64 -T v143
 cmake --build build-v143 --config Release
-ctest --test-dir build-v143 -C Release -R "^(audio_decoder|midi_device_selection|openal_lifecycle)$" --output-on-failure
+ctest --test-dir build-v143 -C Release -R "^audio_decoder$" --output-on-failure
 ```
 
 The additional decoder test hooks are enabled only by `AUDIO_DECODER_TESTING`
-and are not part of the normal build.
+and are not part of the normal build. The current Release rebuild and the
+`audio_decoder` test passed. Separate C11/C++11-oriented MSVC and WSL probes
+also passed for the production iterator, raw/live/value/alignment guards, and
+the two-allocation/two-free lifetime check. The primary ABI probe passed with
+the unchanged public layout and compatibility revision. These are targeted
+checks, not a claim that every compiler mode or warning is clean.
 
 ## Hash Verification
 
