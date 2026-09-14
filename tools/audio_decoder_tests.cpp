@@ -368,7 +368,15 @@ namespace
 		std::size_t lacingBytes;
 		std::size_t packetBytes = 0;
 		std::size_t headerBytes;
-		if (offset == NULL || page == NULL || *offset > oggFlac.size () || oggFlac.size () - *offset < 27 || memcmp (&oggFlac[*offset], "OggS", 4) != 0 || oggFlac[*offset + 4] != 0)
+		if (offset == NULL || page == NULL || *offset > oggFlac.size ())
+		{
+			return false;
+		}
+		if (oggFlac.size () - *offset < 27)
+		{
+			return false;
+		}
+		if (memcmp (oggFlac.data () + *offset, "OggS", 4) != 0 || oggFlac[*offset + 4] != 0)
 		{
 			return false;
 		}
@@ -386,7 +394,7 @@ namespace
 		{
 			return false;
 		}
-		page->Packet = &oggFlac[*offset + headerBytes];
+		page->Packet = oggFlac.data () + *offset + headerBytes;
 		page->PacketBytes = packetBytes;
 		page->HeaderType = oggFlac[*offset + 5];
 		page->GranulePosition = ReadLE64 (&oggFlac[*offset + 6]);
@@ -453,6 +461,19 @@ namespace
 			}
 		}
 		return granulePosition == totalPCMFrames && offset == oggFlac.size ();
+	}
+
+	void TestOggPacketPageBoundaries ()
+	{
+		std::vector<unsigned char> empty;
+		std::vector<unsigned char> truncated (26, 0);
+		std::vector<unsigned char> terminalPage;
+		OggPacketPage page;
+		std::size_t offset = 0;
+		Check (!ReadOggPacketPage (empty, &offset, 0, &page), "Ogg packet page rejects end offset");
+		Check (!ReadOggPacketPage (truncated, &offset, 0, &page), "Ogg packet page rejects 26-byte header");
+		Check (AppendOggPacketPage (&terminalPage, empty, 0x04, 0, 0x1a2b3c4dU, 0), "Ogg packet page creates empty terminal page");
+		Check (ReadOggPacketPage (terminalPage, &offset, 0, &page) && page.PacketBytes == 0 && page.Packet == terminalPage.data () + terminalPage.size () && page.HeaderType == 0x04 && offset == terminalPage.size (), "Ogg packet page accepts empty terminal page");
 	}
 
 	std::vector<unsigned char> MakeWave (unsigned int format)
@@ -2138,33 +2159,43 @@ namespace
 int main ()
 {
 	const char *path = "audio_decoder_tests_input.bin";
-	FILE *file = fopen (path, "wb");
-	if (file == NULL)
+	try
 	{
+		FILE *file = fopen (path, "wb");
+		if (file == NULL)
+		{
+			return 1;
+		}
+		fwrite ("0123456789", 1, 10, file);
+		fclose (file);
+
+		TestMemoryOwnership ();
+		TestFileSourceBoundaries (path);
+		TestFileFailures (path);
+		TestProbeContracts ();
+		TestId3ProbeContracts ();
+		TestDecoderContract ();
+		TestWavDecoder ();
+		TestMiniaudioWavConversionHelpers ();
+		TestMiniaudioWavReaderBoundaries ();
+		TestTemporaryFixtureCreationFailures ();
+		TestMiniaudioAutoDetectionFallback ();
+		TestCodecFixtures ();
+		TestOggPacketPageBoundaries ();
+		TestMiniaudioFlacAllocationLayout ();
+		TestVorbisMemorySeekBoundaries ();
+		TestVorbisTemporaryMemoryRequirements ();
+		TestVorbisResidueRuntimeLayout ();
+		TestVorbisPersistentScratch ();
+		TestTimeTags ();
+		TestVorbisLoopComments ();
+	}
+	catch (...)
+	{
+		remove (path);
+		fprintf (stderr, "FAILED: unexpected exception\n");
 		return 1;
 	}
-	fwrite ("0123456789", 1, 10, file);
-	fclose (file);
-
-	TestMemoryOwnership ();
-	TestFileSourceBoundaries (path);
-	TestFileFailures (path);
-	TestProbeContracts ();
-	TestId3ProbeContracts ();
-	TestDecoderContract ();
-	TestWavDecoder ();
-	TestMiniaudioWavConversionHelpers ();
-	TestMiniaudioWavReaderBoundaries ();
-	TestTemporaryFixtureCreationFailures ();
-	TestMiniaudioAutoDetectionFallback ();
-	TestCodecFixtures ();
-	TestMiniaudioFlacAllocationLayout ();
-	TestVorbisMemorySeekBoundaries ();
-	TestVorbisTemporaryMemoryRequirements ();
-	TestVorbisResidueRuntimeLayout ();
-	TestVorbisPersistentScratch ();
-	TestTimeTags ();
-	TestVorbisLoopComments ();
 	remove (path);
 	return Failures == 0 ? 0 : 1;
 }

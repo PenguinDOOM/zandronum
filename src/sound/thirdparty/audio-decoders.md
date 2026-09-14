@@ -77,8 +77,10 @@ not change the network protocol, FMOD behavior, or the OpenAL backend.
   unchanged.
 - The CUESHEET implementation is covered by the existing four-slot V2R
   allocation/lifetime checks plus a dedicated fifth probe for native Ogg
-  comment-first input. The dedicated adapter and test hooks are verification
-  support only and do not change the decoder's public ABI.
+  comment-first input. The direct owned-host allocation probe retains the four
+  slots, fail ordinal, canary, alignment, and `79`-byte padding checks; the
+  dedicated fifth slot remains unchanged. The dedicated adapter and test hooks
+  are verification support only and do not change the decoder's public ABI.
 
 ### Patch Details: stb_vorbis
 
@@ -131,24 +133,23 @@ that every warning or every vendor build mode is clean.
   the standalone probe did not declare its file wrapper; that probe result is
   recorded as unsupported for that harness, not as proof that all modes
   compile.
-- The current Lizard review reported 47 non-legacy new or changed functions;
-  all satisfy the inclusive review thresholds of CCN <= 20 and NLOC <= 80,
-  including functions with CCN 20. The legacy parser changed from `391` to
-  `370` NLOC and from `83` to `87` CCN; it remains explicitly above the
-  repository's advisory thresholds and was not cleaned. These figures are
-  advisory and are not a claim of a clean whole-repository total.
+- The independent Phase 2A Lizard CSV review reports the changed-function
+  values used for this recovery: `FlacAllocationProbeAllocate` NLOC/CCN
+  `39/7`, `ReadOggPacketPage` `38/14`, `TestOggPacketPageBoundaries` `12/5`,
+  and `main` `42/4`. These figures are advisory and are not a claim of a clean
+  whole-repository total.
 - The V2B vendor-disposition policy is source-, API-, and configuration-bound.
-  The saved six-target/TU evidence contains `322` raw diagnostics: `321` are
-  accepted by exact records and one local `memleak` at
-  `src/sound/audio_decoder_miniaudio.cpp:439:3` remains unaccepted. The local
-  diagnostic is retained in the raw result and is not treated as a vendor
-  filter. The accepted records are `195` `dangerousTypeCast`, `96`
-  `invalidPointerCast`, `15` `memsetClassFloat`, `3`
-  `arrayIndexOutOfBoundsCond`, `6` `shiftNegativeLHS`, and `6` `uninitvar`
-  occurrences. These are not a claim that general casts are safe: the 65
-  distinct dangerous casts comprise 9 configuration-limited object-
-  representation/typed-storage cases and 56 cases unreachable under the
-  verified PCM16, original-rate/channel, identity-map test paths.
+  The previous V2B evidence recorded `322` raw diagnostics, with `321`
+  accepted and one local `memleak`; those counts are historical and are not
+  the current disposition. The current JSON-only disposition contains `321`
+  vendor diagnostics keyed by the exact source/API/configuration proof. The
+  current root-set proof records `53` `ma_` tokens in one consumer root and
+  `17` `stb_vorbis_` tokens in three consumer roots. The adapter and test-root
+  hashes were updated from the current files; the vendor source hash remains
+  unchanged. The focused ownership probe found no local diagnostics in
+  `src/sound/audio_decoder_miniaudio.cpp`, including no replacement for the
+  historical `memleak` at line `439`. These results are targeted evidence,
+  not a claim that general casts are safe or that the full gate passes.
 - A disposition is keyed by target, translation unit, source path, line,
   column, severity, identifier, and message. It also requires the exact
   vendor-source hash, API-consumer root hashes and exact token sets, analyzer version, and
@@ -170,12 +171,18 @@ that every warning or every vendor build mode is clean.
   and `8`), and raw diagnostics remain separate from accepted reasons.
 - The focused `scripts/test-lint-vendor-dispositions.ps1` check passed, as did
   the normal three-project context check, including rejection of duplicate
-  `v143`/`ClangCL` and empty or missing toolset cases. This is independent
-  code approval evidence, not a V3 full-gate result. The earlier `105`/`106`/
-  `105` Cppcheck counts and the broader record of 48 pre-push failures are
-  historical raw-scan/gate labels; they are not the current V2B count or a
-  declaration that the push gate is green. These results do not establish push
-  readiness or that all platforms are clean.
+  `v143`/`ClangCL` and empty or missing toolset cases. The Phase 2A recovery
+  rebuilt the Release target successfully, passed the focused `audio_decoder`
+  CTest, and reported zero local diagnostics for the owning translation unit;
+  its nonzero direct Cppcheck exit was caused by retained vendor-header
+  diagnostics. The Ogg page boundary check keeps explicit guards, represents
+  an empty terminal packet with a valid one-past-end pointer,
+  and preserves CRC, serial, and sequence validation. The test entry point
+  catches unexpected exceptions, removes its input fixture, and returns
+  nonzero. This is independent targeted evidence, not a V3 full-gate result.
+  The earlier `105`/`106`/`105` Cppcheck counts and the broader record of 48
+  pre-push failures are historical raw-scan/gate labels. These results do not
+  establish push readiness or that all platforms are clean.
 
 For the user-facing build and test path, use the repository's normal commands:
 
@@ -190,8 +197,15 @@ and are not part of the normal build. The current Release rebuild and the
 `audio_decoder` test passed. Separate C11/C++11-oriented MSVC and WSL probes
 also passed for the production iterator, raw/live/value/alignment guards, and
 the two-allocation/two-free lifetime check. The primary ABI probe passed with
-the unchanged public layout and compatibility revision. These are targeted
-checks, not a claim that every compiler mode or warning is clean.
+the unchanged public layout and compatibility revision. Targeted Cppcheck
+2.21 checks verified that the TEST adapter has no local `memleak` diagnostic
+(`0` local, `105` vendor, exit `1`) and that TEST main has no bounds or thrown-
+exception diagnostics (`0` diagnostics, exit `0`). The three fingerprints were
+removed from the targeted checks. The separate V3 FULL gate was not rerun or
+approved after these changes, and exception fault injection was not done;
+existing RAII/static review and targeted Cppcheck acceptance do not establish
+that a runtime exception path was injected. These are targeted checks, not a
+claim that every compiler mode or warning is clean.
 
 ## Hash Verification
 

@@ -397,7 +397,6 @@ namespace
 	void *FlacAllocationProbeAllocate (std::size_t size, void *userData, bool reallocate, void *pointer)
 	{
 		FlacAllocationProbe *probe = static_cast<FlacAllocationProbe *> (userData);
-		unsigned char *host;
 		uintptr_t address;
 		unsigned char *raw;
 		std::size_t allocationOrdinal = probe->AllocationCount + probe->ReallocCount + 1;
@@ -418,23 +417,19 @@ namespace
 		{
 			return NULL;
 		}
-		host = static_cast<unsigned char *> (malloc (size + 79));
-		if (host == NULL)
+		probe->HostPointers[allocationOrdinal - 1] = malloc (size + 79);
+		if (probe->HostPointers[allocationOrdinal - 1] == NULL)
 		{
 			return NULL;
 		}
-		address = ((uintptr_t)host + 15) & ~(uintptr_t)15;
+		address = ((uintptr_t)probe->HostPointers[allocationOrdinal - 1] + 15) & ~(uintptr_t)15;
 		if (address % 64 == 0)
 		{
 			address += 16;
 		}
 		raw = reinterpret_cast<unsigned char *> (address);
-		if (allocationOrdinal <= 4)
-		{
-			probe->HostPointers[allocationOrdinal - 1] = host;
-			probe->RawPointers[allocationOrdinal - 1] = raw;
-			probe->AllocationSizes[allocationOrdinal - 1] = size;
-		}
+		probe->RawPointers[allocationOrdinal - 1] = raw;
+		probe->AllocationSizes[allocationOrdinal - 1] = size;
 		memset (raw + size, 0xa5, 8);
 		return raw;
 	}
