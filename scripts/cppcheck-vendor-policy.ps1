@@ -143,8 +143,8 @@ function ConvertFrom-CppcheckProjectOutput {
         [string[]]$AllowedMissingFiles = @()
     )
 
-    $diagnostics = @()
-    $unexpectedOutput = @()
+    $diagnostics = [System.Collections.Generic.List[object]]::new()
+    $unexpectedOutput = [System.Collections.Generic.List[object]]::new()
 
     foreach ($line in $Output) {
         if ([string]::IsNullOrWhiteSpace($line)) {
@@ -154,7 +154,7 @@ function ConvertFrom-CppcheckProjectOutput {
         $match = [regex]::Match($line, '^(?<file>.+?)\t(?<line>\d+)\t(?<column>\d+)\t(?<severity>[^\t]+)\t(?<id>[^\t]+)\t(?<message>.*)$')
 
         if (-not $match.Success) {
-            $unexpectedOutput += $line
+            [void]$unexpectedOutput.Add($line)
             continue
         }
 
@@ -162,7 +162,7 @@ function ConvertFrom-CppcheckProjectOutput {
         $severity = $match.Groups['severity'].Value
         $identifier = $match.Groups['id'].Value
         $message = $match.Groups['message'].Value
-        $diagnostics += [PSCustomObject]@{
+        [void]$diagnostics.Add([PSCustomObject]@{
             Fingerprint = "$TargetName|$relativePath|$severity|$identifier|$message"
             Display = "${TargetName}: ${TranslationUnit}: ${relativePath}:$($match.Groups['line'].Value):$($match.Groups['column'].Value) [$severity/$identifier] $message"
             Target = $TargetName
@@ -173,7 +173,7 @@ function ConvertFrom-CppcheckProjectOutput {
             Severity = $severity
             Identifier = $identifier
             Message = $message
-        }
+        })
     }
 
     $missingFileDiagnostics = @($diagnostics | Where-Object { $_.Identifier -eq 'missingFile' })
@@ -206,7 +206,7 @@ function ConvertFrom-CppcheckProjectOutput {
         throw "Cppcheck reported a tool or configuration error for '$TargetName': $details"
     }
 
-    return $diagnostics
+    return $diagnostics.ToArray()
 }
 
 function Get-CppcheckVendorDispositionResult {
@@ -244,8 +244,8 @@ function Get-CppcheckVendorDispositionResult {
         $dispositionsByKey[$key] = $disposition
     }
 
-    $accepted = @()
-    $unaccepted = @()
+    $accepted = [System.Collections.Generic.List[object]]::new()
+    $unaccepted = [System.Collections.Generic.List[object]]::new()
 
     foreach ($diagnostic in $Diagnostics) {
         $key = Get-VendorPolicyRecordKey -Record $diagnostic
@@ -260,17 +260,17 @@ function Get-CppcheckVendorDispositionResult {
             }
 
             Assert-VendorPolicyPreconditions -Disposition $disposition -RepositoryRoot $RepositoryRoot -Context $Contexts[$diagnostic.Target]
-            $accepted += [PSCustomObject]@{ Diagnostic = $diagnostic; Disposition = $disposition }
+            [void]$accepted.Add([PSCustomObject]@{ Diagnostic = $diagnostic; Disposition = $disposition })
         }
         else {
-            $unaccepted += $diagnostic
+            [void]$unaccepted.Add($diagnostic)
         }
     }
 
     return [PSCustomObject]@{
         Raw = @($Diagnostics)
-        Accepted = $accepted
-        Unaccepted = $unaccepted
+        Accepted = $accepted.ToArray()
+        Unaccepted = $unaccepted.ToArray()
     }
 }
 

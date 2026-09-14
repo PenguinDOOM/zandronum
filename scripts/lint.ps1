@@ -726,8 +726,8 @@ try {
     Invoke-GeneratedBuildInputPreparation -CMakePath $cmake.Source -BuildRoot $baselineBuildRoot -RevisionName 'baseline'
 
     $baselineProjects = Get-ProjectSources -BuildRoot $baselineBuildRoot -RepositoryRoot $baselineRoot
-    $baselineDiagnostics = @()
-    $headDiagnostics = @()
+    $baselineDiagnostics = [System.Collections.Generic.List[object]]::new()
+    $headDiagnostics = [System.Collections.Generic.List[object]]::new()
     $vendorDispositionContexts = @{}
 
     Write-Host "Running isolated Cppcheck analysis for $($analysisProjects.Count) target(s):"
@@ -743,7 +743,7 @@ try {
 
         foreach ($translationUnit in $project.Files) {
             $headCache = Join-Path $tempRoot (Join-Path 'head-cache' ($targetName.Replace('/', '_') + '-' + $translationUnit.Replace('/', '_')))
-            $headDiagnostics += Invoke-CppcheckProject `
+            [void]$headDiagnostics.AddRange(@(Invoke-CppcheckProject `
                 -CppcheckPath $cppcheck.Source `
                 -ProjectPath $project.ProjectPath `
                 -CachePath $headCache `
@@ -751,7 +751,7 @@ try {
                 -BuildRoot $buildRoot `
                 -TargetName $targetName `
                 -TranslationUnit $translationUnit `
-                -CppcheckJobs $CppcheckJobs
+                -CppcheckJobs $CppcheckJobs))
         }
 
         $baselineProject = $baselineProjects | Where-Object { $_.RelativeProject -eq $project.RelativeProject } | Select-Object -First 1
@@ -759,7 +759,7 @@ try {
         if ($baselineProject) {
             foreach ($translationUnit in @($baselineProject.Sources.Keys | Sort-Object)) {
                 $baselineCache = Join-Path $tempRoot (Join-Path 'baseline-cache' ($targetName.Replace('/', '_') + '-' + $translationUnit.Replace('/', '_')))
-                $baselineDiagnostics += Invoke-CppcheckProject `
+                [void]$baselineDiagnostics.AddRange(@(Invoke-CppcheckProject `
                     -CppcheckPath $cppcheck.Source `
                     -ProjectPath $baselineProject.ProjectPath `
                     -CachePath $baselineCache `
@@ -767,11 +767,13 @@ try {
                     -BuildRoot $baselineBuildRoot `
                     -TargetName $targetName `
                     -TranslationUnit $translationUnit `
-                    -CppcheckJobs $CppcheckJobs
+                    -CppcheckJobs $CppcheckJobs))
             }
         }
     }
 
+    $baselineDiagnostics = $baselineDiagnostics.ToArray()
+    $headDiagnostics = $headDiagnostics.ToArray()
     $vendorDispositionPolicy = Join-Path $PSScriptRoot 'cppcheck-vendor-dispositions.json'
     Write-Host "Raw HEAD diagnostics ($($headDiagnostics.Count)):"
     $headDiagnostics | Sort-Object Display | ForEach-Object { Write-Host "  $($_.Display)" }

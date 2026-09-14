@@ -64,6 +64,21 @@ try {
     $movedComparison = Get-CppcheckBaselineComparisonResult -BaselineDiagnostics @($baselineDiagnostic) -HeadDiagnostics @($movedVendorDiagnostic) -UnacceptedDiagnostics @($movedVendorDiagnostic)
     if (($movedComparison.UnresolvedVendor.Count -ne 1) -or ($movedComparison.New.Count -ne 0)) { throw 'Moved unproven vendor diagnostic was not separated from legacy baseline comparison.' }
 
+    $emptyParserResult = @(ConvertFrom-CppcheckProjectOutput -Output @() -ExitCode 0 -RepositoryRoot $fixtureRoot -BuildRoot '' -TargetName 'zdoom' -TranslationUnit $adapterPath)
+    if ($emptyParserResult.Count -ne 0) { throw 'Empty Cppcheck output did not return an empty diagnostic collection.' }
+    $singleParserResult = @(ConvertFrom-CppcheckProjectOutput -Output @("$(Join-Path $fixtureRoot $vendorPath)`t10`t4`twarning`tsingle`tsingle message") -ExitCode 0 -RepositoryRoot $fixtureRoot -BuildRoot '' -TargetName 'zdoom' -TranslationUnit $adapterPath)
+    if (($singleParserResult.Count -ne 1) -or ($singleParserResult[0].Identifier -ne 'single')) { throw 'Single Cppcheck diagnostic collection shape changed.' }
+    $multipleParserResult = @(ConvertFrom-CppcheckProjectOutput -Output @("$(Join-Path $fixtureRoot $vendorPath)`t10`t4`twarning`tfirst`tfirst message", "$(Join-Path $fixtureRoot $vendorPath)`t11`t5`twarning`tsecond`tsecond message", "$(Join-Path $fixtureRoot $vendorPath)`t10`t4`twarning`tfirst`tfirst message") -ExitCode 0 -RepositoryRoot $fixtureRoot -BuildRoot '' -TargetName 'zdoom' -TranslationUnit $adapterPath)
+    if ((@($multipleParserResult | ForEach-Object { $_.Identifier }) -join '|') -ne 'first|second|first') { throw 'Multiple Cppcheck diagnostics lost order or duplicates.' }
+
+    $unmatchedDiagnostic = [PSCustomObject]@{ Target = 'unscanned'; TranslationUnit = 'src/local.cpp'; RelativePath = 'src/local.cpp'; Line = 1; Column = 1; Severity = 'warning'; Identifier = 'local'; Message = 'local message' }
+    $emptyDispositionResult = Get-CppcheckVendorDispositionResult -Diagnostics @() -PolicyPath $policyPath -RepositoryRoot $fixtureRoot -Contexts $contexts
+    if (($emptyDispositionResult.Raw.Count -ne 0) -or ($emptyDispositionResult.Accepted.Count -ne 0) -or ($emptyDispositionResult.Unaccepted.Count -ne 0)) { throw 'Empty disposition result collection shape changed.' }
+    $unmatchedOrderedDiagnostic = [PSCustomObject]@{ Target = 'unscanned'; TranslationUnit = 'src/local.cpp'; RelativePath = 'src/local.cpp'; Line = 2; Column = 1; Severity = 'warning'; Identifier = 'local-second'; Message = 'local message second' }
+    $multipleDispositionResult = Get-CppcheckVendorDispositionResult -Diagnostics @($diagnostic, $unmatchedDiagnostic, $diagnostic, $unmatchedOrderedDiagnostic) -PolicyPath $policyPath -RepositoryRoot $fixtureRoot -Contexts $contexts
+    if (($multipleDispositionResult.Accepted.Count -ne 2) -or ($multipleDispositionResult.Accepted[0].Diagnostic -ne $diagnostic) -or ($multipleDispositionResult.Accepted[1].Diagnostic -ne $diagnostic)) { throw 'Accepted disposition collection lost order or duplicates.' }
+    if ((@($multipleDispositionResult.Unaccepted | ForEach-Object { $_.Identifier }) -join '|') -ne 'local|local-second') { throw 'Unaccepted disposition collection lost order.' }
+
     foreach ($mutation in @(@{ Line = 11 }, @{ Column = 5 }, @{ Target = 'other' }, @{ TranslationUnit = 'src/other.cpp' }, @{ RelativePath = $adapterPath }, @{ Identifier = 'local' })) {
         $candidate = [PSCustomObject]@{ Target = $diagnostic.Target; TranslationUnit = $diagnostic.TranslationUnit; RelativePath = $diagnostic.RelativePath; Line = $diagnostic.Line; Column = $diagnostic.Column; Severity = $diagnostic.Severity; Identifier = $diagnostic.Identifier; Message = $diagnostic.Message }
         foreach ($name in $mutation.Keys) { $candidate.$name = $mutation[$name] }
