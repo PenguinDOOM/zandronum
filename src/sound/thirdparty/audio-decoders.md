@@ -137,16 +137,45 @@ that every warning or every vendor build mode is clean.
   `370` NLOC and from `83` to `87` CCN; it remains explicitly above the
   repository's advisory thresholds and was not cleaned. These figures are
   advisory and are not a claim of a clean whole-repository total.
-- Current Cppcheck 2.21.0 evidence remains non-zero. The production,
-  adapter-test, and lifecycle translation-unit runs reported respectively
-  `105`, `106`, and `105` diagnostics and each exited `1`; the adapter run
-  included one independently reviewed local ownership diagnostic alongside
-  vendor diagnostics. These results are not claimed to be fully resolved or
-  globally clean. Historical stb_vorbis results remain `2/2/2` and were not
-  rescanned for this patch.
-- The broader pre-push gate was still failing with 48 failures, including
-  unfinished V2B work. This document therefore does not declare the push gate
-  green.
+- The V2B vendor-disposition policy is source-, API-, and configuration-bound.
+  The saved six-target/TU evidence contains `322` raw diagnostics: `321` are
+  accepted by exact records and one local `memleak` at
+  `src/sound/audio_decoder_miniaudio.cpp:439:3` remains unaccepted. The local
+  diagnostic is retained in the raw result and is not treated as a vendor
+  filter. The accepted records are `195` `dangerousTypeCast`, `96`
+  `invalidPointerCast`, `15` `memsetClassFloat`, `3`
+  `arrayIndexOutOfBoundsCond`, `6` `shiftNegativeLHS`, and `6` `uninitvar`
+  occurrences. These are not a claim that general casts are safe: the 65
+  distinct dangerous casts comprise 9 configuration-limited object-
+  representation/typed-storage cases and 56 cases unreachable under the
+  verified PCM16, original-rate/channel, identity-map test paths.
+- A disposition is keyed by target, translation unit, source path, line,
+  column, severity, identifier, and message. It also requires the exact
+  vendor-source hash, API-consumer root hashes and exact token sets, analyzer version, and
+  compiler context (`Cppcheck 2.21.0`, MSVC `v143`, x64, `Release|x64`, and
+  the recorded defines). The current API closure covers 53 `ma_` tokens in
+  one consumer root and 17 `stb_vorbis_` tokens in three consumer roots.
+  Preconditions are fail-closed: source/API/configuration/analyzer-version
+  changes, unknown vendor occurrences, malformed records, missing or fatal
+  input, and tool exits outside 0/1 reject the result. The original
+  `Target|Path|Severity|ID|Message` fingerprint remains the ordinary local
+  baseline-comparison key.
+- Only `src/sound/thirdparty/miniaudio/miniaudio.h` and
+  `src/sound/thirdparty/stb/stb_vorbis.c` can receive a disposition. The
+  context extractor proves only the supported generated-project subset; it is
+  not a full MSBuild evaluator or portable-ABI proof. Unsupported imports,
+  compiler or translation-unit overrides, forced includes, and duplicate or
+  otherwise ambiguous toolsets are rejected. Per-TU analysis retains the
+  entire selected project TU set (the verified project counts are `455`, `6`,
+  and `8`), and raw diagnostics remain separate from accepted reasons.
+- The focused `scripts/test-lint-vendor-dispositions.ps1` check passed, as did
+  the normal three-project context check, including rejection of duplicate
+  `v143`/`ClangCL` and empty or missing toolset cases. This is independent
+  code approval evidence, not a V3 full-gate result. The earlier `105`/`106`/
+  `105` Cppcheck counts and the broader record of 48 pre-push failures are
+  historical raw-scan/gate labels; they are not the current V2B count or a
+  declaration that the push gate is green. These results do not establish push
+  readiness or that all platforms are clean.
 
 For the user-facing build and test path, use the repository's normal commands:
 

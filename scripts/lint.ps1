@@ -10,6 +10,7 @@ $utf8 = New-Object System.Text.UTF8Encoding $false
 $OutputEncoding = $utf8
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'cppcheck-vendor-policy.ps1')
 
 if (($CppcheckJobs -lt 1) -or ($CppcheckJobs -gt [Environment]::ProcessorCount)) {
     Write-Error "CppcheckJobs must be between 1 and $([Environment]::ProcessorCount); received $CppcheckJobs."
@@ -531,18 +532,20 @@ function Invoke-CppcheckProject {
         [string]$RepositoryRoot,
         [string]$BuildRoot,
         [string]$TargetName,
+        [string]$TranslationUnit,
         [int]$CppcheckJobs
     )
 
     New-Item -ItemType Directory -Force -Path $CachePath | Out-Null
 
-    $template = '{file}' + "`t" + '{severity}' + "`t" + '{id}' + "`t" + '{message}'
+    $template = '{file}' + "`t" + '{line}' + "`t" + '{column}' + "`t" + '{severity}' + "`t" + '{id}' + "`t" + '{message}'
     $arguments = @(
         "--project=$ProjectPath"
         "--project-configuration=Release|x64"
         "--enable=warning,performance,portability"
         "--error-exitcode=1"
         "--cppcheck-build-dir=$CachePath"
+        "--file-filter=$TranslationUnit"
         "--template=$template"
         "--quiet"
         "-j"
@@ -551,59 +554,14 @@ function Invoke-CppcheckProject {
 
     $output = @(& $CppcheckPath @arguments 2>&1 | ForEach-Object { $_.ToString() })
     $exitCode = $LASTEXITCODE
-    $diagnostics = @()
-    $unexpectedOutput = @()
-
-    foreach ($line in $output) {
-        if ([string]::IsNullOrWhiteSpace($line)) {
-            continue
-        }
-
-        $match = [regex]::Match($line, '^(?<file>.+?)\t(?<severity>[^\t]+)\t(?<id>[^\t]+)\t(?<message>.*)$')
-
-        if (-not $match.Success) {
-            $unexpectedOutput += $line
-            continue
-        }
-
-        $relativePath = Get-RepositoryRelativePath -Path $match.Groups['file'].Value -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot
-        $severity = $match.Groups['severity'].Value
-        $identifier = $match.Groups['id'].Value
-        $message = $match.Groups['message'].Value
-        $diagnostics += [PSCustomObject]@{
-            Fingerprint = "$TargetName|$relativePath|$severity|$identifier|$message"
-            Display = "${TargetName}: $relativePath [$severity/$identifier] $message"
-            RelativePath = $relativePath
-            Identifier = $identifier
-        }
-    }
-
-    $missingFileDiagnostics = @($diagnostics | Where-Object { $_.Identifier -eq 'missingFile' })
-
-    if ($missingFileDiagnostics.Count -ne 0) {
-        $missingPaths = @($missingFileDiagnostics | ForEach-Object { $_.RelativePath } | Sort-Object -Unique)
-        $unsupportedPaths = @($missingPaths | Where-Object { $_ -notin $generatedBundlePaths })
-
-        if ($unsupportedPaths.Count -ne 0) {
-            throw "Cppcheck reported unsupported missing input(s): $($unsupportedPaths -join ', '). Only src/network/servercommands.cpp and src/network/servercommands.h may be materialized."
-        }
-
-        throw "Cppcheck reported missing verified generated input(s): $($missingPaths -join ', ')."
-    }
-
-    if (($exitCode -ne 0) -and ($diagnostics.Count -eq 0)) {
-        $details = ($unexpectedOutput -join [Environment]::NewLine).Replace($RepositoryRoot, '<repo>')
-        throw "Cppcheck failed before producing diagnostics for '$TargetName': $details"
-    }
-
-    $fatalOutput = @($unexpectedOutput | Where-Object { $_ -match '(?i)(^|:\s*)(fatal )?error:' })
-
-    if ($fatalOutput.Count -ne 0) {
-        $details = ($fatalOutput -join [Environment]::NewLine).Replace($RepositoryRoot, '<repo>')
-        throw "Cppcheck reported a tool or configuration error for '$TargetName': $details"
-    }
-
-    return $diagnostics
+    return ConvertFrom-CppcheckProjectOutput `
+        -Output $output `
+        -ExitCode $exitCode `
+        -RepositoryRoot $RepositoryRoot `
+        -BuildRoot $BuildRoot `
+        -TargetName $TargetName `
+        -TranslationUnit $TranslationUnit `
+        -AllowedMissingFiles $generatedBundlePaths
 }
 
 $cppcheck = Get-Command cppcheck -ErrorAction SilentlyContinue
@@ -616,6 +574,13 @@ if (-not $cppcheck) {
 
 if (-not $cmake) {
     Write-Error "CMake was not found in PATH. Install CMake and restart your terminal/IDE."
+    exit 1
+}
+
+$cppcheckVersion = @(& $cppcheck.Source --version 2>&1 | ForEach-Object { $_.ToString() })
+
+if (($LASTEXITCODE -ne 0) -or ($cppcheckVersion.Count -ne 1) -or [string]::IsNullOrWhiteSpace($cppcheckVersion[0])) {
+    Write-Error "Could not determine the Cppcheck version for vendor disposition validation."
     exit 1
 }
 
@@ -679,7 +644,7 @@ foreach ($file in $changedFiles) {
     }
 
     foreach ($project in $projectMatches) {
-        $project.Files += $file
+        $project.Files = @($project.Sources.Keys | Sort-Object)
     }
 }
 
@@ -763,6 +728,7 @@ try {
     $baselineProjects = Get-ProjectSources -BuildRoot $baselineBuildRoot -RepositoryRoot $baselineRoot
     $baselineDiagnostics = @()
     $headDiagnostics = @()
+    $vendorDispositionContexts = @{}
 
     Write-Host "Running isolated Cppcheck analysis for $($analysisProjects.Count) target(s):"
 
@@ -770,55 +736,78 @@ try {
         $targetName = $project.RelativeProject
         Write-Host "  $targetName"
 
-        $headCache = Join-Path $tempRoot (Join-Path 'head-cache' $targetName.Replace('/', '_'))
-        $headDiagnostics += Invoke-CppcheckProject `
-            -CppcheckPath $cppcheck.Source `
+        $vendorDispositionContexts[$targetName] = Get-CppcheckVendorDispositionContext `
             -ProjectPath $project.ProjectPath `
-            -CachePath $headCache `
-            -RepositoryRoot $repositoryRoot `
-            -BuildRoot $buildRoot `
             -TargetName $targetName `
-            -CppcheckJobs $CppcheckJobs
+            -AnalyzerVersion $cppcheckVersion[0]
+
+        foreach ($translationUnit in $project.Files) {
+            $headCache = Join-Path $tempRoot (Join-Path 'head-cache' ($targetName.Replace('/', '_') + '-' + $translationUnit.Replace('/', '_')))
+            $headDiagnostics += Invoke-CppcheckProject `
+                -CppcheckPath $cppcheck.Source `
+                -ProjectPath $project.ProjectPath `
+                -CachePath $headCache `
+                -RepositoryRoot $repositoryRoot `
+                -BuildRoot $buildRoot `
+                -TargetName $targetName `
+                -TranslationUnit $translationUnit `
+                -CppcheckJobs $CppcheckJobs
+        }
 
         $baselineProject = $baselineProjects | Where-Object { $_.RelativeProject -eq $project.RelativeProject } | Select-Object -First 1
 
         if ($baselineProject) {
-            $baselineCache = Join-Path $tempRoot (Join-Path 'baseline-cache' $targetName.Replace('/', '_'))
-            $baselineDiagnostics += Invoke-CppcheckProject `
-                -CppcheckPath $cppcheck.Source `
-                -ProjectPath $baselineProject.ProjectPath `
-                -CachePath $baselineCache `
-                -RepositoryRoot $baselineRoot `
-                -BuildRoot $baselineBuildRoot `
-                -TargetName $targetName `
-                -CppcheckJobs $CppcheckJobs
+            foreach ($translationUnit in @($baselineProject.Sources.Keys | Sort-Object)) {
+                $baselineCache = Join-Path $tempRoot (Join-Path 'baseline-cache' ($targetName.Replace('/', '_') + '-' + $translationUnit.Replace('/', '_')))
+                $baselineDiagnostics += Invoke-CppcheckProject `
+                    -CppcheckPath $cppcheck.Source `
+                    -ProjectPath $baselineProject.ProjectPath `
+                    -CachePath $baselineCache `
+                    -RepositoryRoot $baselineRoot `
+                    -BuildRoot $baselineBuildRoot `
+                    -TargetName $targetName `
+                    -TranslationUnit $translationUnit `
+                    -CppcheckJobs $CppcheckJobs
+            }
         }
     }
 
-    $baselineByFingerprint = @{}
+    $vendorDispositionPolicy = Join-Path $PSScriptRoot 'cppcheck-vendor-dispositions.json'
+    Write-Host "Raw HEAD diagnostics ($($headDiagnostics.Count)):"
+    $headDiagnostics | Sort-Object Display | ForEach-Object { Write-Host "  $($_.Display)" }
+    $vendorDispositionResult = Get-CppcheckVendorDispositionResult `
+        -Diagnostics $headDiagnostics `
+        -PolicyPath $vendorDispositionPolicy `
+        -RepositoryRoot $repositoryRoot `
+        -Contexts $vendorDispositionContexts
+    $headDiagnosticsForComparison = @($vendorDispositionResult.Unaccepted)
 
-    foreach ($diagnostic in $baselineDiagnostics) {
-        $baselineByFingerprint[$diagnostic.Fingerprint] = $diagnostic
-    }
+    $comparison = Get-CppcheckBaselineComparisonResult `
+        -BaselineDiagnostics $baselineDiagnostics `
+        -HeadDiagnostics $headDiagnostics `
+        -UnacceptedDiagnostics $headDiagnosticsForComparison
 
-    $headByFingerprint = @{}
+    Write-Host "Accepted vendor dispositions ($($vendorDispositionResult.Accepted.Count)):"
+    $vendorDispositionResult.Accepted | Sort-Object { $_.Diagnostic.Display } | ForEach-Object { Write-Host "  $($_.Diagnostic.Display) [$($_.Disposition.Reason)]" }
 
-    foreach ($diagnostic in $headDiagnostics) {
-        $headByFingerprint[$diagnostic.Fingerprint] = $diagnostic
-    }
-
-    $unchangedDiagnostics = @($headByFingerprint.Keys | Where-Object { $baselineByFingerprint.ContainsKey($_) } | Sort-Object | ForEach-Object { $headByFingerprint[$_] })
-    $newDiagnostics = @($headByFingerprint.Keys | Where-Object { -not $baselineByFingerprint.ContainsKey($_) } | Sort-Object | ForEach-Object { $headByFingerprint[$_] })
-    $baselineOnlyDiagnostics = @($baselineByFingerprint.Keys | Where-Object { -not $headByFingerprint.ContainsKey($_) } | Sort-Object | ForEach-Object { $baselineByFingerprint[$_] })
+    $unchangedDiagnostics = $comparison.Unchanged
+    $newDiagnostics = $comparison.New
+    $baselineOnlyDiagnostics = $comparison.BaselineOnly
 
     Write-Host "Baseline diagnostics ($($baselineDiagnostics.Count)):"
-    $baselineByFingerprint.Values | Sort-Object Display | ForEach-Object { Write-Host "  $($_.Display)" }
+    $comparison.Baseline | Sort-Object Display | ForEach-Object { Write-Host "  $($_.Display)" }
     Write-Host "Unchanged baseline diagnostics ($($unchangedDiagnostics.Count)):"
     $unchangedDiagnostics | ForEach-Object { Write-Host "  $($_.Display)" }
     Write-Host "Baseline-only diagnostics ($($baselineOnlyDiagnostics.Count)):"
     $baselineOnlyDiagnostics | ForEach-Object { Write-Host "  $($_.Display)" }
     Write-Host "New diagnostics ($($newDiagnostics.Count)):"
     $newDiagnostics | ForEach-Object { Write-Host "  $($_.Display)" }
+
+    if ($comparison.UnresolvedVendor.Count -ne 0) {
+        Write-Error "Cppcheck reported $($comparison.UnresolvedVendor.Count) unresolved vendor diagnostic(s)."
+        $comparison.UnresolvedVendor | Sort-Object Display | ForEach-Object { Write-Host "  $($_.Display)" }
+        exit 1
+    }
 
     if ($newDiagnostics.Count -ne 0) {
         Write-Error "Cppcheck reported $($newDiagnostics.Count) new diagnostic fingerprint(s)."
