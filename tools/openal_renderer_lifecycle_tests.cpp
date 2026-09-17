@@ -1817,14 +1817,94 @@ static int RunPriorityRendererTests (std::vector<BYTE> &longSamples)
 	return 0;
 }
 
+static void TestPhase2Capabilities ()
+{
+	OpenALEFXFunctions missing;
+	OpenALCapabilities absent = OALBuildCapabilities (false, false, 0, false, missing, false);
+	Check (!absent.HRTFAdvertised && !absent.EFXAdvertised && !absent.EFXCallable && !absent.RadiusAdvertised,
+		"phase2 absent extensions remain unavailable");
+
+	OpenALEFXFunctions partial;
+	partial.GenEffects = reinterpret_cast<OALGenEffects> (static_cast<uintptr_t> (1));
+	OpenALCapabilities missingPointer = OALBuildCapabilities (false, false, 0, true, partial, false);
+	Check (missingPointer.EFXAdvertised && !missingPointer.EFXCallable && !missingPointer.EFXUsable,
+		"phase2 missing EFX pointer is not callable or usable");
+
+	OpenALEFXFunctions callable;
+	callable.GenEffects = reinterpret_cast<OALGenEffects> (static_cast<uintptr_t> (1));
+	callable.DeleteEffects = reinterpret_cast<OALDeleteEffects> (static_cast<uintptr_t> (1));
+	callable.Effecti = reinterpret_cast<OALEffecti> (static_cast<uintptr_t> (1));
+	callable.Effectf = reinterpret_cast<OALEffectf> (static_cast<uintptr_t> (1));
+	callable.Effectfv = reinterpret_cast<OALEffectfv> (static_cast<uintptr_t> (1));
+	callable.GenAuxiliaryEffectSlots = reinterpret_cast<OALGenAuxiliaryEffectSlots> (static_cast<uintptr_t> (1));
+	callable.DeleteAuxiliaryEffectSlots = reinterpret_cast<OALDeleteAuxiliaryEffectSlots> (static_cast<uintptr_t> (1));
+	callable.AuxiliaryEffectSloti = reinterpret_cast<OALAuxiliaryEffectSloti> (static_cast<uintptr_t> (1));
+	callable.AuxiliaryEffectSlotf = reinterpret_cast<OALAuxiliaryEffectSlotf> (static_cast<uintptr_t> (1));
+	callable.GenFilters = reinterpret_cast<OALGenFilters> (static_cast<uintptr_t> (1));
+	callable.DeleteFilters = reinterpret_cast<OALDeleteFilters> (static_cast<uintptr_t> (1));
+	callable.Filteri = reinterpret_cast<OALFilteri> (static_cast<uintptr_t> (1));
+	callable.Filterf = reinterpret_cast<OALFilterf> (static_cast<uintptr_t> (1));
+	OpenALCapabilities known = OALBuildCapabilities (true, true, 1, true, callable, true);
+	Check (known.HRTFAdvertised && known.HRTFStatusKnown && known.HRTFStatus == 1 && known.EFXCallable && !known.EFXUsable &&
+		known.EFXSendCount < 0 && known.RadiusAdvertised && !known.RadiusApplied && !known.DopplerApplied,
+		"phase2 known status separates callable from applied state");
+	OpenALCapabilities unknown = OALBuildCapabilities (true, true, 777, false, missing, false);
+	Check (unknown.HRTFStatusKnown && unknown.HRTFStatus == 777,
+		"phase2 unknown HRTF numerical status is retained");
+}
+
+static bool IsKnownOperation (const char *operation)
+{
+	return operation == NULL || strcmp (operation, "--phase2-unit-only") == 0 ||
+		strcmp (operation, "--phase2-status") == 0 || strcmp (operation, "--phase1b-direct-memory") == 0 ||
+		strcmp (operation, "--phase1b-file-slice") == 0;
+}
+
+static int PrintUsage (const char *program)
+{
+	fprintf (stderr, "Usage: %s [--phase2-unit-only|--phase2-status|--phase1b-direct-memory|--phase1b-file-slice]\n", program);
+	return 2;
+}
+
+static int RunPhase2UnitOperation (const char *operation)
+{
+	if (operation == NULL || strcmp (operation, "--phase2-unit-only") != 0)
+	{
+		return -1;
+	}
+	TestPhase2Capabilities ();
+	return Failures == 0 ? 0 : 1;
+}
+
+static bool RunInitialOperation (const char *operation, const char *program, int *result)
+{
+	if (!IsKnownOperation (operation))
+	{
+		*result = PrintUsage (program);
+		return true;
+	}
+	*result = RunPhase2UnitOperation (operation);
+	return *result >= 0;
+}
+
+static bool PrintPhase2StatusIfRequested (const char *operation, OpenALSoundRenderer &renderer)
+{
+	if (operation == NULL || strcmp (operation, "--phase2-status") != 0)
+	{
+		return false;
+	}
+	renderer.PrintStatus ();
+	fprintf (stdout, "Stats: %s\n", renderer.GatherStats ().GetChars ());
+	return true;
+}
+
 int main (int argc, char **argv)
 {
 	const char *phase1bOperation = argc == 2 ? argv[1] : NULL;
-	if (phase1bOperation != NULL && strcmp (phase1bOperation, "--phase1b-direct-memory") != 0 &&
-		strcmp (phase1bOperation, "--phase1b-file-slice") != 0)
+	int initialResult;
+	if (RunInitialOperation (phase1bOperation, argv[0], &initialResult))
 	{
-		fprintf (stderr, "Usage: %s [--phase1b-direct-memory|--phase1b-file-slice]\n", argv[0]);
-		return 2;
+		return initialResult;
 	}
 	std::vector<BYTE> longSamples = MakeSamples (8000);
 	std::vector<BYTE> shortSamples = MakeSamples (160);
@@ -1846,6 +1926,10 @@ int main (int argc, char **argv)
 		}
 		fprintf (stderr, "FAILED: OpenAL renderer could not initialize after context creation\n");
 		return 1;
+	}
+	if (PrintPhase2StatusIfRequested (phase1bOperation, renderer))
+	{
+		return 0;
 	}
 	if (phase1bOperation != NULL)
 	{

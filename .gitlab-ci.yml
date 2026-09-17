@@ -44,7 +44,7 @@ variables:
         )
       fi
       cmake "${cmake_args[@]}" ..
-    - ninja && if [[ "$SERVERONLY" != "ON" ]]; then python3 ../tools/testdata/audio/validate_phase1b_manifest.py --self-test && ctest --test-dir . --output-on-failure -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_lifecycle)$'; fi
+    - ninja && if [[ "$SERVERONLY" != "ON" ]]; then python3 ../tools/testdata/audio/validate_phase1b_manifest.py --self-test && ctest --test-dir . --output-on-failure -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_phase2_unit|openal_lifecycle)$'; fi
     # liboutput_sdl is a symlink, we need the actual file
     - if [ -L liboutput_sdl.so ]; then
         cp --remove-destination "$(readlink liboutput_sdl.so)" liboutput_sdl.so ;
@@ -459,7 +459,7 @@ appimage:
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } ;
       python ..\tools\testdata\audio\validate_phase1b_manifest.py --self-test ;
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } ;
-      ctest --test-dir . -C Release --output-on-failure -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_lifecycle)' ;
+      ctest --test-dir . -C Release --output-on-failure -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_phase2_unit|openal_lifecycle)' ;
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } ;
       Copy-Item "$env:ZA_FMOD_ROOT\api\fmodex${fmodArch}.dll" -Destination "Release" ;
       $release = (Resolve-Path "Release").Path ;

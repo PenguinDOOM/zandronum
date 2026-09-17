@@ -9,6 +9,78 @@
 
 #include <vector>
 
+#ifdef OAL_LIFECYCLE_TEST
+#define OAL_APIENTRY
+typedef int OALsizei;
+typedef unsigned int OALuint;
+typedef int OALenum;
+typedef int OALint;
+typedef float OALfloat;
+#else
+#include <AL/al.h>
+typedef ALsizei OALsizei;
+typedef ALuint OALuint;
+typedef ALenum OALenum;
+typedef ALint OALint;
+typedef ALfloat OALfloat;
+#define OAL_APIENTRY AL_APIENTRY
+#endif
+
+typedef void (OAL_APIENTRY *OALGenEffects) (OALsizei, OALuint *);
+typedef void (OAL_APIENTRY *OALDeleteEffects) (OALsizei, const OALuint *);
+typedef void (OAL_APIENTRY *OALEffecti) (OALuint, OALenum, OALint);
+typedef void (OAL_APIENTRY *OALEffectf) (OALuint, OALenum, OALfloat);
+typedef void (OAL_APIENTRY *OALEffectfv) (OALuint, OALenum, const OALfloat *);
+typedef void (OAL_APIENTRY *OALGenAuxiliaryEffectSlots) (OALsizei, OALuint *);
+typedef void (OAL_APIENTRY *OALDeleteAuxiliaryEffectSlots) (OALsizei, const OALuint *);
+typedef void (OAL_APIENTRY *OALAuxiliaryEffectSloti) (OALuint, OALenum, OALint);
+typedef void (OAL_APIENTRY *OALAuxiliaryEffectSlotf) (OALuint, OALenum, OALfloat);
+typedef void (OAL_APIENTRY *OALGenFilters) (OALsizei, OALuint *);
+typedef void (OAL_APIENTRY *OALDeleteFilters) (OALsizei, const OALuint *);
+typedef void (OAL_APIENTRY *OALFilteri) (OALuint, OALenum, OALint);
+typedef void (OAL_APIENTRY *OALFilterf) (OALuint, OALenum, OALfloat);
+
+struct OpenALEFXFunctions
+{
+	OALGenEffects GenEffects;
+	OALDeleteEffects DeleteEffects;
+	OALEffecti Effecti;
+	OALEffectf Effectf;
+	OALEffectfv Effectfv;
+	OALGenAuxiliaryEffectSlots GenAuxiliaryEffectSlots;
+	OALDeleteAuxiliaryEffectSlots DeleteAuxiliaryEffectSlots;
+	OALAuxiliaryEffectSloti AuxiliaryEffectSloti;
+	OALAuxiliaryEffectSlotf AuxiliaryEffectSlotf;
+	OALGenFilters GenFilters;
+	OALDeleteFilters DeleteFilters;
+	OALFilteri Filteri;
+	OALFilterf Filterf;
+
+	OpenALEFXFunctions ();
+	bool IsCallable () const;
+};
+
+struct OpenALCapabilities
+{
+	bool HRTFAdvertised;
+	bool HRTFStatusKnown;
+	int HRTFStatus;
+	bool EFXAdvertised;
+	OpenALEFXFunctions EFX;
+	bool EFXCallable;
+	bool EFXUsable;
+	bool EFXApplied;
+	int EFXSendCount;
+	bool RadiusAdvertised;
+	bool RadiusApplied;
+	bool DopplerApplied;
+
+	OpenALCapabilities ();
+};
+
+OpenALCapabilities OALBuildCapabilities (bool hrtfAdvertised, bool hrtfStatusKnown, int hrtfStatus,
+	bool efxAdvertised, const OpenALEFXFunctions &efx, bool radiusAdvertised);
+
 class OpenALSoundRenderer;
 class OpenALStreamProducer;
 
@@ -304,6 +376,8 @@ private:
 
 	void *Device;
 	void *Context;
+	OpenALCapabilities Capabilities;
+	FString OpenALVersion;
 	unsigned int *Sources;
 	int RequestedSources;
 	int AllocatedSources;

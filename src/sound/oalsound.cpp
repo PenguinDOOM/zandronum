@@ -87,6 +87,17 @@ bool OALTestAcceptsEncodedInputSize (unsigned int bytes)
 #define AL_FORMAT_STEREO_FLOAT32 0x10011
 #endif
 
+#ifndef ALC_SOFT_HRTF
+#define ALC_SOFT_HRTF 1
+#define ALC_HRTF_STATUS_SOFT 0x1993
+#define ALC_HRTF_DISABLED_SOFT 0x0000
+#define ALC_HRTF_ENABLED_SOFT 0x0001
+#define ALC_HRTF_DENIED_SOFT 0x0002
+#define ALC_HRTF_REQUIRED_SOFT 0x0003
+#define ALC_HRTF_HEADPHONES_DETECTED_SOFT 0x0004
+#define ALC_HRTF_UNSUPPORTED_FORMAT_SOFT 0x0005
+#endif
+
 EXTERN_CVAR (Int, snd_channels)
 EXTERN_CVAR (String, snd_openal_device)
 EXTERN_CVAR (Float, snd_sfxvolume)
@@ -98,6 +109,72 @@ enum
 	OALPAUSE_Inactive = 2,
 	OALPAUSE_Sync = 4
 };
+
+namespace
+{
+	template <typename FunctionType>
+	FunctionType ResolveOpenALFunction (const char *name)
+	{
+		return reinterpret_cast<FunctionType> (alGetProcAddress (name));
+	}
+
+	OpenALEFXFunctions ResolveEFXFunctions ()
+	{
+		OpenALEFXFunctions functions;
+		functions.GenEffects = ResolveOpenALFunction<OALGenEffects> ("alGenEffects");
+		functions.DeleteEffects = ResolveOpenALFunction<OALDeleteEffects> ("alDeleteEffects");
+		functions.Effecti = ResolveOpenALFunction<OALEffecti> ("alEffecti");
+		functions.Effectf = ResolveOpenALFunction<OALEffectf> ("alEffectf");
+		functions.Effectfv = ResolveOpenALFunction<OALEffectfv> ("alEffectfv");
+		functions.GenAuxiliaryEffectSlots = ResolveOpenALFunction<OALGenAuxiliaryEffectSlots> ("alGenAuxiliaryEffectSlots");
+		functions.DeleteAuxiliaryEffectSlots = ResolveOpenALFunction<OALDeleteAuxiliaryEffectSlots> ("alDeleteAuxiliaryEffectSlots");
+		functions.AuxiliaryEffectSloti = ResolveOpenALFunction<OALAuxiliaryEffectSloti> ("alAuxiliaryEffectSloti");
+		functions.AuxiliaryEffectSlotf = ResolveOpenALFunction<OALAuxiliaryEffectSlotf> ("alAuxiliaryEffectSlotf");
+		functions.GenFilters = ResolveOpenALFunction<OALGenFilters> ("alGenFilters");
+		functions.DeleteFilters = ResolveOpenALFunction<OALDeleteFilters> ("alDeleteFilters");
+		functions.Filteri = ResolveOpenALFunction<OALFilteri> ("alFilteri");
+		functions.Filterf = ResolveOpenALFunction<OALFilterf> ("alFilterf");
+		return functions;
+	}
+
+	OpenALCapabilities CollectOpenALCapabilities (ALCdevice *device)
+	{
+		bool hrtfAdvertised = alcIsExtensionPresent (device, "ALC_SOFT_HRTF") == ALC_TRUE;
+		bool hrtfStatusKnown = false;
+		int hrtfStatus = 0;
+		if (hrtfAdvertised)
+		{
+			alcGetIntegerv (device, ALC_HRTF_STATUS_SOFT, 1, &hrtfStatus);
+			hrtfStatusKnown = alcGetError (device) == ALC_NO_ERROR;
+		}
+		bool efxAdvertised = alcIsExtensionPresent (device, "ALC_EXT_EFX") == ALC_TRUE;
+		OpenALEFXFunctions efx;
+		if (efxAdvertised)
+		{
+			efx = ResolveEFXFunctions ();
+		}
+		bool radiusAdvertised = alIsExtensionPresent ("AL_EXT_SOURCE_RADIUS") == AL_TRUE;
+		return OALBuildCapabilities (hrtfAdvertised, hrtfStatusKnown, hrtfStatus, efxAdvertised, efx, radiusAdvertised);
+	}
+
+	const char *HRTFStatusName (const OpenALCapabilities &capabilities)
+	{
+		if (!capabilities.HRTFStatusKnown)
+		{
+			return "unknown";
+		}
+		switch (capabilities.HRTFStatus)
+		{
+		case ALC_HRTF_DISABLED_SOFT: return "disabled";
+		case ALC_HRTF_ENABLED_SOFT: return "enabled";
+		case ALC_HRTF_DENIED_SOFT: return "denied";
+		case ALC_HRTF_REQUIRED_SOFT: return "required";
+		case ALC_HRTF_HEADPHONES_DETECTED_SOFT: return "headphones-detected";
+		case ALC_HRTF_UNSUPPORTED_FORMAT_SOFT: return "unsupported-format";
+		default: return "unknown";
+		}
+	}
+}
 
 enum
 {
@@ -1289,7 +1366,7 @@ void OpenALSoundStream::ReleaseResources ()
 }
 
 OpenALSoundRenderer::OpenALSoundRenderer ()
-	: Device (NULL), Context (NULL), Sources (NULL), RequestedSources (0),
+	: Device (NULL), Context (NULL), Capabilities (), Sources (NULL), RequestedSources (0),
 	  AllocatedSources (0), OutputRate (0), InitSuccess (false), SfxVolume (1.f),
 		MusicVolume (1.f), NextAllocationSerial (0), NextLogicalPositionToken (~0ull), PausableOutputFrames (0),
 	  NonPausableOutputFrames (0), PausableFrameRemainder (0), NonPausableFrameRemainder (0),
@@ -1347,6 +1424,9 @@ bool OpenALSoundRenderer::Init ()
 		return false;
 	}
 	Context = context;
+	const ALchar *version = alGetString (AL_VERSION);
+	OpenALVersion = version != NULL ? version : "unknown";
+	Capabilities = CollectOpenALCapabilities (device);
 
 	if (!alIsExtensionPresent ("AL_SOFT_loop_points"))
 	{
@@ -2576,6 +2656,15 @@ void OpenALSoundRenderer::PrintStatus ()
 		Printf ("Output sample rate: " TEXTCOLOR_GREEN "%d\n", OutputRate);
 	}
 	Printf ("AL_SOFT_loop_points: " TEXTCOLOR_GREEN "available\n");
+	Printf ("ALC_SOFT_HRTF: %s, status: %s (%d)\n", Capabilities.HRTFAdvertised ? "advertised" : "absent",
+		HRTFStatusName (Capabilities), Capabilities.HRTFStatus);
+	Printf ("ALC_EXT_EFX: %s, entrypoints: %s, usable: %s, applied: %s\n",
+		Capabilities.EFXAdvertised ? "advertised" : "absent", Capabilities.EFXCallable ? "callable" : "missing",
+		Capabilities.EFXUsable ? "yes" : "no", Capabilities.EFXApplied ? "yes" : "no");
+	Printf ("EFX sends: %s\n", Capabilities.EFXSendCount < 0 ? "not queried" : "available");
+	Printf ("AL_EXT_SOURCE_RADIUS: %s, applied: %s\n", Capabilities.RadiusAdvertised ? "advertised" : "absent",
+		Capabilities.RadiusApplied ? "yes" : "no");
+	Printf ("Doppler: applied: %s (factor remains 0)\n", Capabilities.DopplerApplied ? "yes" : "no");
 	Printf ("SFX sources: " TEXTCOLOR_GREEN "%d allocated / %d requested / %d free / %d active\n", AllocatedSources, RequestedSources, AllocatedSources - (int)ActiveChannels.size (), (int)ActiveChannels.size ());
 }
 
@@ -2609,7 +2698,12 @@ void OpenALSoundRenderer::PrintDriversList ()
 FString OpenALSoundRenderer::GatherStats ()
 {
 	FString out;
-	out.Format ("%d SFX sources, %d active, %d free, %d streams", AllocatedSources, (int)ActiveChannels.size (), AllocatedSources - (int)ActiveChannels.size (), (int)ActiveStreams.size ());
+	out.Format ("device %s, version %s, %d SFX sources, %d active, %d free, %d streams, HRTF %s (%d), EFX %s/%s, sends %s, radius %s",
+		DeviceName.GetChars (), OpenALVersion.GetChars (),
+		AllocatedSources, (int)ActiveChannels.size (), AllocatedSources - (int)ActiveChannels.size (), (int)ActiveStreams.size (),
+		Capabilities.HRTFAdvertised ? HRTFStatusName (Capabilities) : "absent", Capabilities.HRTFStatus,
+		Capabilities.EFXAdvertised ? "advertised" : "absent", Capabilities.EFXCallable ? "callable" : "missing",
+		Capabilities.EFXSendCount < 0 ? "not-queried" : "available", Capabilities.RadiusAdvertised ? "advertised" : "absent");
 	return out;
 }
 
@@ -2620,4 +2714,39 @@ void OpenALSoundRenderer::DestroyStream (OpenALSoundStream *stream)
 	{
 		ActiveStreams.erase (found);
 	}
+}
+
+OpenALEFXFunctions::OpenALEFXFunctions ()
+	: GenEffects (NULL), DeleteEffects (NULL), Effecti (NULL), Effectf (NULL), Effectfv (NULL),
+	  GenAuxiliaryEffectSlots (NULL), DeleteAuxiliaryEffectSlots (NULL), AuxiliaryEffectSloti (NULL),
+	  AuxiliaryEffectSlotf (NULL), GenFilters (NULL), DeleteFilters (NULL), Filteri (NULL), Filterf (NULL)
+{
+}
+
+bool OpenALEFXFunctions::IsCallable () const
+{
+	return GenEffects != NULL && DeleteEffects != NULL && Effecti != NULL && Effectf != NULL && Effectfv != NULL &&
+		GenAuxiliaryEffectSlots != NULL && DeleteAuxiliaryEffectSlots != NULL && AuxiliaryEffectSloti != NULL &&
+		AuxiliaryEffectSlotf != NULL && GenFilters != NULL && DeleteFilters != NULL && Filteri != NULL && Filterf != NULL;
+}
+
+OpenALCapabilities::OpenALCapabilities ()
+	: HRTFAdvertised (false), HRTFStatusKnown (false), HRTFStatus (0), EFXAdvertised (false), EFX (),
+	  EFXCallable (false), EFXUsable (false), EFXApplied (false), EFXSendCount (-1), RadiusAdvertised (false),
+	  RadiusApplied (false), DopplerApplied (false)
+{
+}
+
+OpenALCapabilities OALBuildCapabilities (bool hrtfAdvertised, bool hrtfStatusKnown, int hrtfStatus,
+	bool efxAdvertised, const OpenALEFXFunctions &efx, bool radiusAdvertised)
+{
+	OpenALCapabilities capabilities;
+	capabilities.HRTFAdvertised = hrtfAdvertised;
+	capabilities.HRTFStatusKnown = hrtfStatusKnown;
+	capabilities.HRTFStatus = hrtfStatus;
+	capabilities.EFXAdvertised = efxAdvertised;
+	capabilities.EFX = efx;
+	capabilities.EFXCallable = efx.IsCallable ();
+	capabilities.RadiusAdvertised = radiusAdvertised;
+	return capabilities;
 }

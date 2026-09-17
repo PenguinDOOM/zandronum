@@ -122,7 +122,7 @@ jobs:
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         python tools/testdata/audio/validate_phase1b_manifest.py --self-test
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        ctest --test-dir '${{ steps.strings.outputs.build-output-dir }}' -C '${{ matrix.build_type }}' --output-on-failure -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_lifecycle)$'
+        ctest --test-dir '${{ steps.strings.outputs.build-output-dir }}' -C '${{ matrix.build_type }}' --output-on-failure -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_phase2_unit|openal_lifecycle)$'
         exit $LASTEXITCODE
 
     - name: Create package
