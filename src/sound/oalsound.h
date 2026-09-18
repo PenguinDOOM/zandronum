@@ -63,8 +63,11 @@ struct OpenALEFXFunctions
 struct OpenALCapabilities
 {
 	bool HRTFAdvertised;
+	bool HRTFActiveKnown;
+	bool HRTFActive;
 	bool HRTFStatusKnown;
 	int HRTFStatus;
+	FString HRTFSpecifier;
 	bool EFXAdvertised;
 	OpenALEFXFunctions EFX;
 	bool EFXCallable;
@@ -78,8 +81,68 @@ struct OpenALCapabilities
 	OpenALCapabilities ();
 };
 
-OpenALCapabilities OALBuildCapabilities (bool hrtfAdvertised, bool hrtfStatusKnown, int hrtfStatus,
+OpenALCapabilities OALBuildCapabilities (bool hrtfAdvertised, bool hrtfActiveKnown, bool hrtfActive,
+	bool hrtfStatusKnown, int hrtfStatus,
 	bool efxAdvertised, const OpenALEFXFunctions &efx, bool radiusAdvertised);
+bool OALBuildHRTFContextAttributes (bool hrtfAdvertised, bool hrtfEnabled, int attributes[3]);
+
+enum OpenALContextHRTFFailure
+{
+	OALHRTFCONTEXT_NoFailure,
+	OALHRTFCONTEXT_ExtensionAbsent,
+	OALHRTFCONTEXT_CreateFailed,
+	OALHRTFCONTEXT_MakeCurrentFailed
+};
+
+#ifdef OAL_LIFECYCLE_TEST
+enum OpenALContextTestFailure
+{
+	OALCONTEXTTEST_NoFailure,
+	OALCONTEXTTEST_FirstCreateFailure,
+	OALCONTEXTTEST_FirstMakeCurrentFailure,
+	OALCONTEXTTEST_SecondCreateFailure,
+	OALCONTEXTTEST_SecondMakeCurrentFailure,
+	OALCONTEXTTEST_BothMakeCurrentFailures,
+	OALCONTEXTTEST_SecondOpenFailure
+};
+
+struct OpenALContextTestResult
+{
+	bool Success;
+	bool AttributesApplied;
+	int OpenCount;
+	int CreateCount;
+	int MakeCurrentCount;
+	int DestroyCount;
+	int CloseCount;
+	bool FirstAttributesWereHRTF;
+	bool SecondAttributesWereNull;
+	bool HRTFAdvertised;
+	bool HRTFExtensionQueriedOnDevice;
+	OpenALContextHRTFFailure HRTFFailure;
+	int HRTFSpecifierParameter;
+};
+
+OpenALContextTestResult OALTestRunContextInitialization (bool hrtfAdvertised, bool hrtfEnabled,
+	OpenALContextTestFailure failure);
+bool OALTestCopyHRTFSpecifier (const char *specifier, bool querySucceeded, OpenALCapabilities *capabilities);
+
+struct OpenALHRTFQueryTestResult
+{
+	OpenALHRTFQueryTestResult ()
+	: ActiveQueryCount (0),
+	  StatusQueryCount (0)
+	{
+	}
+
+	OpenALCapabilities Capabilities;
+	int ActiveQueryCount;
+	int StatusQueryCount;
+};
+
+OpenALHRTFQueryTestResult OALTestQueryHRTFCapabilities (bool hrtfAdvertised,
+	bool activeQuerySucceeded, bool active, bool statusQuerySucceeded, int status);
+#endif
 
 class OpenALSoundRenderer;
 class OpenALStreamProducer;
@@ -383,6 +446,9 @@ private:
 	int AllocatedSources;
 	int OutputRate;
 	bool InitSuccess;
+	bool HRTFAttributesApplied;
+	bool HRTFRequestedEnabled;
+	OpenALContextHRTFFailure HRTFFailure;
 	FString DeviceName;
 	float SfxVolume;
 	float MusicVolume;

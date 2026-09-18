@@ -89,7 +89,9 @@ bool OALTestAcceptsEncodedInputSize (unsigned int bytes)
 
 #ifndef ALC_SOFT_HRTF
 #define ALC_SOFT_HRTF 1
+#define ALC_HRTF_SOFT 0x1992
 #define ALC_HRTF_STATUS_SOFT 0x1993
+#define ALC_HRTF_SPECIFIER_SOFT 0x1995
 #define ALC_HRTF_DISABLED_SOFT 0x0000
 #define ALC_HRTF_ENABLED_SOFT 0x0001
 #define ALC_HRTF_DENIED_SOFT 0x0002
@@ -102,6 +104,7 @@ EXTERN_CVAR (Int, snd_channels)
 EXTERN_CVAR (String, snd_openal_device)
 EXTERN_CVAR (Float, snd_sfxvolume)
 EXTERN_CVAR (Bool, snd_pitched)
+EXTERN_CVAR (Bool, snd_hrtf)
 
 enum
 {
@@ -137,15 +140,37 @@ namespace
 		return functions;
 	}
 
+	bool CopyHRTFSpecifier (OpenALCapabilities *capabilities, const ALCchar *specifier, bool querySucceeded);
+	const ALCchar *GetHRTFSpecifier (ALCdevice *device);
+	bool GetHRTFInteger (ALCdevice *device, ALCenum parameter, ALCint *value);
+
+#ifdef OAL_LIFECYCLE_TEST
+	struct OpenALHRTFQueryTestState
+	{
+		bool ActiveQuerySucceeded;
+		bool Active;
+		bool StatusQuerySucceeded;
+		int Status;
+		int ActiveQueryCount;
+		int StatusQueryCount;
+	};
+
+	OpenALHRTFQueryTestState *HRTFQueryTestState = NULL;
+#endif
+
 	OpenALCapabilities CollectOpenALCapabilities (ALCdevice *device)
 	{
 		bool hrtfAdvertised = alcIsExtensionPresent (device, "ALC_SOFT_HRTF") == ALC_TRUE;
+		bool hrtfActiveKnown = false;
+		bool hrtfActive = false;
 		bool hrtfStatusKnown = false;
 		int hrtfStatus = 0;
 		if (hrtfAdvertised)
 		{
-			alcGetIntegerv (device, ALC_HRTF_STATUS_SOFT, 1, &hrtfStatus);
-			hrtfStatusKnown = alcGetError (device) == ALC_NO_ERROR;
+			ALCint active = ALC_FALSE;
+			hrtfActiveKnown = GetHRTFInteger (device, ALC_HRTF_SOFT, &active);
+			hrtfActive = active == ALC_TRUE;
+			hrtfStatusKnown = GetHRTFInteger (device, ALC_HRTF_STATUS_SOFT, &hrtfStatus);
 		}
 		bool efxAdvertised = alcIsExtensionPresent (device, "ALC_EXT_EFX") == ALC_TRUE;
 		OpenALEFXFunctions efx;
@@ -154,7 +179,47 @@ namespace
 			efx = ResolveEFXFunctions ();
 		}
 		bool radiusAdvertised = alIsExtensionPresent ("AL_EXT_SOURCE_RADIUS") == AL_TRUE;
-		return OALBuildCapabilities (hrtfAdvertised, hrtfStatusKnown, hrtfStatus, efxAdvertised, efx, radiusAdvertised);
+		OpenALCapabilities capabilities = OALBuildCapabilities (hrtfAdvertised, hrtfActiveKnown, hrtfActive,
+			hrtfStatusKnown, hrtfStatus, efxAdvertised, efx, radiusAdvertised);
+		if (hrtfAdvertised)
+		{
+			const ALCchar *specifier = GetHRTFSpecifier (device);
+			CopyHRTFSpecifier (&capabilities, specifier, alcGetError (device) == ALC_NO_ERROR);
+		}
+		return capabilities;
+	}
+
+	bool GetHRTFInteger (ALCdevice *device, ALCenum parameter, ALCint *value)
+	{
+#ifdef OAL_LIFECYCLE_TEST
+		if (HRTFQueryTestState != NULL)
+		{
+			if (parameter == ALC_HRTF_SOFT)
+			{
+				++HRTFQueryTestState->ActiveQueryCount;
+				*value = HRTFQueryTestState->Active ? ALC_TRUE : ALC_FALSE;
+				return HRTFQueryTestState->ActiveQuerySucceeded;
+			}
+			if (parameter == ALC_HRTF_STATUS_SOFT)
+			{
+				++HRTFQueryTestState->StatusQueryCount;
+				*value = HRTFQueryTestState->Status;
+				return HRTFQueryTestState->StatusQuerySucceeded;
+			}
+		}
+#endif
+		alcGetIntegerv (device, parameter, 1, value);
+		return alcGetError (device) == ALC_NO_ERROR;
+	}
+
+	bool CopyHRTFSpecifier (OpenALCapabilities *capabilities, const ALCchar *specifier, bool querySucceeded)
+	{
+		if (specifier == NULL || !querySucceeded)
+		{
+			return false;
+		}
+		capabilities->HRTFSpecifier = specifier;
+		return true;
 	}
 
 	const char *HRTFStatusName (const OpenALCapabilities &capabilities)
@@ -174,7 +239,296 @@ namespace
 		default: return "unknown";
 		}
 	}
+
+	const char *HRTFActiveName (const OpenALCapabilities &capabilities)
+	{
+		if (!capabilities.HRTFActiveKnown)
+		{
+			return "unknown";
+		}
+		return capabilities.HRTFActive ? "yes" : "no";
+	}
+
+	const char *HRTFContextFailureName (OpenALContextHRTFFailure failure)
+	{
+		switch (failure)
+		{
+		case OALHRTFCONTEXT_ExtensionAbsent: return "extension absent";
+		case OALHRTFCONTEXT_CreateFailed: return "attribute context creation failed; retried without attributes";
+		case OALHRTFCONTEXT_MakeCurrentFailed: return "attribute context current activation failed; retried without attributes";
+		default: return "attributes accepted";
+		}
+	}
+
+	struct OpenALContextState
+	{
+		ALCdevice *Device;
+		ALCcontext *Context;
+		bool HRTFAttributesApplied;
+		OpenALContextHRTFFailure HRTFFailure;
+
+		OpenALContextState () : Device (NULL), Context (NULL), HRTFAttributesApplied (false), HRTFFailure (OALHRTFCONTEXT_NoFailure) {}
+	};
+
+#ifdef OAL_LIFECYCLE_TEST
+	struct OpenALContextTestState
+	{
+		OpenALContextTestFailure Failure;
+		OpenALContextTestResult Result;
+	};
+
+	OpenALContextTestState *ContextTestState = NULL;
+
+	ALCdevice *OpenContextTestDevice (const ALCchar *)
+	{
+		++ContextTestState->Result.OpenCount;
+		if (ContextTestState->Failure == OALCONTEXTTEST_SecondOpenFailure && ContextTestState->Result.OpenCount == 2)
+		{
+			return NULL;
+		}
+		return reinterpret_cast<ALCdevice *> ((size_t)ContextTestState->Result.OpenCount);
+	}
+
+	ALCboolean IsContextTestExtensionPresent (ALCdevice *device, const ALCchar *)
+	{
+		ContextTestState->Result.HRTFExtensionQueriedOnDevice = device != NULL;
+		return device != NULL && ContextTestState->Result.HRTFAdvertised ? ALC_TRUE : ALC_FALSE;
+	}
+
+	const ALCchar *GetContextTestHRTFSpecifier (ALCdevice *, ALCenum parameter)
+	{
+		ContextTestState->Result.HRTFSpecifierParameter = parameter;
+		return NULL;
+	}
+
+	ALCcontext *CreateContextTestContext (ALCdevice *, const ALCint *attributes)
+	{
+		++ContextTestState->Result.CreateCount;
+		if (ContextTestState->Result.CreateCount == 1)
+		{
+			ContextTestState->Result.FirstAttributesWereHRTF = attributes != NULL && attributes[0] == ALC_HRTF_SOFT;
+		}
+		else
+		{
+			ContextTestState->Result.SecondAttributesWereNull = attributes == NULL;
+		}
+		if ((ContextTestState->Failure == OALCONTEXTTEST_FirstCreateFailure && ContextTestState->Result.CreateCount == 1) ||
+			(ContextTestState->Failure == OALCONTEXTTEST_SecondCreateFailure && ContextTestState->Result.CreateCount == 2))
+		{
+			return NULL;
+		}
+		return reinterpret_cast<ALCcontext *> ((size_t)ContextTestState->Result.CreateCount);
+	}
+
+	ALCboolean MakeContextTestCurrent (ALCcontext *)
+	{
+		++ContextTestState->Result.MakeCurrentCount;
+		return !((ContextTestState->Failure == OALCONTEXTTEST_FirstMakeCurrentFailure && ContextTestState->Result.MakeCurrentCount == 1) ||
+			(ContextTestState->Failure == OALCONTEXTTEST_SecondMakeCurrentFailure && ContextTestState->Result.MakeCurrentCount == 2) ||
+			(ContextTestState->Failure == OALCONTEXTTEST_BothMakeCurrentFailures && ContextTestState->Result.MakeCurrentCount <= 2));
+	}
+
+	void DestroyContextTestContext (ALCcontext *) { ++ContextTestState->Result.DestroyCount; }
+	ALCboolean CloseContextTestDevice (ALCdevice *) { ++ContextTestState->Result.CloseCount; return ALC_TRUE; }
+#endif
+
+	ALCdevice *OpenContextDevice (const ALCchar *name)
+	{
+#ifdef OAL_LIFECYCLE_TEST
+		if (ContextTestState != NULL)
+		{
+			return OpenContextTestDevice (name);
+		}
+#endif
+		return alcOpenDevice (name);
+	}
+
+	ALCboolean IsContextExtensionPresent (ALCdevice *device, const ALCchar *extension)
+	{
+#ifdef OAL_LIFECYCLE_TEST
+		if (ContextTestState != NULL)
+		{
+			return IsContextTestExtensionPresent (device, extension);
+		}
+#endif
+		return alcIsExtensionPresent (device, extension);
+	}
+
+	const ALCchar *GetHRTFSpecifier (ALCdevice *device)
+	{
+#ifdef OAL_LIFECYCLE_TEST
+		if (ContextTestState != NULL)
+		{
+			return GetContextTestHRTFSpecifier (device, ALC_HRTF_SPECIFIER_SOFT);
+		}
+#endif
+		return alcGetString (device, ALC_HRTF_SPECIFIER_SOFT);
+	}
+
+	ALCcontext *CreateContext (ALCdevice *device, const ALCint *attributes)
+	{
+#ifdef OAL_LIFECYCLE_TEST
+		if (ContextTestState != NULL)
+		{
+			return CreateContextTestContext (device, attributes);
+		}
+#endif
+		return alcCreateContext (device, attributes);
+	}
+
+	ALCboolean MakeContextCurrent (ALCcontext *context)
+	{
+#ifdef OAL_LIFECYCLE_TEST
+		if (ContextTestState != NULL)
+		{
+			return MakeContextTestCurrent (context);
+		}
+#endif
+		return alcMakeContextCurrent (context);
+	}
+
+	void DestroyContext (ALCcontext *context)
+	{
+#ifdef OAL_LIFECYCLE_TEST
+		if (ContextTestState != NULL)
+		{
+			DestroyContextTestContext (context);
+			return;
+		}
+#endif
+		alcDestroyContext (context);
+	}
+
+	ALCboolean CloseContextDevice (ALCdevice *device)
+	{
+#ifdef OAL_LIFECYCLE_TEST
+		if (ContextTestState != NULL)
+		{
+			return CloseContextTestDevice (device);
+		}
+#endif
+		return alcCloseDevice (device);
+	}
+
+	void CloseOpenALContext (ALCdevice *device, ALCcontext *context)
+	{
+		if (context != NULL)
+		{
+			if (alcGetCurrentContext () == context)
+			{
+				alcMakeContextCurrent (NULL);
+			}
+			DestroyContext (context);
+		}
+		if (device != NULL)
+		{
+			CloseContextDevice (device);
+		}
+	}
+
+	bool CreateOpenALContext (const ALCchar *deviceName, bool hrtfEnabled, OpenALContextState *state)
+	{
+		ALCint hrtfAttributes[3];
+		ALCdevice *device = OpenContextDevice (deviceName);
+		if (device == NULL)
+		{
+			return false;
+		}
+		bool hrtfAdvertised = IsContextExtensionPresent (device, "ALC_SOFT_HRTF") == ALC_TRUE;
+		bool hrtfAttributesRequested = OALBuildHRTFContextAttributes (hrtfAdvertised, hrtfEnabled, (int *)hrtfAttributes);
+		if (!hrtfAttributesRequested)
+		{
+			state->HRTFFailure = OALHRTFCONTEXT_ExtensionAbsent;
+		}
+		ALCcontext *context = CreateContext (device, hrtfAttributesRequested ? hrtfAttributes : NULL);
+		if (context != NULL && MakeContextCurrent (context))
+		{
+			state->Device = device;
+			state->Context = context;
+			state->HRTFAttributesApplied = hrtfAttributesRequested;
+			return true;
+		}
+		if (!hrtfAttributesRequested)
+		{
+			CloseOpenALContext (device, context);
+			return false;
+		}
+		state->HRTFFailure = context == NULL ? OALHRTFCONTEXT_CreateFailed : OALHRTFCONTEXT_MakeCurrentFailed;
+		CloseOpenALContext (device, context);
+		device = OpenContextDevice (deviceName);
+		if (device == NULL)
+		{
+			return false;
+		}
+		context = CreateContext (device, NULL);
+		if (context == NULL || !MakeContextCurrent (context))
+		{
+			CloseOpenALContext (device, context);
+			return false;
+		}
+		state->Device = device;
+		state->Context = context;
+		return true;
+	}
 }
+
+#ifdef OAL_LIFECYCLE_TEST
+OpenALContextTestResult OALTestRunContextInitialization (bool hrtfAdvertised, bool hrtfEnabled,
+	OpenALContextTestFailure failure)
+{
+	OpenALContextTestState testState;
+	OpenALContextState contextState;
+	testState.Failure = failure;
+	memset (&testState.Result, 0, sizeof (testState.Result));
+	testState.Result.HRTFAdvertised = hrtfAdvertised;
+	ContextTestState = &testState;
+	testState.Result.Success = CreateOpenALContext (NULL, hrtfEnabled, &contextState);
+	if (testState.Result.Success)
+	{
+		testState.Result.AttributesApplied = contextState.HRTFAttributesApplied;
+		testState.Result.HRTFFailure = contextState.HRTFFailure;
+		GetHRTFSpecifier (contextState.Device);
+		CloseOpenALContext (contextState.Device, contextState.Context);
+	}
+	ContextTestState = NULL;
+	return testState.Result;
+}
+
+bool OALTestCopyHRTFSpecifier (const char *specifier, bool querySucceeded, OpenALCapabilities *capabilities)
+{
+	return CopyHRTFSpecifier (capabilities, specifier, querySucceeded);
+}
+
+OpenALHRTFQueryTestResult OALTestQueryHRTFCapabilities (bool hrtfAdvertised,
+	bool activeQuerySucceeded, bool active, bool statusQuerySucceeded, int status)
+{
+	OpenALHRTFQueryTestResult result;
+	OpenALHRTFQueryTestState testState;
+	OpenALEFXFunctions efx;
+	bool activeKnown = false;
+	bool statusKnown = false;
+	ALCint activeValue = ALC_FALSE;
+	ALCint statusValue = 0;
+
+	memset (&testState, 0, sizeof (testState));
+	testState.ActiveQuerySucceeded = activeQuerySucceeded;
+	testState.Active = active;
+	testState.StatusQuerySucceeded = statusQuerySucceeded;
+	testState.Status = status;
+	HRTFQueryTestState = &testState;
+	if (hrtfAdvertised)
+	{
+		activeKnown = GetHRTFInteger (NULL, ALC_HRTF_SOFT, &activeValue);
+		statusKnown = GetHRTFInteger (NULL, ALC_HRTF_STATUS_SOFT, &statusValue);
+	}
+	HRTFQueryTestState = NULL;
+	result.Capabilities = OALBuildCapabilities (hrtfAdvertised, activeKnown, activeValue == ALC_TRUE,
+		statusKnown, statusValue, false, efx, false);
+	result.ActiveQueryCount = testState.ActiveQueryCount;
+	result.StatusQueryCount = testState.StatusQueryCount;
+	return result;
+}
+#endif
 
 enum
 {
@@ -1367,7 +1721,7 @@ void OpenALSoundStream::ReleaseResources ()
 
 OpenALSoundRenderer::OpenALSoundRenderer ()
 	: Device (NULL), Context (NULL), Capabilities (), Sources (NULL), RequestedSources (0),
-	  AllocatedSources (0), OutputRate (0), InitSuccess (false), SfxVolume (1.f),
+	  AllocatedSources (0), OutputRate (0), InitSuccess (false), HRTFAttributesApplied (false), HRTFRequestedEnabled (false), HRTFFailure (OALHRTFCONTEXT_NoFailure), SfxVolume (1.f),
 		MusicVolume (1.f), NextAllocationSerial (0), NextLogicalPositionToken (~0ull), PausableOutputFrames (0),
 	  NonPausableOutputFrames (0), PausableFrameRemainder (0), NonPausableFrameRemainder (0),
 	  LastClockMilliseconds (0), SfxPaused (0), InactiveState (INACTIVE_Active),
@@ -1389,6 +1743,7 @@ bool OpenALSoundRenderer::Init ()
 {
 	const char *requestedDevice = *snd_openal_device;
 	const char *deviceName = NULL;
+	OpenALContextState contextState;
 	ALCdevice *device;
 	ALCcontext *context;
 
@@ -1402,28 +1757,19 @@ bool OpenALSoundRenderer::Init ()
 		}
 	}
 
-	device = alcOpenDevice (deviceName);
-	if (device == NULL)
+	if (!CreateOpenALContext (deviceName, snd_hrtf, &contextState))
 	{
-		Printf (TEXTCOLOR_RED "OpenAL could not open device '%s'. Falling back to FMOD.\n", requestedDevice);
+		Printf (TEXTCOLOR_RED "OpenAL could not create a current context for device '%s'. Falling back to FMOD.\n", requestedDevice);
 		return false;
 	}
+	device = contextState.Device;
+	context = contextState.Context;
 	Device = device;
 	DeviceName = alcGetString (device, ALC_DEVICE_SPECIFIER);
-
-	context = alcCreateContext (device, NULL);
-	if (context == NULL || !alcMakeContextCurrent (context))
-	{
-		Printf (TEXTCOLOR_RED "OpenAL could not create a current context. Falling back to FMOD.\n");
-		if (context != NULL)
-		{
-			alcDestroyContext (context);
-		}
-		alcCloseDevice (device);
-		Device = NULL;
-		return false;
-	}
 	Context = context;
+	HRTFAttributesApplied = contextState.HRTFAttributesApplied;
+	HRTFRequestedEnabled = snd_hrtf;
+	HRTFFailure = contextState.HRTFFailure;
 	const ALchar *version = alGetString (AL_VERSION);
 	OpenALVersion = version != NULL ? version : "unknown";
 	Capabilities = CollectOpenALCapabilities (device);
@@ -2656,8 +3002,13 @@ void OpenALSoundRenderer::PrintStatus ()
 		Printf ("Output sample rate: " TEXTCOLOR_GREEN "%d\n", OutputRate);
 	}
 	Printf ("AL_SOFT_loop_points: " TEXTCOLOR_GREEN "available\n");
-	Printf ("ALC_SOFT_HRTF: %s, status: %s (%d)\n", Capabilities.HRTFAdvertised ? "advertised" : "absent",
-		HRTFStatusName (Capabilities), Capabilities.HRTFStatus);
+	Printf ("ALC_SOFT_HRTF: %s, attributes at init: %s, request at init: %s, current cvar: %s, active: %s, status: %s (%d), init result: %s%s%s\n",
+		Capabilities.HRTFAdvertised ? "advertised" : "absent", HRTFAttributesApplied ? "applied" : "not applied",
+		HRTFRequestedEnabled ? "on" : "off", snd_hrtf ? "on" : "off",
+		HRTFActiveName (Capabilities), HRTFStatusName (Capabilities), Capabilities.HRTFStatus,
+			HRTFContextFailureName (HRTFFailure),
+		Capabilities.HRTFSpecifier.GetChars ()[0] != '\0' ? ", specifier: " : "",
+		Capabilities.HRTFSpecifier.GetChars ()[0] != '\0' ? Capabilities.HRTFSpecifier.GetChars () : "");
 	Printf ("ALC_EXT_EFX: %s, entrypoints: %s, usable: %s, applied: %s\n",
 		Capabilities.EFXAdvertised ? "advertised" : "absent", Capabilities.EFXCallable ? "callable" : "missing",
 		Capabilities.EFXUsable ? "yes" : "no", Capabilities.EFXApplied ? "yes" : "no");
@@ -2731,17 +3082,20 @@ bool OpenALEFXFunctions::IsCallable () const
 }
 
 OpenALCapabilities::OpenALCapabilities ()
-	: HRTFAdvertised (false), HRTFStatusKnown (false), HRTFStatus (0), EFXAdvertised (false), EFX (),
+	: HRTFAdvertised (false), HRTFActiveKnown (false), HRTFActive (false), HRTFStatusKnown (false), HRTFStatus (0), HRTFSpecifier (), EFXAdvertised (false), EFX (),
 	  EFXCallable (false), EFXUsable (false), EFXApplied (false), EFXSendCount (-1), RadiusAdvertised (false),
 	  RadiusApplied (false), DopplerApplied (false)
 {
 }
 
-OpenALCapabilities OALBuildCapabilities (bool hrtfAdvertised, bool hrtfStatusKnown, int hrtfStatus,
+OpenALCapabilities OALBuildCapabilities (bool hrtfAdvertised, bool hrtfActiveKnown, bool hrtfActive,
+	bool hrtfStatusKnown, int hrtfStatus,
 	bool efxAdvertised, const OpenALEFXFunctions &efx, bool radiusAdvertised)
 {
 	OpenALCapabilities capabilities;
 	capabilities.HRTFAdvertised = hrtfAdvertised;
+	capabilities.HRTFActiveKnown = hrtfActiveKnown;
+	capabilities.HRTFActive = hrtfActive;
 	capabilities.HRTFStatusKnown = hrtfStatusKnown;
 	capabilities.HRTFStatus = hrtfStatus;
 	capabilities.EFXAdvertised = efxAdvertised;
@@ -2749,4 +3103,16 @@ OpenALCapabilities OALBuildCapabilities (bool hrtfAdvertised, bool hrtfStatusKno
 	capabilities.EFXCallable = efx.IsCallable ();
 	capabilities.RadiusAdvertised = radiusAdvertised;
 	return capabilities;
+}
+
+bool OALBuildHRTFContextAttributes (bool hrtfAdvertised, bool hrtfEnabled, int attributes[3])
+{
+	if (!hrtfAdvertised)
+	{
+		return false;
+	}
+	attributes[0] = ALC_HRTF_SOFT;
+	attributes[1] = hrtfEnabled ? ALC_TRUE : ALC_FALSE;
+	attributes[2] = 0;
+	return true;
 }

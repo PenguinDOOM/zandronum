@@ -19,6 +19,7 @@ OALTestIntCVar snd_channels (1);
 OALTestStringCVar snd_openal_device ("default");
 OALTestFloatCVar snd_sfxvolume (1.f);
 OALTestBoolCVar snd_pitched (true);
+OALTestBoolCVar snd_hrtf (false);
 extern bool OALTestForceFloatPCM16Fallback;
 
 namespace
@@ -70,6 +71,21 @@ namespace
 	std::vector<BYTE> MakeStereoSamples (unsigned int frames)
 	{
 		return std::vector<BYTE> ((size_t)frames * 4, 0);
+	}
+
+	std::vector<BYTE> MakeManualNoiseSamples (unsigned int frames)
+	{
+		std::vector<BYTE> samples ((size_t)frames * 2);
+		unsigned int state = 0x4f1bbcd3u;
+		for (unsigned int frame = 0; frame < frames; ++frame)
+		{
+			state = state * 1664525u + 1013904223u;
+			short sample = (short)(((int)(state >> 16) - 32768) / 7);
+			unsigned int encoded = (unsigned short)sample;
+			samples[(size_t)frame * 2] = (BYTE)encoded;
+			samples[(size_t)frame * 2 + 1] = (BYTE)(encoded >> 8);
+		}
+		return samples;
 	}
 
 	void WriteLE16 (std::vector<BYTE> &bytes, size_t offset, unsigned int value)
@@ -1817,16 +1833,119 @@ static int RunPriorityRendererTests (std::vector<BYTE> &longSamples)
 	return 0;
 }
 
-static void TestPhase2Capabilities ()
+static void TestPhase2ContextInitialization ()
 {
+	OpenALContextTestResult extensionAbsent = OALTestRunContextInitialization (false, true, OALCONTEXTTEST_NoFailure);
+	Check (extensionAbsent.Success && !extensionAbsent.AttributesApplied && extensionAbsent.OpenCount == 1 &&
+		extensionAbsent.CreateCount == 1 && !extensionAbsent.FirstAttributesWereHRTF,
+		"phase2 absent HRTF extension keeps normal OpenAL context initialization");
+	OpenALContextTestResult hrtfRejected = OALTestRunContextInitialization (true, true, OALCONTEXTTEST_FirstCreateFailure);
+	Check (hrtfRejected.Success && !hrtfRejected.AttributesApplied && hrtfRejected.OpenCount == 2 && hrtfRejected.CreateCount == 2 &&
+		hrtfRejected.DestroyCount == 1 && hrtfRejected.CloseCount == 2 && hrtfRejected.HRTFExtensionQueriedOnDevice &&
+		hrtfRejected.FirstAttributesWereHRTF && hrtfRejected.SecondAttributesWereNull &&
+		hrtfRejected.HRTFFailure == OALHRTFCONTEXT_CreateFailed,
+		"phase2 rejected HRTF context closes the first device and retries once without attributes");
+	Check (OALTestRunContextInitialization (true, true, OALCONTEXTTEST_NoFailure).HRTFSpecifierParameter == 0x1995,
+		"phase2 HRTF specifier query uses ALC_HRTF_SPECIFIER_SOFT");
+	OpenALContextTestResult hrtfMakeCurrentFailure = OALTestRunContextInitialization (true, true, OALCONTEXTTEST_FirstMakeCurrentFailure);
+	Check (hrtfMakeCurrentFailure.Success && hrtfMakeCurrentFailure.DestroyCount == 2 && hrtfMakeCurrentFailure.CloseCount == 2 &&
+		hrtfMakeCurrentFailure.SecondAttributesWereNull,
+		"phase2 HRTF make-current failure destroys its context before the attribute-free retry");
+}
+
+static FVector3 MakePhase2BackendPosition (float gameX, float gameY, float gameZ)
+{
+	return FVector3 (gameX, gameZ, gameY);
+}
+
+struct Phase2DirectionCase
+{
+	const char *ID;
+	const char *ExpectedDirection;
+	float GameX;
+	float GameY;
+	float GameZ;
+};
+
+static void TestPhase2ManualDirectionMapping ()
+{
+	FVector3 left = MakePhase2BackendPosition (0.f, 64.f, 0.f);
+	FVector3 right = MakePhase2BackendPosition (0.f, -64.f, 0.f);
+	FVector3 front = MakePhase2BackendPosition (64.f, 0.f, 0.f);
+	FVector3 back = MakePhase2BackendPosition (-64.f, 0.f, 0.f);
+	FVector3 up = MakePhase2BackendPosition (0.f, 0.f, 64.f);
+	FVector3 down = MakePhase2BackendPosition (0.f, 0.f, -64.f);
+	Check (left.X == 0.f && left.Y == 0.f && left.Z == 64.f && right.Z == -64.f &&
+		front.X == 64.f && back.X == -64.f && up.Y == 64.f && down.Y == -64.f,
+		"phase2 manual direction mapping preserves game x,z,y listener coordinates");
+}
+
+static void TestPhase2ContextFailureCleanup ()
+{
+	OpenALContextTestResult basicFailure = OALTestRunContextInitialization (false, true, OALCONTEXTTEST_FirstCreateFailure);
+	Check (!basicFailure.Success && basicFailure.OpenCount == 1 && basicFailure.CreateCount == 1 && basicFailure.DestroyCount == 0 &&
+		basicFailure.CloseCount == 1 && !basicFailure.FirstAttributesWereHRTF,
+		"phase2 basic OpenAL failure closes once without an HRTF retry");
+	OpenALContextTestResult retryFailure = OALTestRunContextInitialization (true, true, OALCONTEXTTEST_BothMakeCurrentFailures);
+	Check (!retryFailure.Success, "phase2 failed attribute-free retry returns failure");
+	Check (retryFailure.OpenCount == 2 && retryFailure.CreateCount == 2 && retryFailure.MakeCurrentCount == 2,
+		"phase2 failed attribute-free retry stops after one retry");
+	Check (retryFailure.DestroyCount == 2 && retryFailure.CloseCount == 2,
+		"phase2 failed attribute-free retry cleans both contexts");
+}
+
+static void TestPhase2HRTFCapabilities ()
+{
+	int attributes[3] = { 0, 0, 0 };
+	Check (!OALBuildHRTFContextAttributes (false, true, attributes),
+		"phase2 HRTF attributes are absent when the extension is unavailable");
+	Check (OALBuildHRTFContextAttributes (true, true, attributes) && attributes[0] == 0x1992 && attributes[1] == 1 && attributes[2] == 0,
+		"phase2 HRTF startup request explicitly enables advertised HRTF");
+	Check (OALBuildHRTFContextAttributes (true, false, attributes) && attributes[1] == 0,
+		"phase2 HRTF startup request explicitly disables advertised HRTF");
 	OpenALEFXFunctions missing;
-	OpenALCapabilities absent = OALBuildCapabilities (false, false, 0, false, missing, false);
+	OpenALCapabilities absent = OALBuildCapabilities (false, false, false, false, 0, false, missing, false);
 	Check (!absent.HRTFAdvertised && !absent.EFXAdvertised && !absent.EFXCallable && !absent.RadiusAdvertised,
 		"phase2 absent extensions remain unavailable");
+	OpenALCapabilities denied = OALBuildCapabilities (true, true, false, true, 0x0002, false, missing, false);
+	OpenALCapabilities unsupported = OALBuildCapabilities (true, true, false, true, 0x0005, false, missing, false);
+	Check (denied.HRTFAdvertised && denied.HRTFStatusKnown && !denied.HRTFActive &&
+		unsupported.HRTFAdvertised && unsupported.HRTFStatusKnown && !unsupported.HRTFActive,
+		"phase2 rejected or unsupported HRTF status remains an active renderer capability, not HRTF activation");
+	OpenALCapabilities specifier;
+	Check (OALTestCopyHRTFSpecifier ("Test HRTF", true, &specifier) && strcmp (specifier.HRTFSpecifier.GetChars (), "Test HRTF") == 0 &&
+		!OALTestCopyHRTFSpecifier (NULL, true, &specifier) && !OALTestCopyHRTFSpecifier ("ignored", false, &specifier) &&
+		strcmp (specifier.HRTFSpecifier.GetChars (), "Test HRTF") == 0,
+		"phase2 HRTF specifier is copied only after a successful non-null query");
+	OpenALCapabilities unknown = OALBuildCapabilities (true, true, true, true, 777, false, missing, false);
+	Check (unknown.HRTFStatusKnown && unknown.HRTFStatus == 777 && unknown.HRTFActive,
+		"phase2 unknown HRTF numerical status is retained");
+}
 
+static void TestPhase2HRTFActualQuery ()
+{
+	OpenALHRTFQueryTestResult required = OALTestQueryHRTFCapabilities (true, true, true, true, 0x0003);
+	OpenALHRTFQueryTestResult headphones = OALTestQueryHRTFCapabilities (true, true, true, true, 0x0004);
+	OpenALHRTFQueryTestResult inactive = OALTestQueryHRTFCapabilities (true, true, false, true, 0x0001);
+	Check (required.Capabilities.HRTFActiveKnown && required.Capabilities.HRTFActive && required.Capabilities.HRTFStatus == 0x0003 &&
+		headphones.Capabilities.HRTFActiveKnown && headphones.Capabilities.HRTFActive && headphones.Capabilities.HRTFStatus == 0x0004 &&
+		inactive.Capabilities.HRTFActiveKnown && !inactive.Capabilities.HRTFActive && inactive.Capabilities.HRTFStatus == 0x0001,
+		"phase2 HRTF activity is independent from the status reason");
+	OpenALHRTFQueryTestResult activeError = OALTestQueryHRTFCapabilities (true, false, true, true, 777);
+	OpenALHRTFQueryTestResult statusError = OALTestQueryHRTFCapabilities (true, true, false, false, 777);
+	OpenALHRTFQueryTestResult extensionAbsent = OALTestQueryHRTFCapabilities (false, true, true, true, 777);
+	Check (!activeError.Capabilities.HRTFActiveKnown && activeError.Capabilities.HRTFStatusKnown && activeError.Capabilities.HRTFStatus == 777 &&
+		statusError.Capabilities.HRTFActiveKnown && !statusError.Capabilities.HRTFActive && !statusError.Capabilities.HRTFStatusKnown &&
+		extensionAbsent.ActiveQueryCount == 0 && extensionAbsent.StatusQueryCount == 0,
+		"phase2 HRTF activity and status query errors remain separate and absent extensions are not queried");
+}
+
+
+static void TestPhase2EFXCapabilities ()
+{
 	OpenALEFXFunctions partial;
 	partial.GenEffects = reinterpret_cast<OALGenEffects> (static_cast<uintptr_t> (1));
-	OpenALCapabilities missingPointer = OALBuildCapabilities (false, false, 0, true, partial, false);
+	OpenALCapabilities missingPointer = OALBuildCapabilities (false, false, false, false, 0, true, partial, false);
 	Check (missingPointer.EFXAdvertised && !missingPointer.EFXCallable && !missingPointer.EFXUsable,
 		"phase2 missing EFX pointer is not callable or usable");
 
@@ -1844,25 +1963,42 @@ static void TestPhase2Capabilities ()
 	callable.DeleteFilters = reinterpret_cast<OALDeleteFilters> (static_cast<uintptr_t> (1));
 	callable.Filteri = reinterpret_cast<OALFilteri> (static_cast<uintptr_t> (1));
 	callable.Filterf = reinterpret_cast<OALFilterf> (static_cast<uintptr_t> (1));
-	OpenALCapabilities known = OALBuildCapabilities (true, true, 1, true, callable, true);
-	Check (known.HRTFAdvertised && known.HRTFStatusKnown && known.HRTFStatus == 1 && known.EFXCallable && !known.EFXUsable &&
+	OpenALCapabilities known = OALBuildCapabilities (true, true, true, true, 1, true, callable, true);
+	Check (known.HRTFAdvertised && known.HRTFActiveKnown && known.HRTFStatusKnown && known.HRTFStatus == 1 && known.HRTFActive && known.EFXCallable && !known.EFXUsable &&
 		known.EFXSendCount < 0 && known.RadiusAdvertised && !known.RadiusApplied && !known.DopplerApplied,
 		"phase2 known status separates callable from applied state");
-	OpenALCapabilities unknown = OALBuildCapabilities (true, true, 777, false, missing, false);
-	Check (unknown.HRTFStatusKnown && unknown.HRTFStatus == 777,
-		"phase2 unknown HRTF numerical status is retained");
+}
+
+static void TestPhase2Capabilities ()
+{
+	TestPhase2ContextInitialization ();
+	TestPhase2ManualDirectionMapping ();
+	TestPhase2ContextFailureCleanup ();
+	TestPhase2HRTFCapabilities ();
+	TestPhase2HRTFActualQuery ();
+	TestPhase2EFXCapabilities ();
+}
+
+static void TestPhase2RuntimeHRTFRequest (OpenALSoundRenderer &renderer)
+{
+	bool requestedAtInit = renderer.HRTFRequestedEnabled;
+	snd_hrtf.Value = !requestedAtInit;
+	Check (renderer.HRTFRequestedEnabled == requestedAtInit,
+		"phase2 current HRTF cvar remains pending until renderer reinitialization");
+	snd_hrtf.Value = requestedAtInit;
 }
 
 static bool IsKnownOperation (const char *operation)
 {
 	return operation == NULL || strcmp (operation, "--phase2-unit-only") == 0 ||
 		strcmp (operation, "--phase2-status") == 0 || strcmp (operation, "--phase1b-direct-memory") == 0 ||
-		strcmp (operation, "--phase1b-file-slice") == 0;
+		strcmp (operation, "--phase1b-file-slice") == 0 || strcmp (operation, "--phase2-listen-six-directions") == 0 ||
+		strcmp (operation, "--phase2-status-hrtf-on") == 0;
 }
 
 static int PrintUsage (const char *program)
 {
-	fprintf (stderr, "Usage: %s [--phase2-unit-only|--phase2-status|--phase1b-direct-memory|--phase1b-file-slice]\n", program);
+	fprintf (stderr, "Usage: %s [--phase2-unit-only|--phase2-status|--phase2-status-hrtf-on|--phase1b-direct-memory|--phase1b-file-slice|--phase2-listen-six-directions]\n", program);
 	return 2;
 }
 
@@ -1889,13 +2025,124 @@ static bool RunInitialOperation (const char *operation, const char *program, int
 
 static bool PrintPhase2StatusIfRequested (const char *operation, OpenALSoundRenderer &renderer)
 {
-	if (operation == NULL || strcmp (operation, "--phase2-status") != 0)
+	if (operation == NULL || (strcmp (operation, "--phase2-status") != 0 && strcmp (operation, "--phase2-status-hrtf-on") != 0))
 	{
 		return false;
 	}
 	renderer.PrintStatus ();
+	fprintf (stdout, "HRTF: advertised=%d, attributes-at-init=%d, request-at-init=%d, active-known=%d, active=%s, status-known=%d, status=%d, init-result=%d, specifier=%s\n",
+		renderer.Capabilities.HRTFAdvertised ? 1 : 0, renderer.HRTFAttributesApplied ? 1 : 0,
+		renderer.HRTFRequestedEnabled ? 1 : 0, renderer.Capabilities.HRTFActiveKnown ? 1 : 0,
+		renderer.Capabilities.HRTFActiveKnown ? (renderer.Capabilities.HRTFActive ? "1" : "0") : "unknown",
+		renderer.Capabilities.HRTFStatusKnown ? 1 : 0, renderer.Capabilities.HRTFStatus,
+		renderer.HRTFFailure, renderer.Capabilities.HRTFSpecifier.GetChars ());
 	fprintf (stdout, "Stats: %s\n", renderer.GatherStats ().GetChars ());
 	return true;
+}
+
+static bool IsPhase2ListeningOperation (const char *operation)
+{
+	return operation != NULL && strcmp (operation, "--phase2-listen-six-directions") == 0;
+}
+
+static bool PlayPhase2ListeningBurst (OpenALSoundRenderer &renderer, SoundHandle sound, SoundListener &listener,
+	FRolloffInfo &rolloff, const Phase2DirectionCase &testCase)
+{
+	FVector3 backendPosition = MakePhase2BackendPosition (testCase.GameX, testCase.GameY, testCase.GameZ);
+	FVector3 openALPosition (backendPosition.X, backendPosition.Y, -backendPosition.Z);
+	FISoundChannel *channel;
+	fprintf (stdout, "%s expected=%s game=(%.0f,%.0f,%.0f) backend=(%.0f,%.0f,%.0f) OpenAL=(%.0f,%.0f,%.0f)\n",
+		testCase.ID, testCase.ExpectedDirection, testCase.GameX, testCase.GameY, testCase.GameZ,
+		backendPosition.X, backendPosition.Y, backendPosition.Z, openALPosition.X, openALPosition.Y, openALPosition.Z);
+	channel = renderer.StartSound3D (sound, &listener, 0.6f, &rolloff, 1.f, 128, 0, backendPosition, FVector3 (), 0, 0, NULL);
+	if (channel == NULL)
+	{
+		fprintf (stderr, "FAILED: %s could not start a 3D source\n", testCase.ID);
+		return false;
+	}
+	for (int elapsed = 0; elapsed < 2000 && channel->SysChannel != NULL; elapsed += 20)
+	{
+		std::this_thread::sleep_for (std::chrono::milliseconds (20));
+		renderer.UpdateSounds ();
+	}
+	StopAndDrain (renderer, channel);
+	ReleaseOwner (channel);
+	return true;
+}
+
+static int RunPhase2SixDirectionListening (OpenALSoundRenderer &renderer)
+{
+	static const Phase2DirectionCase cases[] =
+	{
+		{ "M01", "left", 0.f, 64.f, 0.f },
+		{ "M02", "right", 0.f, -64.f, 0.f },
+		{ "M03", "front", 64.f, 0.f, 0.f },
+		{ "M04", "back", -64.f, 0.f, 0.f },
+		{ "M05", "up", 0.f, 0.f, 64.f },
+		{ "M06", "down", 0.f, 0.f, -64.f }
+	};
+	const unsigned int sampleRate = 22050;
+	const unsigned int burstFrames = sampleRate * 2;
+	SoundListener listener;
+	FRolloffInfo rolloff = MakeLinearRolloff (64.f, 128.f);
+	std::vector<BYTE> samples;
+	SoundHandle sound;
+	int index = 0;
+
+	if (!renderer.Capabilities.HRTFActiveKnown || !renderer.Capabilities.HRTFActive)
+	{
+		fprintf (stderr, "SKIP: HRTF actual activity is not available (known=%d active=%d); manual listening did not run\n",
+			renderer.Capabilities.HRTFActiveKnown ? 1 : 0, renderer.Capabilities.HRTFActive ? 1 : 0);
+		return 77;
+	}
+
+	samples = MakeManualNoiseSamples (burstFrames);
+	sound = renderer.LoadSoundRaw (&samples[0], (int)samples.size (), sampleRate, 1, -16, -1);
+	if (sound.data == NULL)
+	{
+		fprintf (stderr, "FAILED: manual listening PCM buffer could not initialize\n");
+		return 1;
+	}
+	listener.position = FVector3 (0.f, 0.f, 0.f);
+	listener.velocity = FVector3 ();
+	listener.angle = 0.f;
+	listener.valid = true;
+	renderer.UpdateListener (&listener);
+	fprintf (stdout, "HRTF active. Listener game=(0,0,0) backend=(0,0,0) OpenAL=(0,0,0) forward=(+1,0,0).\n");
+
+	while (index >= 0 && index < (int)(sizeof (cases) / sizeof (cases[0])))
+	{
+		char command[16];
+
+		if (!PlayPhase2ListeningBurst (renderer, sound, listener, rolloff, cases[index]))
+		{
+			renderer.UnloadSound (sound);
+			return 1;
+		}
+		fprintf (stdout, "Press Enter for next case, r then Enter to replay, or b then Enter to go back: ");
+		fflush (stdout);
+		if (fgets (command, sizeof (command), stdin) == NULL)
+		{
+			fprintf (stderr, "FAILED: manual listening input closed before completion\n");
+			renderer.UnloadSound (sound);
+			return 1;
+		}
+		if (command[0] == 'r' || command[0] == 'R')
+		{
+			continue;
+		}
+		if ((command[0] == 'b' || command[0] == 'B') && index > 0)
+		{
+			--index;
+		}
+		else
+		{
+			++index;
+		}
+	}
+	renderer.UnloadSound (sound);
+	fprintf (stdout, "Manual listening sequence completed; no hearing result was recorded by this program.\n");
+	return 0;
 }
 
 int main (int argc, char **argv)
@@ -1906,6 +2153,7 @@ int main (int argc, char **argv)
 	{
 		return initialResult;
 	}
+	if (IsPhase2ListeningOperation (phase1bOperation) || (phase1bOperation != NULL && strcmp (phase1bOperation, "--phase2-status-hrtf-on") == 0)) snd_hrtf.Value = true;
 	std::vector<BYTE> longSamples = MakeSamples (8000);
 	std::vector<BYTE> shortSamples = MakeSamples (160);
 	snd_channels.Value = 2;
@@ -1927,10 +2175,12 @@ int main (int argc, char **argv)
 		fprintf (stderr, "FAILED: OpenAL renderer could not initialize after context creation\n");
 		return 1;
 	}
+	if (IsPhase2ListeningOperation (phase1bOperation)) return RunPhase2SixDirectionListening (renderer);
 	if (PrintPhase2StatusIfRequested (phase1bOperation, renderer))
 	{
 		return 0;
 	}
+	TestPhase2RuntimeHRTFRequest (renderer);
 	if (phase1bOperation != NULL)
 	{
 		if (strcmp (phase1bOperation, "--phase1b-direct-memory") == 0)

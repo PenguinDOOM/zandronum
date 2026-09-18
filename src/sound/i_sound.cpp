@@ -78,6 +78,8 @@ extern HINSTANCE g_hInst;
 #include "w_wad.h"
 #include "i_video.h"
 #include "s_sound.h"
+
+CVAR (Bool, snd_hrtf, false, CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
 #include "v_text.h"
 #include "gi.h"
 
