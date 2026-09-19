@@ -119,6 +119,110 @@ function Assert-ClassifiedFailureEvidence {
     }
 }
 
+function Assert-FinalizationFailureProcess {
+    param(
+        [string]$FixtureRoot,
+        [string]$FailureKind
+    )
+
+    $childScriptPath = Join-Path $FixtureRoot ("finalization-$FailureKind.ps1")
+    $resultPath = Join-Path $FixtureRoot ("finalization-$FailureKind.json")
+    $definition = (Get-Command Complete-LintFinalization -CommandType Function).Definition
+    $childScript = @'
+param([string]$FailureKind, [string]$ResultPath)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+function Complete-LintFinalization {
+'@ + $definition + @'
+}
+$finalization = Complete-LintFinalization `
+    -SaveEvidenceAction { if ($FailureKind -match '^evidence') { throw 'injected evidence failure' } } `
+    -CleanupAction { if ($FailureKind -eq 'cleanup') { throw 'injected cleanup failure' } } `
+    -SaveResultAction {
+        param($status, $exitCode, $errorMessage)
+        if ($FailureKind -eq 'evidence-save') { throw 'injected failed evidence save failure' }
+        @{ Status = $status; ExitCode = $exitCode; Error = $errorMessage } | ConvertTo-Json | Set-Content -LiteralPath $ResultPath -NoNewline
+    }
+if ($FailureKind -eq 'evidence-save') {
+    if ($finalization.Succeeded -or $finalization.ResultSaved -or ($finalization.ErrorMessage -ne 'injected evidence failure')) {
+        exit 3
+    }
+    exit 1
+}
+if ($finalization.Succeeded -or (-not $finalization.ResultSaved)) {
+    exit 2
+}
+exit 1
+'@
+    Set-Content -LiteralPath $childScriptPath -Value $childScript -NoNewline
+    & pwsh -NoProfile -File $childScriptPath -FailureKind $FailureKind -ResultPath $resultPath
+    if ($LASTEXITCODE -ne 1) {
+        throw "Cppcheck $FailureKind finalization process expected exit code 1, got $LASTEXITCODE."
+    }
+
+    if ($FailureKind -eq 'evidence-save') {
+        return
+    }
+
+    $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+    if (($result.Status -ne 'failed') -or ($result.ExitCode -ne 1) -or ($result.Error -notmatch "injected $FailureKind failure")) {
+        throw "Cppcheck $FailureKind finalization process did not save a failed result."
+    }
+}
+
+function Assert-FinalizationSuccessCleanupOnce {
+    $cleanupState = [PSCustomObject]@{ Count = 0 }
+    $savedState = [PSCustomObject]@{ Result = $null }
+    $finalization = Complete-LintFinalization `
+        -SaveEvidenceAction {} `
+        -CleanupAction { $cleanupState.Count++ } `
+        -SaveResultAction { param($status, $exitCode, $errorMessage) $savedState.Result = "$status/$exitCode/$errorMessage" }
+
+    if ((-not $finalization.Succeeded) -or (-not $finalization.ResultSaved) -or ($cleanupState.Count -ne 1) -or ($savedState.Result -ne 'passed/0/')) {
+        throw 'Cppcheck successful finalization did not complete cleanup exactly once.'
+    }
+}
+
+function Assert-LintOuterFinalizationIntegration {
+    $lintScript = Join-Path $PSScriptRoot 'lint.ps1'
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($lintScript, [ref]$tokens, [ref]$errors)
+
+    if ($errors.Count -ne 0) {
+        throw "Could not parse lint.ps1: $($errors[0].Message)"
+    }
+
+    $scriptText = $ast.Extent.Text
+    if (($scriptText -notmatch '\$cleanupState = \[PSCustomObject\]@\{ Completed = \$false \}') -or
+        ($scriptText -notmatch 'if \(-not \$cleanupState\.Completed\)')) {
+        throw 'lint.ps1 outer finalization does not use shared cleanup completion state.'
+    }
+
+    $lockFinally = $ast.FindAll({
+            param($node)
+            ($node -is [System.Management.Automation.Language.TryStatementAst]) -and
+            ($null -ne $node.Finally) -and
+            ($node.Finally.Extent.Text -match 'Exit-CppcheckCacheLock')
+        }, $true) | Select-Object -First 1
+
+    if ($null -eq $lockFinally) {
+        throw 'lint.ps1 does not release the Cppcheck cache lock from a finally block.'
+    }
+
+    $outerFinalization = $ast.FindAll({
+            param($node)
+            ($node -is [System.Management.Automation.Language.TryStatementAst]) -and
+            ($null -ne $node.Finally) -and
+            ($node.Finally.Extent.Text -match 'Remove-CppcheckDisposableStage') -and
+            ($node.Finally.FindAll({ param($child) ($child -is [System.Management.Automation.Language.TryStatementAst]) -and ($null -ne $child.Finally) -and ($child.Finally.Extent.Text -match 'Exit-CppcheckCacheLock') }, $true).Count -ne 0)
+        }, $true) | Select-Object -First 1
+
+    if ($null -eq $outerFinalization) {
+        throw 'lint.ps1 cleanup failure can bypass Cppcheck cache lock release.'
+    }
+}
+
 function Assert-ManifestDoesNotReconfigureBaseline {
     $lintScript = Join-Path $PSScriptRoot 'lint.ps1'
     $tokens = $null
@@ -145,7 +249,45 @@ function Assert-ManifestDoesNotReconfigureBaseline {
     }
 }
 
+function Assert-RealCppcheckProjectCacheRoute {
+    param(
+        [string]$FixtureRoot,
+        [string]$CacheRoot
+    )
+
+    $cppcheck = Get-Command cppcheck -ErrorAction Stop
+    $repositoryRoot = Split-Path -Parent $PSScriptRoot
+    $buildRoot = Join-Path $repositoryRoot 'build-v143'
+    $projectPath = Join-Path $buildRoot 'src/zdoom.vcxproj'
+    $translationUnit = 'src/sound/i_sound.cpp'
+    $evidenceRoot = Join-Path $FixtureRoot 'real-project-evidence'
+    if ((-not (Test-Path -LiteralPath $projectPath -PathType Leaf)) -or (-not (Test-Path -LiteralPath (Join-Path $repositoryRoot $translationUnit) -PathType Leaf))) {
+        throw 'Real generated Cppcheck project fixture is unavailable.'
+    }
+    New-Item -ItemType Directory -Force -Path (Join-Path $evidenceRoot 'commands') | Out-Null
+
+    $analysisContext = Get-CppcheckAnalysisContext -BuildRoot $buildRoot -ProjectPaths @($projectPath) -InputRootIdentities @('regression-live-worktree') -AnalyzerConfigurationPaths @((Join-Path $PSScriptRoot 'lint.ps1'), (Join-Path $PSScriptRoot 'cppcheck-cache.ps1'), (Join-Path $PSScriptRoot 'cppcheck-vendor-dispositions.json')) -AnalyzerOptions @('--project-configuration=Release|x64', '--enable=warning,performance,portability', '--error-exitcode=1', '--debug-analyzerinfo', '--template=tabular', '--quiet', '-j=1')
+    $identity = Get-CppcheckCacheIdentity -AnalyzerVersion (& $cppcheck.Source --version) -AnalyzerSHA256 (Get-FileHash -LiteralPath $cppcheck.Source -Algorithm SHA256).Hash -InputMode 'normal' -Toolset 'v143' -RootIdentity 'regression-live-worktree' -AnalysisContext $analysisContext
+    $cachePath = Get-CppcheckCacheLeaf -CacheRoot $CacheRoot -Namespace 'regression' -Identity $identity -Role 'head' -TargetName ('probe.vcxproj|project:' + (Get-FileHash -LiteralPath $projectPath -Algorithm SHA256).Hash) -TranslationUnit $translationUnit
+    $evidence = [PSCustomObject]@{ Root = $evidenceRoot; Counter = 0 }
+    $global:generatedBundlePaths = @()
+    $global:utf8 = New-Object System.Text.UTF8Encoding $false
+
+    $cold = @(Invoke-CppcheckProject -CppcheckPath $cppcheck.Source -ProjectPath $projectPath -CachePath $cachePath -RepositoryRoot $repositoryRoot -BuildRoot $buildRoot -TargetName 'src/zdoom.vcxproj' -TranslationUnit $translationUnit -CppcheckJobs 1 -Evidence $evidence)
+    $warm = @(Invoke-CppcheckProject -CppcheckPath $cppcheck.Source -ProjectPath $projectPath -CachePath $cachePath -RepositoryRoot $repositoryRoot -BuildRoot $buildRoot -TargetName 'src/zdoom.vcxproj' -TranslationUnit $translationUnit -CppcheckJobs 1 -Evidence $evidence)
+
+    if ((@($cold | ForEach-Object Fingerprint) -join '|') -ne (@($warm | ForEach-Object Fingerprint) -join '|')) {
+        throw 'Real Cppcheck project route did not preserve diagnostic fingerprints.'
+    }
+
+    $warmRaw = Get-Content -LiteralPath (Get-ChildItem -LiteralPath (Join-Path $evidenceRoot 'commands') -Filter '*.raw.txt' | Sort-Object Name | Select-Object -Last 1).FullName -Raw
+    if ($warmRaw -notmatch 'skipping analysis - loaded [0-9]+ cached finding\(s\)') {
+        throw 'Real Cppcheck project route did not report a native warm-cache hit.'
+    }
+}
+
 . (Join-Path $PSScriptRoot 'cppcheck-vendor-policy.ps1')
+. (Join-Path $PSScriptRoot 'cppcheck-cache.ps1')
 Import-LintFunction -Name 'ConvertTo-NormalizedCppcheckPathValue'
 Import-LintFunction -Name 'Get-NormalizedCppcheckAdditionalIncludeDirectories'
 Import-LintFunction -Name 'Assert-EqualCppcheckProjectContext'
@@ -159,10 +301,86 @@ Import-LintFunction -Name 'Resolve-ApiRootRepresentation'
 Import-LintFunction -Name 'Get-ManifestApiRoots'
 Import-LintFunction -Name 'Assert-ApiRootBlobIdentity'
 Import-LintFunction -Name 'Save-LintEvidenceResult'
+Import-LintFunction -Name 'Complete-LintFinalization'
+Import-LintFunction -Name 'Invoke-LintChild'
+Import-LintFunction -Name 'Invoke-CppcheckProject'
 
 $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('zandronum-vendor-policy-' + [guid]::NewGuid().ToString('N'))
 
 try {
+    $cacheFixtureRoot = Join-Path $fixtureRoot 'cppcheck-cache'
+    $contextBuildRoot = Join-Path $fixtureRoot 'context-build'
+    $contextProjectPath = Join-Path $contextBuildRoot 'fixture.vcxproj'
+    $contextConfigurationPath = Join-Path $fixtureRoot 'cppcheck.cfg'
+    New-Item -ItemType Directory -Force -Path $contextBuildRoot | Out-Null
+    Set-Content -LiteralPath (Join-Path $contextBuildRoot 'CMakeCache.txt') -Value @('CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022', 'CMAKE_GENERATOR_PLATFORM:INTERNAL=x64', 'CMAKE_GENERATOR_TOOLSET:INTERNAL=v143') -NoNewline
+    Set-Content -LiteralPath $contextProjectPath -Value '<Project><PropertyGroup><ProjectGuid>{A}</ProjectGuid><PlatformToolset>v143</PlatformToolset></PropertyGroup></Project>' -NoNewline
+    Set-Content -LiteralPath $contextConfigurationPath -Value 'fixture-one' -NoNewline
+    $contextOne = Get-CppcheckAnalysisContext -BuildRoot $contextBuildRoot -ProjectPaths @($contextProjectPath) -InputRootIdentities @('fixture-root') -AnalyzerConfigurationPaths @($contextConfigurationPath) -AnalyzerOptions @('--enable=warning')
+    $contextIdentityOne = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -RootIdentity 'fixture-root' -AnalysisContext $contextOne
+    Set-Content -LiteralPath $contextProjectPath -Value '<Project><PropertyGroup><ProjectGuid>{B}</ProjectGuid><PlatformToolset>v142</PlatformToolset></PropertyGroup></Project>' -NoNewline
+    $contextTwo = Get-CppcheckAnalysisContext -BuildRoot $contextBuildRoot -ProjectPaths @($contextProjectPath) -InputRootIdentities @('fixture-root') -AnalyzerConfigurationPaths @($contextConfigurationPath) -AnalyzerOptions @('--enable=warning')
+    $contextIdentityTwo = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -RootIdentity 'fixture-root' -AnalysisContext $contextTwo
+    Set-Content -LiteralPath $contextConfigurationPath -Value 'fixture-two' -NoNewline
+    $contextThree = Get-CppcheckAnalysisContext -BuildRoot $contextBuildRoot -ProjectPaths @($contextProjectPath) -InputRootIdentities @('fixture-root') -AnalyzerConfigurationPaths @($contextConfigurationPath) -AnalyzerOptions @('--enable=warning')
+    $contextIdentityThree = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -RootIdentity 'fixture-root' -AnalysisContext $contextThree
+    if (($contextIdentityOne.Key -eq $contextIdentityTwo.Key) -or ($contextIdentityTwo.Key -eq $contextIdentityThree.Key)) { throw 'Cppcheck cache identity did not separate generated project or analyzer configuration changes.' }
+    $cppcheck = Get-Command cppcheck -ErrorAction Stop
+    $installedConfigurationPaths = @(Get-CppcheckInstalledConfigurationPaths -AnalyzerPath $cppcheck.Source)
+    if (($installedConfigurationPaths.Count -ne 1) -or ((Split-Path -Leaf $installedConfigurationPaths[0]) -ne 'std.cfg')) { throw 'Cppcheck automatic standard-library configuration was not resolved.' }
+    foreach ($failureKind in @('evidence', 'cleanup', 'evidence-save')) { Assert-FinalizationFailureProcess -FixtureRoot $fixtureRoot -FailureKind $failureKind }
+    Assert-FinalizationSuccessCleanupOnce
+    Assert-LintOuterFinalizationIntegration
+    $normalIdentity = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -RootIdentity 'C:\fixture\source'
+    $manifestIdentity = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'input-manifest' -RootIdentity 'fixed-regression-manifest-stage'
+    $differentToolsetIdentity = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -Toolset 'v142' -RootIdentity 'C:\fixture\source'
+    if (($normalIdentity.Key -eq $manifestIdentity.Key) -or ($normalIdentity.Key -eq $differentToolsetIdentity.Key)) { throw 'Cppcheck cache identity did not separate input mode or toolset.' }
+    $headCache = Get-CppcheckCacheLeaf -CacheRoot $cacheFixtureRoot -Namespace 'regression' -Identity $normalIdentity -Role 'head' -TargetName 'src/zdoom.vcxproj' -TranslationUnit 'src/example.cpp'
+    $baseOneCache = Get-CppcheckCacheLeaf -CacheRoot $cacheFixtureRoot -Namespace 'regression' -Identity $normalIdentity -Role (Join-Path 'baseline' ('1' * 40)) -TargetName 'src/zdoom.vcxproj' -TranslationUnit 'src/example.cpp'
+    $baseTwoCache = Get-CppcheckCacheLeaf -CacheRoot $cacheFixtureRoot -Namespace 'regression' -Identity $normalIdentity -Role (Join-Path 'baseline' ('2' * 40)) -TargetName 'src/zdoom.vcxproj' -TranslationUnit 'src/example.cpp'
+    if (($headCache -eq $baseOneCache) -or ($baseOneCache -eq $baseTwoCache)) { throw 'Cppcheck cache paths did not separate head and complete baseline SHA namespaces.' }
+    Assert-RealCppcheckProjectCacheRoute -FixtureRoot $fixtureRoot -CacheRoot $cacheFixtureRoot
+    $cacheLock = Enter-CppcheckCacheLock -CacheRoot $cacheFixtureRoot -Name 'fixture'
+    try {
+        Assert-ExpectedException -Expected 'already running' -Action { Enter-CppcheckCacheLock -CacheRoot $cacheFixtureRoot -Name 'fixture' | Out-Null }
+    }
+    finally {
+        Exit-CppcheckCacheLock -Lock $cacheLock
+    }
+    $stage = New-CppcheckDisposableStage -CacheRoot $cacheFixtureRoot -Name 'fixture-stage'
+    Assert-ExpectedException -Expected 'already exists' -Action { New-CppcheckDisposableStage -CacheRoot $cacheFixtureRoot -Name 'fixture-stage' | Out-Null }
+    Remove-CppcheckDisposableStage -CacheRoot $cacheFixtureRoot -StageRoot $stage -Name 'fixture-stage'
+    $unknownStage = Join-Path $cacheFixtureRoot 'staging\unknown-stage'
+    New-Item -ItemType Directory -Force -Path $unknownStage | Out-Null
+    Assert-ExpectedException -Expected 'not the owned' -Action { Remove-CppcheckDisposableStage -CacheRoot $cacheFixtureRoot -StageRoot $unknownStage -Name 'fixture-stage' }
+    if (-not (Test-Path -LiteralPath $unknownStage)) { throw 'Cppcheck cleanup removed an unowned staging path.' }
+    Assert-ExpectedException -Expected 'not the owned' -Action { Remove-CppcheckDisposableStage -CacheRoot $cacheFixtureRoot -StageRoot $fixtureRoot -Name 'fixture-stage' }
+    $outsideStageRoot = Join-Path $fixtureRoot 'outside-stage'
+    $stagingPath = Join-Path $cacheFixtureRoot 'staging'
+    try {
+        New-Item -ItemType Directory -Force -Path $outsideStageRoot | Out-Null
+        Set-Content -LiteralPath (Join-Path $outsideStageRoot 'marker.txt') -Value 'keep' -NoNewline
+        Remove-Item -LiteralPath $stagingPath -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Junction -Path $stagingPath -Target $outsideStageRoot -ErrorAction Stop | Out-Null
+        Assert-ExpectedException -Expected 'reparse-point ancestor' -Action { New-CppcheckDisposableStage -CacheRoot $cacheFixtureRoot -Name 'junction-stage' | Out-Null }
+        Assert-ExpectedException -Expected 'reparse-point ancestor' -Action { Remove-CppcheckDisposableStage -CacheRoot $cacheFixtureRoot -StageRoot (Join-Path $stagingPath 'junction-stage') -Name 'junction-stage' }
+        if (-not (Test-Path -LiteralPath (Join-Path $outsideStageRoot 'marker.txt') -PathType Leaf)) { throw 'Cppcheck staging cleanup traversed an intermediate junction.' }
+    }
+    catch [System.UnauthorizedAccessException] {
+        Write-Host 'staging junction fixture: skipped (permission unavailable)'
+    }
+    finally {
+        Remove-Item -LiteralPath $stagingPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outsideStageRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $lintAllText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'lint-all.ps1') -Raw
+    foreach ($directory in @('bzip2', 'jpeg-6b', 'zlib', 'game-music-emu', 'gdtoa', 'dumb', 'lzma', 'sqlite', 'GeoIP', 'rnnoise')) {
+        if ($lintAllText -notmatch [regex]::Escape("'$directory'")) { throw "Full Cppcheck exclusion '$directory' is missing." }
+    }
+    foreach ($path in @('miniaudio', 'stb_vorbis', 'output_sdl', 'upnpnat')) {
+        if ($lintAllText -match [regex]::Escape("'$path'")) { throw "Full Cppcheck exclusion unexpectedly includes '$path'." }
+    }
+
     $vendorPath = 'src/sound/thirdparty/miniaudio/miniaudio.h'
     $adapterPath = 'src/sound/audio_decoder_miniaudio.cpp'
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent (Join-Path $fixtureRoot $vendorPath)) | Out-Null

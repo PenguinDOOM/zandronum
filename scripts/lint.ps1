@@ -14,6 +14,7 @@ $OutputEncoding = $utf8
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot 'cppcheck-vendor-policy.ps1')
+. (Join-Path $PSScriptRoot 'cppcheck-cache.ps1')
 
 if ((-not [string]::IsNullOrWhiteSpace($InputManifest)) -and
     (-not (Test-Path -LiteralPath $InputManifest -PathType Leaf))) {
@@ -91,8 +92,10 @@ function Invoke-LintChild {
     }
 
     try {
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $output = @(& $Path @Arguments 2>&1 | ForEach-Object { $_.ToString() })
         $exitCode = $LASTEXITCODE
+        $stopwatch.Stop()
     }
     finally {
         if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
@@ -109,10 +112,11 @@ function Invoke-LintChild {
             Arguments = $Arguments
             WorkingDirectory = $WorkingDirectory
             ExitCode = $exitCode
+            ElapsedMilliseconds = $stopwatch.ElapsedMilliseconds
         } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $Evidence.Root (Join-Path 'commands' ($prefix + '.invocation.json'))) -NoNewline
     }
 
-    return [PSCustomObject]@{ Output = $output; ExitCode = $exitCode }
+    return [PSCustomObject]@{ Output = $output; ExitCode = $exitCode; ElapsedMilliseconds = $stopwatch.ElapsedMilliseconds }
 }
 
 function Save-LintEvidenceState {
@@ -124,7 +128,9 @@ function Save-LintEvidenceState {
         [object[]]$AnalysisProjects,
         [object[]]$BaselineProjects,
         [hashtable]$Contexts,
-        [object[]]$VerifiedGeneratedBundle
+        [object[]]$VerifiedGeneratedBundle,
+        [object]$CacheIdentity = $null,
+        [hashtable]$CachePaths = @{}
     )
 
     if ($null -eq $Evidence) {
@@ -150,12 +156,24 @@ function Save-LintEvidenceState {
         GeneratedBundle = $VerifiedGeneratedBundle
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Evidence.Root 'analysis-context.json') -NoNewline
 
-    foreach ($cacheName in @('head-cache', 'baseline-cache')) {
-        $cachePath = Join-Path $TempRoot $cacheName
-        if (Test-Path -LiteralPath $cachePath -PathType Container) {
-            Copy-Item -LiteralPath $cachePath -Destination (Join-Path $Evidence.Root $cacheName) -Recurse -Force
+    $cacheInputRoot = Join-Path $Evidence.Root 'cache-inputs'
+    New-Item -ItemType Directory -Force -Path $cacheInputRoot | Out-Null
+    if ($null -ne $CacheIdentity) {
+        $CacheIdentity | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $cacheInputRoot 'identity.json') -NoNewline
+        foreach ($configuration in @($CacheIdentity.AnalysisContext.AnalyzerConfigurations)) {
+            $configurationPath = [string]$configuration.Path
+            if (-not [string]::IsNullOrWhiteSpace($configurationPath) -and (Test-Path -LiteralPath $configurationPath -PathType Leaf)) {
+                $snapshotName = ('{0}-{1}' -f $configuration.SHA256, (Split-Path -Leaf $configurationPath))
+                Copy-Item -LiteralPath $configurationPath -Destination (Join-Path $cacheInputRoot $snapshotName) -Force
+            }
         }
     }
+
+    [PSCustomObject]@{
+        Identity = $CacheIdentity
+        CacheLeaves = @($CachePaths.GetEnumerator() | Sort-Object Key | ForEach-Object { [PSCustomObject]@{ Role = $_.Key; Path = $_.Value } })
+        NativeAnalyzerInfo = 'Stored in commands/*.raw.txt for each Cppcheck invocation.'
+    } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $Evidence.Root 'cache-context.json') -NoNewline
 }
 
 function Save-LintEvidenceResult {
@@ -192,6 +210,54 @@ function Save-LintEvidenceResult {
             UnresolvedVendor = if ($Comparison) { @($Comparison.UnresolvedVendor).Count } else { $null }
         }
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Evidence.Root 'final-result.json') -NoNewline
+}
+
+function Complete-LintTemporaryCleanup {
+    param(
+        [switch]$BaselineWorktreeCreated,
+        [string]$BaselineRoot,
+        [string]$TempRoot,
+        [string]$CppcheckCacheRoot,
+        [string]$StageName
+    )
+
+    if ($BaselineWorktreeCreated) {
+        & git worktree remove --force $BaselineRoot 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not remove the isolated baseline worktree '$BaselineRoot'."
+        }
+    }
+
+    if (Test-Path -LiteralPath $TempRoot) {
+        Remove-CppcheckDisposableStage -CacheRoot $CppcheckCacheRoot -StageRoot $TempRoot -Name $StageName
+    }
+}
+
+function Complete-LintFinalization {
+    param(
+        [scriptblock]$SaveEvidenceAction,
+        [scriptblock]$CleanupAction,
+        [scriptblock]$SaveResultAction
+    )
+
+    try {
+        & $SaveEvidenceAction
+        & $CleanupAction
+        & $SaveResultAction 'passed' 0 ''
+        return [PSCustomObject]@{ Succeeded = $true; ResultSaved = $true; ErrorMessage = '' }
+    }
+    catch {
+        $failureMessage = $_.Exception.Message
+        $resultSaved = $false
+        try {
+            & $SaveResultAction 'failed' 1 $failureMessage
+            $resultSaved = $true
+        }
+        catch {
+            Write-Warning "Could not save failed lint evidence: $($_.Exception.Message)" -WarningAction Continue
+        }
+        return [PSCustomObject]@{ Succeeded = $false; ResultSaved = $resultSaved; ErrorMessage = $failureMessage }
+    }
 }
 
 function Get-PathRelativeToRoot {
@@ -800,6 +866,7 @@ function Invoke-InputManifestPreflight {
         [string]$RepositoryRoot,
         [string]$CachePath,
         [string]$CMakePath,
+        [string]$CppcheckCacheRoot,
         [switch]$KeepTemporaryRoot,
         [object]$Evidence = $null
     )
@@ -814,7 +881,7 @@ function Invoke-InputManifestPreflight {
     Assert-InputManifestProductionContext -Manifest $Manifest -RepositoryRoot $RepositoryRoot
     $baseCommit = Get-GitSingleLine -Arguments @('rev-parse', '--verify', '--quiet', "$($Manifest.BaseCommit)^{commit}") -ErrorMessage "InputManifest BaseCommit '$($Manifest.BaseCommit)' does not resolve to a commit."
     $sourceCommit = Get-GitSingleLine -Arguments @('rev-parse', '--verify', '--quiet', "$($Manifest.SourceCommit)^{commit}") -ErrorMessage "InputManifest SourceCommit '$($Manifest.SourceCommit)' does not resolve to a commit."
-    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('zandronum-input-preflight-' + [guid]::NewGuid().ToString('N'))
+    $tempRoot = New-CppcheckDisposableStage -CacheRoot $CppcheckCacheRoot -Name 'regression-manifest'
     $sourceRoot = Join-Path $tempRoot 'source'
     $baselineRoot = Join-Path $tempRoot 'baseline'
     $sourceBuildRoot = Join-Path $tempRoot 'source-build'
@@ -944,7 +1011,7 @@ function Invoke-InputManifestPreflight {
     }
     finally {
         if (((-not $KeepTemporaryRoot) -or ($null -eq $result)) -and (Test-Path -LiteralPath $tempRoot)) {
-            Remove-Item -LiteralPath $tempRoot -Force -Recurse -ErrorAction SilentlyContinue
+            Remove-CppcheckDisposableStage -CacheRoot $CppcheckCacheRoot -StageRoot $tempRoot -Name 'regression-manifest'
         }
     }
 
@@ -1507,6 +1574,7 @@ function Invoke-CppcheckProject {
         "--error-exitcode=1"
         "--cppcheck-build-dir=$CachePath"
         "--file-filter=$TranslationUnit"
+        "--debug-analyzerinfo"
         "--template=$template"
         "--quiet"
         "-j"
@@ -1557,9 +1625,14 @@ if ($PreflightOnly -and ($null -eq $inputManifestData)) {
 }
 
 $repositoryRoot = Get-GitSingleLine -Arguments @('rev-parse', '--show-toplevel') -ErrorMessage 'This script must run inside a Git worktree.'
+$cppcheckCacheRoot = Join-Path $repositoryRoot '.cppcheck-cache'
+$cacheLock = Enter-CppcheckCacheLock -CacheRoot $cppcheckCacheRoot -Name 'regression'
 $evidence = $null
+$inputManifestRoots = $null
+$tempRoot = $null
 $cppcheckSHA256 = (Get-FileHash -LiteralPath $cppcheck.Source -Algorithm SHA256).Hash
 
+try {
 if ($null -ne $inputManifestData) {
     $effectiveEvidenceDir = if ([string]::IsNullOrWhiteSpace($EvidenceDir)) { Join-Path $repositoryRoot 'completes/openal-full-gate-preparation/evidence' } else { $EvidenceDir }
     $evidence = Initialize-LintEvidence -RootPath $effectiveEvidenceDir -ManifestPath $inputManifestData.Path -CppcheckPath $cppcheck.Source -CppcheckSHA256 $cppcheckSHA256 -CppcheckVersion ''
@@ -1590,7 +1663,7 @@ if ($null -ne $inputManifestData) {
     $preflightCachePath = Join-Path ([System.IO.Path]::GetFullPath((Join-Path $repositoryRoot $BuildDir))) 'CMakeCache.txt'
 
     try {
-        $inputManifestRoots = Invoke-InputManifestPreflight -Manifest $inputManifestData -RepositoryRoot $repositoryRoot -CachePath $preflightCachePath -CMakePath $cmake.Source -KeepTemporaryRoot -Evidence $evidence
+        $inputManifestRoots = Invoke-InputManifestPreflight -Manifest $inputManifestData -RepositoryRoot $repositoryRoot -CachePath $preflightCachePath -CMakePath $cmake.Source -CppcheckCacheRoot $cppcheckCacheRoot -KeepTemporaryRoot -Evidence $evidence
     }
     catch {
         Write-Error $_.Exception.Message
@@ -1598,7 +1671,7 @@ if ($null -ne $inputManifestData) {
     }
 
     if ($PreflightOnly) {
-        Remove-Item -LiteralPath $inputManifestRoots.TempRoot -Force -Recurse -ErrorAction SilentlyContinue
+        Remove-CppcheckDisposableStage -CacheRoot $cppcheckCacheRoot -StageRoot $inputManifestRoots.TempRoot -Name 'regression-manifest'
         exit 0
     }
 }
@@ -1651,6 +1724,23 @@ if (-not (Test-Path -LiteralPath $cacheFile -PathType Leaf)) {
     exit 1
 }
 
+$toolsetSetting = Get-CMakeCacheSetting -CachePath $cacheFile -Name 'CMAKE_GENERATOR_TOOLSET'
+$analysisContext = Get-CppcheckAnalysisContext `
+    -BuildRoot $analysisBuildRoot `
+    -ProjectPaths @(Get-ChildItem -LiteralPath $analysisBuildRoot -Filter *.vcxproj -File -Recurse | ForEach-Object { $_.FullName }) `
+    -InputRootIdentities @($(if ($null -eq $inputManifestData) { 'regression-live-worktree' } else { 'regression-fixed-manifest-stage' })) `
+    -AnalyzerConfigurationPaths (@($PSCommandPath, (Join-Path $PSScriptRoot 'cppcheck-cache.ps1'), (Join-Path $PSScriptRoot 'cppcheck-vendor-dispositions.json')) + @(Get-CppcheckInstalledConfigurationPaths -AnalyzerPath $cppcheck.Source)) `
+    -AnalyzerOptions @('--project-configuration=Release|x64', '--enable=warning,performance,portability', '--error-exitcode=1', '--debug-analyzerinfo', '--template=tabular', '--quiet', "-j=$CppcheckJobs")
+$cacheIdentity = Get-CppcheckCacheIdentity `
+    -AnalyzerVersion $cppcheckVersion[0] `
+    -AnalyzerSHA256 $cppcheckSHA256 `
+    -InputMode $(if ($null -eq $inputManifestData) { 'normal' } else { 'input-manifest' }) `
+    -Toolset $(if ($toolsetSetting -and -not [string]::IsNullOrWhiteSpace($toolsetSetting.Value)) { $toolsetSetting.Value } else { 'v143' }) `
+    -RootIdentity $(if ($null -eq $inputManifestData) { 'regression-live-worktree' } else { 'regression-fixed-manifest-stage' }) `
+    -AnalysisContext $analysisContext
+Save-CppcheckCacheIdentity -CacheRoot $cppcheckCacheRoot -Namespace 'regression' -Identity $cacheIdentity
+$cachePaths = @{}
+
 $changedFiles = @()
 
 if ($null -ne $inputManifestData) {
@@ -1695,7 +1785,7 @@ foreach ($file in $changedFiles) {
 }
 
 $analysisProjects = @($headProjects | Where-Object { $_.Files.Count -ne 0 })
-$tempRoot = if ($null -ne $inputManifestData) { $inputManifestRoots.TempRoot } else { Join-Path ([System.IO.Path]::GetTempPath()) ("zandronum-cppcheck-" + [guid]::NewGuid().ToString('N')) }
+$tempRoot = if ($null -ne $inputManifestData) { $inputManifestRoots.TempRoot } else { New-CppcheckDisposableStage -CacheRoot $cppcheckCacheRoot -Name 'regression-normal' }
 $baselineRoot = if ($null -ne $inputManifestData) { $inputManifestRoots.BaselineRoot } else { Join-Path $tempRoot 'baseline' }
 $baselineBuildRoot = if ($null -ne $inputManifestData) { $inputManifestRoots.BaselineBuildRoot } else { Join-Path $baselineRoot 'build' }
 $baselineWorktreeCreated = $false
@@ -1703,6 +1793,8 @@ $baselineProjects = @()
 $vendorDispositionContexts = @{}
 $verifiedGeneratedBundle = @()
 $finalResultSaved = $false
+$cleanupState = [PSCustomObject]@{ Completed = $false }
+$gateFailure = ''
 
 try {
     if ($null -eq $inputManifestData) {
@@ -1830,7 +1922,7 @@ try {
     }
 
     Write-Host "Cppcheck context and full translation-unit equality: confirmed for $($analysisProjects.Count) target(s)."
-    Save-LintEvidenceState -Evidence $evidence -AnalysisBuildRoot $analysisBuildRoot -BaselineBuildRoot $baselineBuildRoot -TempRoot $tempRoot -AnalysisProjects $analysisProjects -BaselineProjects $baselineProjects -Contexts $vendorDispositionContexts -VerifiedGeneratedBundle $verifiedGeneratedBundle
+    Save-LintEvidenceState -Evidence $evidence -AnalysisBuildRoot $analysisBuildRoot -BaselineBuildRoot $baselineBuildRoot -TempRoot $tempRoot -AnalysisProjects $analysisProjects -BaselineProjects $baselineProjects -Contexts $vendorDispositionContexts -VerifiedGeneratedBundle $verifiedGeneratedBundle -CacheIdentity $cacheIdentity.Context -CachePaths $cachePaths
     Write-Host "Running isolated Cppcheck analysis for $($analysisProjects.Count) target(s):"
 
     foreach ($project in $analysisProjects) {
@@ -1838,7 +1930,8 @@ try {
         Write-Host "  $targetName"
 
         foreach ($translationUnit in $project.Files) {
-            $headCache = Join-Path $tempRoot (Join-Path 'head-cache' ($targetName.Replace('/', '_') + '-' + $translationUnit.Replace('/', '_')))
+            $headCache = Get-CppcheckCacheLeaf -CacheRoot $cppcheckCacheRoot -Namespace 'regression' -Identity $cacheIdentity -Role 'head' -TargetName ($targetName + '|project:' + (Get-FileHash -LiteralPath $project.ProjectPath -Algorithm SHA256).Hash) -TranslationUnit $translationUnit
+            $cachePaths["head/$targetName/$translationUnit"] = $headCache
             [void]$headDiagnostics.AddRange(@(Invoke-CppcheckProject `
                 -CppcheckPath $cppcheck.Source `
                 -ProjectPath $project.ProjectPath `
@@ -1855,7 +1948,8 @@ try {
 
         if ($baselineProject) {
             foreach ($translationUnit in @($baselineProject.Sources.Keys | Sort-Object)) {
-                $baselineCache = Join-Path $tempRoot (Join-Path 'baseline-cache' ($targetName.Replace('/', '_') + '-' + $translationUnit.Replace('/', '_')))
+                $baselineCache = Get-CppcheckCacheLeaf -CacheRoot $cppcheckCacheRoot -Namespace 'regression' -Identity $cacheIdentity -Role (Join-Path 'baseline' $baseCommit) -TargetName ($targetName + '|project:' + (Get-FileHash -LiteralPath $baselineProject.ProjectPath -Algorithm SHA256).Hash) -TranslationUnit $translationUnit
+                $cachePaths["baseline/$baseCommit/$targetName/$translationUnit"] = $baselineCache
                 [void]$baselineDiagnostics.AddRange(@(Invoke-CppcheckProject `
                     -CppcheckPath $cppcheck.Source `
                     -ProjectPath $baselineProject.ProjectPath `
@@ -1919,27 +2013,65 @@ try {
     }
 
     Write-Host "Cppcheck passed: no new diagnostic fingerprints."
-    Save-LintEvidenceResult -Evidence $evidence -Status 'passed' -ExitCode 0 -VendorDispositionResult $vendorDispositionResult -Comparison $comparison
-    $finalResultSaved = $true
+    $finalization = Complete-LintFinalization `
+        -SaveEvidenceAction {
+            Save-LintEvidenceState -Evidence $evidence -AnalysisBuildRoot $analysisBuildRoot -BaselineBuildRoot $baselineBuildRoot -TempRoot $tempRoot -AnalysisProjects $analysisProjects -BaselineProjects $baselineProjects -Contexts $vendorDispositionContexts -VerifiedGeneratedBundle $verifiedGeneratedBundle -CacheIdentity $cacheIdentity.Context -CachePaths $cachePaths
+        } `
+        -CleanupAction {
+            Complete-LintTemporaryCleanup -BaselineWorktreeCreated:$baselineWorktreeCreated -BaselineRoot $baselineRoot -TempRoot $tempRoot -CppcheckCacheRoot $cppcheckCacheRoot -StageName $(if ($null -eq $inputManifestData) { 'regression-normal' } else { 'regression-manifest' })
+            $cleanupState.Completed = $true
+        } `
+        -SaveResultAction {
+            param($status, $exitCode, $errorMessage)
+            Save-LintEvidenceResult -Evidence $evidence -Status $status -ExitCode $exitCode -Error $errorMessage -VendorDispositionResult $vendorDispositionResult -Comparison $comparison
+        }
+    $finalResultSaved = $finalization.ResultSaved
+    if (-not $finalization.Succeeded) {
+        throw $finalization.ErrorMessage
+    }
+}
+catch {
+    $gateFailure = $_.Exception.Message
+    throw
 }
 finally {
-    if (-not $finalResultSaved) {
-        Save-LintEvidenceResult -Evidence $evidence -Status 'incomplete' -ExitCode 1 -Error 'The gate did not reach final classification.'
-    }
-
-    Save-LintEvidenceState -Evidence $evidence -AnalysisBuildRoot $analysisBuildRoot -BaselineBuildRoot $baselineBuildRoot -TempRoot $tempRoot -AnalysisProjects $analysisProjects -BaselineProjects $baselineProjects -Contexts $vendorDispositionContexts -VerifiedGeneratedBundle $verifiedGeneratedBundle
-
-    if ($baselineWorktreeCreated) {
-        & git worktree remove --force $baselineRoot 2>$null
-    }
-
-    if (Test-Path -LiteralPath $tempRoot) {
+    if (-not $cleanupState.Completed) {
         try {
-            Remove-Item -LiteralPath $tempRoot -Force -Recurse
+            Complete-LintTemporaryCleanup -BaselineWorktreeCreated:$baselineWorktreeCreated -BaselineRoot $baselineRoot -TempRoot $tempRoot -CppcheckCacheRoot $cppcheckCacheRoot -StageName $(if ($null -eq $inputManifestData) { 'regression-normal' } else { 'regression-manifest' })
+            $cleanupState.Completed = $true
         }
         catch {
-            Write-Warning "Could not remove Cppcheck temporary directory '$tempRoot': $($_.Exception.Message)"
+            if ([string]::IsNullOrWhiteSpace($gateFailure)) {
+                $gateFailure = $_.Exception.Message
+            }
+            else {
+                Write-Warning "Could not complete lint temporary cleanup: $($_.Exception.Message)" -WarningAction Continue
+            }
         }
+    }
+
+    if (-not $finalResultSaved) {
+        $finalizationError = if ([string]::IsNullOrWhiteSpace($gateFailure)) { 'The gate did not reach final classification.' } else { $gateFailure }
+        try {
+            Save-LintEvidenceResult -Evidence $evidence -Status 'failed' -ExitCode 1 -Error $finalizationError
+        }
+        catch {
+            Write-Warning "Could not save failed lint evidence: $($_.Exception.Message)" -WarningAction Continue
+        }
+    }
+
+}
+
+}
+
+finally {
+    try {
+        if (($null -ne $inputManifestRoots) -and ($null -eq $tempRoot) -and (Test-Path -LiteralPath $inputManifestRoots.TempRoot)) {
+            Remove-CppcheckDisposableStage -CacheRoot $cppcheckCacheRoot -StageRoot $inputManifestRoots.TempRoot -Name 'regression-manifest'
+        }
+    }
+    finally {
+        Exit-CppcheckCacheLock -Lock $cacheLock
     }
 }
 
