@@ -422,6 +422,7 @@ ReverbContainer *DefaultEnvironments[26] =
 };
 
 ReverbContainer *Environments = &Off;
+ReverbContainer *ForcedEnvironment;
 
 ReverbContainer *S_FindEnvironment (const char *name)
 {
@@ -468,6 +469,10 @@ void S_AddEnvironment (ReverbContainer *settings)
 		// Built-in environments cannot be changed
 		if (!probe->Builtin)
 		{
+			if (ForcedEnvironment == probe)
+			{
+				ForcedEnvironment = NULL;
+			}
 			settings->Next = probe->Next;
 			*ptr = settings;
 			delete[] const_cast<char *>(probe->Name);
@@ -479,6 +484,7 @@ void S_AddEnvironment (ReverbContainer *settings)
 		settings->Next = probe;
 		*ptr = settings;
 	}
+	settings->Modified = true;
 }
 
 FArchive &operator<< (FArchive &arc, ReverbContainer *&env)
@@ -503,6 +509,19 @@ FArchive &operator<< (FArchive &arc, ReverbContainer *&env)
 		env = S_FindEnvironment (id);
 	}
 	return arc;
+}
+
+static ReverbContainer *CreateEnvironment (char *name, int id, const REVERB_PROPERTIES &properties)
+{
+	ReverbContainer *environment = new ReverbContainer;
+	environment->Next = NULL;
+	environment->Name = name;
+	environment->ID = id;
+	environment->Builtin = false;
+	environment->Modified = true;
+	environment->Properties = properties;
+	environment->SoftwareWater = false;
+	return environment;
 }
 
 static void ReadReverbDef (int lump)
@@ -598,13 +617,7 @@ static void ReadReverbDef (int lump)
 			}
 		}
 
-		newenv = new ReverbContainer;
-		newenv->Next = NULL;
-		newenv->Name = name;
-		newenv->ID = (id1 << 8) | id2;
-		newenv->Builtin = false;
-		newenv->Properties = props;
-		newenv->SoftwareWater = false;
+		newenv = CreateEnvironment (name, (id1 << 8) | id2, props);
 		S_AddEnvironment (newenv);
 	}
 }
@@ -632,6 +645,10 @@ void S_UnloadReverbDef ()
 		ReverbContainer *next = probe->Next;
 		if (!probe->Builtin)
 		{
+			if (ForcedEnvironment == probe)
+			{
+				ForcedEnvironment = NULL;
+			}
 			if (pNext != NULL) *pNext = probe->Next;
 			delete[] const_cast<char *>(probe->Name);
 			delete probe;

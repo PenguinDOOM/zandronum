@@ -117,35 +117,20 @@ EXTERN_CVAR (Int, snd_samplerate)
 EXTERN_CVAR (Bool, snd_pitched)
 EXTERN_CVAR (Int, snd_channels)
 EXTERN_CVAR (Bool, snd_hrtf)
+EXTERN_CVAR (Bool, snd_waterreverb)
+EXTERN_CVAR (Float, snd_waterlp)
 
 extern int sfx_empty;
 
 // PUBLIC DATA DEFINITIONS -------------------------------------------------
 
-ReverbContainer *ForcedEnvironment;
-
 CVAR (Int, snd_driver, 0, CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
 CVAR (Int, snd_buffercount, 0, CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
-CVAR (Bool, snd_waterreverb, true, CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
 CVAR (String, snd_resampler, "Linear", CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
 CVAR (String, snd_speakermode, "Auto", CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
 CVAR (String, snd_output_format, "PCM-16", CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
 CVAR (Bool, snd_profile, false, 0)
 CVAR (String, snd_midipatchset, "", CVAR_ARCHIVE|CVAR_GLOBALCONFIG);
-
-// Underwater low-pass filter cutoff frequency. Set to 0 to disable the filter.
-CUSTOM_CVAR (Float, snd_waterlp, 250, CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
-{
-	// Clamp to the DSP unit's limits.
-	if (*self < 10 && *self != 0)
-	{
-		self = 10;
-	}
-	else if (*self > 22000)
-	{
-		self = 22000;
-	}
-}
 
 #ifndef NO_SOUND
 

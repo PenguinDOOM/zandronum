@@ -5,6 +5,7 @@
 
 #include <AL/al.h>
 #include <AL/alc.h>
+#include <AL/efx.h>
 
 #include <algorithm>
 #include <stdint.h>
@@ -106,6 +107,76 @@ EXTERN_CVAR (Float, snd_sfxvolume)
 EXTERN_CVAR (Bool, snd_pitched)
 EXTERN_CVAR (Bool, snd_hrtf)
 
+namespace
+{
+	float ClampReverbValue (float value, float defaultValue, float minimum, float maximum)
+	{
+		if (isnan (value))
+		{
+			return defaultValue;
+		}
+		if (isinf (value))
+		{
+			return value < 0.f ? minimum : maximum;
+		}
+		return std::max (minimum, std::min (value, maximum));
+	}
+
+	float ReverbGain (float millibels, float defaultValue, float maximum)
+	{
+		return ClampReverbValue (powf (10.f, float (millibels) / 2000.f), defaultValue, 0.f, maximum);
+	}
+
+	bool NormalizeReverbPan (float pan[3])
+	{
+		if (!isfinite (pan[0]) || !isfinite (pan[1]) || !isfinite (pan[2]))
+		{
+			pan[0] = pan[1] = pan[2] = 0.f;
+			return true;
+		}
+		double length = sqrt (double (pan[0]) * pan[0] + double (pan[1]) * pan[1] + double (pan[2]) * pan[2]);
+		if (length > 1.0)
+		{
+			pan[0] = float (pan[0] / length);
+			pan[1] = float (pan[1] / length);
+			pan[2] = float (pan[2] / length);
+		}
+		return false;
+	}
+}
+
+OpenALReverbParameters OALBuildReverbParameters (const REVERB_PROPERTIES &properties)
+{
+	OpenALReverbParameters output;
+	output.Gain = ReverbGain (float (properties.Room), AL_EAXREVERB_DEFAULT_GAIN, 1.f);
+	output.GainHF = ReverbGain (float (properties.RoomHF), AL_EAXREVERB_DEFAULT_GAINHF, 1.f);
+	output.GainLF = ReverbGain (float (properties.RoomLF), AL_EAXREVERB_DEFAULT_GAINLF, 1.f);
+	output.DecayTime = ClampReverbValue (properties.DecayTime, AL_EAXREVERB_DEFAULT_DECAY_TIME, AL_EAXREVERB_MIN_DECAY_TIME, AL_EAXREVERB_MAX_DECAY_TIME);
+	output.DecayHFRatio = ClampReverbValue (properties.DecayHFRatio, AL_EAXREVERB_DEFAULT_DECAY_HFRATIO, AL_EAXREVERB_MIN_DECAY_HFRATIO, AL_EAXREVERB_MAX_DECAY_HFRATIO);
+	output.DecayLFRatio = ClampReverbValue (properties.DecayLFRatio, AL_EAXREVERB_DEFAULT_DECAY_LFRATIO, AL_EAXREVERB_MIN_DECAY_LFRATIO, AL_EAXREVERB_MAX_DECAY_LFRATIO);
+	output.ReflectionsGain = ReverbGain (float (properties.Reflections), AL_EAXREVERB_DEFAULT_REFLECTIONS_GAIN, AL_EAXREVERB_MAX_REFLECTIONS_GAIN);
+	output.ReflectionsDelay = ClampReverbValue (properties.ReflectionsDelay, AL_EAXREVERB_DEFAULT_REFLECTIONS_DELAY, AL_EAXREVERB_MIN_REFLECTIONS_DELAY, AL_EAXREVERB_MAX_REFLECTIONS_DELAY);
+	output.ReflectionsPan[0] = properties.ReflectionsPan0; output.ReflectionsPan[1] = properties.ReflectionsPan1; output.ReflectionsPan[2] = properties.ReflectionsPan2;
+	output.HasInvalidPan = NormalizeReverbPan (output.ReflectionsPan);
+	output.LateReverbGain = ReverbGain (float (properties.Reverb), AL_EAXREVERB_DEFAULT_LATE_REVERB_GAIN, AL_EAXREVERB_MAX_LATE_REVERB_GAIN);
+	output.LateReverbDelay = ClampReverbValue (properties.ReverbDelay, AL_EAXREVERB_DEFAULT_LATE_REVERB_DELAY, AL_EAXREVERB_MIN_LATE_REVERB_DELAY, AL_EAXREVERB_MAX_LATE_REVERB_DELAY);
+	output.LateReverbPan[0] = properties.ReverbPan0; output.LateReverbPan[1] = properties.ReverbPan1; output.LateReverbPan[2] = properties.ReverbPan2;
+	output.HasInvalidPan = NormalizeReverbPan (output.LateReverbPan) || output.HasInvalidPan;
+	output.EchoTime = ClampReverbValue (properties.EchoTime, AL_EAXREVERB_DEFAULT_ECHO_TIME, AL_EAXREVERB_MIN_ECHO_TIME, AL_EAXREVERB_MAX_ECHO_TIME);
+	output.EchoDepth = ClampReverbValue (properties.EchoDepth, AL_EAXREVERB_DEFAULT_ECHO_DEPTH, AL_EAXREVERB_MIN_ECHO_DEPTH, AL_EAXREVERB_MAX_ECHO_DEPTH);
+	output.ModulationTime = ClampReverbValue (properties.ModulationTime, AL_EAXREVERB_DEFAULT_MODULATION_TIME, AL_EAXREVERB_MIN_MODULATION_TIME, AL_EAXREVERB_MAX_MODULATION_TIME);
+	output.ModulationDepth = ClampReverbValue (properties.ModulationDepth, AL_EAXREVERB_DEFAULT_MODULATION_DEPTH, AL_EAXREVERB_MIN_MODULATION_DEPTH, AL_EAXREVERB_MAX_MODULATION_DEPTH);
+	output.AirAbsorptionGainHF = ReverbGain (properties.AirAbsorptionHF, AL_EAXREVERB_DEFAULT_AIR_ABSORPTION_GAINHF, 1.f);
+	output.AirAbsorptionGainHF = ClampReverbValue (output.AirAbsorptionGainHF, AL_EAXREVERB_DEFAULT_AIR_ABSORPTION_GAINHF, AL_EAXREVERB_MIN_AIR_ABSORPTION_GAINHF, 1.f);
+	output.HFReference = ClampReverbValue (properties.HFReference, AL_EAXREVERB_DEFAULT_HFREFERENCE, AL_EAXREVERB_MIN_HFREFERENCE, AL_EAXREVERB_MAX_HFREFERENCE);
+	output.LFReference = ClampReverbValue (properties.LFReference, AL_EAXREVERB_DEFAULT_LFREFERENCE, AL_EAXREVERB_MIN_LFREFERENCE, AL_EAXREVERB_MAX_LFREFERENCE);
+	output.RoomRolloffFactor = ClampReverbValue (properties.RoomRolloffFactor, AL_EAXREVERB_DEFAULT_ROOM_ROLLOFF_FACTOR, AL_EAXREVERB_MIN_ROOM_ROLLOFF_FACTOR, AL_EAXREVERB_MAX_ROOM_ROLLOFF_FACTOR);
+	output.Diffusion = ClampReverbValue (properties.Diffusion / 100.f, AL_EAXREVERB_DEFAULT_DIFFUSION, AL_EAXREVERB_MIN_DIFFUSION, AL_EAXREVERB_MAX_DIFFUSION);
+	output.Density = ClampReverbValue (properties.Density / 100.f, AL_EAXREVERB_DEFAULT_DENSITY, AL_EAXREVERB_MIN_DENSITY, AL_EAXREVERB_MAX_DENSITY);
+	output.DecayHFLimit = (properties.Flags & REVERB_FLAGS_DECAYHFLIMIT) != 0;
+	return output;
+}
+
 enum
 {
 	OALPAUSE_Gameplay = 1,
@@ -138,6 +209,131 @@ namespace
 		functions.Filteri = ResolveOpenALFunction<OALFilteri> ("alFilteri");
 		functions.Filterf = ResolveOpenALFunction<OALFilterf> ("alFilterf");
 		return functions;
+	}
+
+	bool InitializeEFXResources (OpenALCapabilities *capabilities, OALuint *effect, OALuint *slot,
+		OALuint *filter, bool *usesEAX, int sends, OALGetError getError)
+	{
+		OpenALEFXFunctions &efx = capabilities->EFX;
+		if (capabilities->EFXFilterCallable)
+		{
+			getError ();
+			efx.GenFilters (1, filter);
+			if (getError () == AL_NO_ERROR && *filter != 0)
+			{
+				getError ();
+				efx.Filteri (*filter, AL_FILTER_TYPE, AL_FILTER_LOWPASS);
+				if (getError () == AL_NO_ERROR)
+				{
+					capabilities->EFXFilterUsable = true;
+				}
+				else
+				{
+					efx.DeleteFilters (1, filter);
+					*filter = 0;
+				}
+			}
+			else if (*filter != 0)
+			{
+				efx.DeleteFilters (1, filter);
+				*filter = 0;
+			}
+		}
+		if (!capabilities->EFXCallable || sends <= 0)
+		{
+			return false;
+		}
+		bool typeSelected = false;
+		getError ();
+		efx.GenEffects (1, effect);
+		if (getError () == AL_NO_ERROR && *effect != 0)
+		{
+			efx.Effecti (*effect, AL_EFFECT_TYPE, AL_EFFECT_EAXREVERB);
+			if (getError () == AL_NO_ERROR)
+			{
+				*usesEAX = true;
+				typeSelected = true;
+			}
+			else
+			{
+				efx.Effecti (*effect, AL_EFFECT_TYPE, AL_EFFECT_REVERB);
+				typeSelected = getError () == AL_NO_ERROR;
+			}
+		}
+		if (typeSelected)
+		{
+			getError ();
+			efx.GenAuxiliaryEffectSlots (1, slot);
+			if (getError () == AL_NO_ERROR && *slot != 0)
+			{
+				getError ();
+				efx.AuxiliaryEffectSloti (*slot, AL_EFFECTSLOT_EFFECT, *effect);
+				if (getError () == AL_NO_ERROR)
+				{
+					capabilities->EFXUsable = true;
+				}
+			}
+		}
+		return capabilities->EFXUsable;
+	}
+
+	void ReleaseEFXReverbResources (OpenALCapabilities *capabilities, OALuint *effect, OALuint *slot, bool *usesEAX)
+	{
+		OpenALEFXFunctions &efx = capabilities->EFX;
+		if (*slot != 0 && capabilities->EFXCallable)
+		{
+			efx.AuxiliaryEffectSloti (*slot, AL_EFFECTSLOT_EFFECT, AL_EFFECT_NULL);
+			efx.DeleteAuxiliaryEffectSlots (1, slot);
+		}
+		*slot = 0;
+		if (*effect != 0 && capabilities->EFXCallable)
+		{
+			efx.DeleteEffects (1, effect);
+		}
+		*effect = 0;
+		capabilities->EFXUsable = false;
+		capabilities->EFXApplied = false;
+		*usesEAX = false;
+	}
+
+	void FinalizeEFXInitialization (OpenALCapabilities *capabilities, OALuint *effect, OALuint *slot, bool *usesEAX)
+	{
+		if (!capabilities->EFXUsable)
+		{
+			ReleaseEFXReverbResources (capabilities, effect, slot, usesEAX);
+		}
+	}
+
+	void ReleaseEFXResources (OpenALCapabilities *capabilities, OALuint *effect, OALuint *slot,
+		OALuint *filter, bool *usesEAX)
+	{
+		OpenALEFXFunctions &efx = capabilities->EFX;
+		if (*filter != 0 && capabilities->EFXFilterCallable)
+		{
+			efx.DeleteFilters (1, filter);
+		}
+		*filter = 0;
+		capabilities->EFXFilterUsable = false;
+		ReleaseEFXReverbResources (capabilities, effect, slot, usesEAX);
+	}
+
+	void InitializeRendererEFXResources (OpenALCapabilities *capabilities, ALCdevice *device,
+		OALuint *effect, OALuint *slot, OALuint *filter, bool *usesEAX)
+	{
+		ALCint sends = 0;
+		if (capabilities->EFXCallable)
+		{
+			alcGetError (device);
+			alcGetIntegerv (device, ALC_MAX_AUXILIARY_SENDS, 1, &sends);
+			if (alcGetError (device) == ALC_NO_ERROR)
+			{
+				capabilities->EFXSendCount = sends;
+			}
+		}
+		if (capabilities->EFXCallable || capabilities->EFXFilterCallable)
+		{
+			InitializeEFXResources (capabilities, effect, slot, filter, usesEAX, sends, alGetError);
+		}
 	}
 
 	bool CopyHRTFSpecifier (OpenALCapabilities *capabilities, const ALCchar *specifier, bool querySucceeded);
@@ -307,6 +503,9 @@ namespace
 		if (ContextTestState->Result.CreateCount == 1)
 		{
 			ContextTestState->Result.FirstAttributesWereHRTF = attributes != NULL && attributes[0] == ALC_HRTF_SOFT;
+			ContextTestState->Result.FirstAttributesRequestedAuxiliarySend = attributes != NULL &&
+				((attributes[0] == ALC_MAX_AUXILIARY_SENDS && attributes[1] == 1) ||
+				 (attributes[2] == ALC_MAX_AUXILIARY_SENDS && attributes[3] == 1));
 		}
 		else
 		{
@@ -428,7 +627,7 @@ namespace
 
 	bool CreateOpenALContext (const ALCchar *deviceName, bool hrtfEnabled, OpenALContextState *state)
 	{
-		ALCint hrtfAttributes[3];
+		ALCint hrtfAttributes[5];
 		ALCdevice *device = OpenContextDevice (deviceName);
 		if (device == NULL)
 		{
@@ -439,8 +638,11 @@ namespace
 		if (!hrtfAttributesRequested)
 		{
 			state->HRTFFailure = OALHRTFCONTEXT_ExtensionAbsent;
+			hrtfAttributes[0] = ALC_MAX_AUXILIARY_SENDS;
+			hrtfAttributes[1] = 1;
+			hrtfAttributes[2] = 0;
 		}
-		ALCcontext *context = CreateContext (device, hrtfAttributesRequested ? hrtfAttributes : NULL);
+		ALCcontext *context = CreateContext (device, hrtfAttributes);
 		if (context != NULL && MakeContextCurrent (context))
 		{
 			state->Device = device;
@@ -448,12 +650,10 @@ namespace
 			state->HRTFAttributesApplied = hrtfAttributesRequested;
 			return true;
 		}
-		if (!hrtfAttributesRequested)
+		if (hrtfAttributesRequested)
 		{
-			CloseOpenALContext (device, context);
-			return false;
+			state->HRTFFailure = context == NULL ? OALHRTFCONTEXT_CreateFailed : OALHRTFCONTEXT_MakeCurrentFailed;
 		}
-		state->HRTFFailure = context == NULL ? OALHRTFCONTEXT_CreateFailed : OALHRTFCONTEXT_MakeCurrentFailed;
 		CloseOpenALContext (device, context);
 		device = OpenContextDevice (deviceName);
 		if (device == NULL)
@@ -527,6 +727,46 @@ OpenALHRTFQueryTestResult OALTestQueryHRTFCapabilities (bool hrtfAdvertised,
 	result.ActiveQueryCount = testState.ActiveQueryCount;
 	result.StatusQueryCount = testState.StatusQueryCount;
 	return result;
+}
+
+OpenALEFXResourceTestResult OALTestInitializeEFXResources (const OpenALEFXFunctions &functions,
+	bool filterCallable, int sends, OALGetError getError)
+{
+	OpenALEFXResourceTestResult result;
+	OpenALCapabilities capabilities;
+	capabilities.EFX = functions;
+	capabilities.EFXCallable = functions.IsCallable ();
+	capabilities.EFXFilterCallable = filterCallable && functions.IsFilterCallable ();
+	if (capabilities.EFXCallable || capabilities.EFXFilterCallable)
+	{
+		InitializeEFXResources (&capabilities, &result.Effect, &result.Slot, &result.Filter,
+			&result.UsesEAX, sends, getError);
+	}
+	result.Usable = capabilities.EFXUsable;
+	return result;
+}
+
+void OALTestFinalizeEFXInitialization (const OpenALEFXFunctions &functions, OpenALEFXResourceTestResult *resources)
+{
+	OpenALCapabilities capabilities;
+	capabilities.EFX = functions;
+	capabilities.EFXCallable = functions.IsCallable ();
+	capabilities.EFXFilterCallable = functions.IsFilterCallable ();
+	capabilities.EFXFilterUsable = resources->Filter != 0;
+	capabilities.EFXUsable = resources->Usable;
+	FinalizeEFXInitialization (&capabilities, &resources->Effect, &resources->Slot, &resources->UsesEAX);
+	resources->Usable = capabilities.EFXUsable;
+}
+
+void OALTestReleaseEFXResources (const OpenALEFXFunctions &functions, OpenALEFXResourceTestResult *resources)
+{
+	OpenALCapabilities capabilities;
+	capabilities.EFX = functions;
+	capabilities.EFXCallable = functions.IsCallable ();
+	capabilities.EFXFilterCallable = functions.IsFilterCallable ();
+	capabilities.EFXUsable = resources->Usable;
+	ReleaseEFXResources (&capabilities, &resources->Effect, &resources->Slot, &resources->Filter, &resources->UsesEAX);
+	resources->Usable = capabilities.EFXUsable;
 }
 #endif
 
@@ -1720,12 +1960,12 @@ void OpenALSoundStream::ReleaseResources ()
 }
 
 OpenALSoundRenderer::OpenALSoundRenderer ()
-	: Device (NULL), Context (NULL), Capabilities (), Sources (NULL), RequestedSources (0),
+	: Device (NULL), Context (NULL), Capabilities (), EFXEffect (0), EFXSlot (0), EFXFilter (0), Sources (NULL), RequestedSources (0),
 	  AllocatedSources (0), OutputRate (0), InitSuccess (false), HRTFAttributesApplied (false), HRTFRequestedEnabled (false), HRTFFailure (OALHRTFCONTEXT_NoFailure), SfxVolume (1.f),
 		MusicVolume (1.f), NextAllocationSerial (0), NextLogicalPositionToken (~0ull), PausableOutputFrames (0),
 	  NonPausableOutputFrames (0), PausableFrameRemainder (0), NonPausableFrameRemainder (0),
 	  LastClockMilliseconds (0), SfxPaused (0), InactiveState (INACTIVE_Active),
-	  SyncPaused (false), PendingStartNoPause (false)
+	  SyncPaused (false), PendingStartNoPause (false), EFXUsesEAX (false), InvalidReverbPanWarned (false)
 #ifdef OAL_LIFECYCLE_TEST
 	  , FailNextStart (false)
 #endif
@@ -1741,6 +1981,7 @@ OpenALSoundRenderer::~OpenALSoundRenderer ()
 
 bool OpenALSoundRenderer::Init ()
 {
+	InvalidReverbPanWarned = false;
 	const char *requestedDevice = *snd_openal_device;
 	const char *deviceName = NULL;
 	OpenALContextState contextState;
@@ -1773,6 +2014,8 @@ bool OpenALSoundRenderer::Init ()
 	const ALchar *version = alGetString (AL_VERSION);
 	OpenALVersion = version != NULL ? version : "unknown";
 	Capabilities = CollectOpenALCapabilities (device);
+	InitializeRendererEFXResources (&Capabilities, device, &EFXEffect, &EFXSlot, &EFXFilter, &EFXUsesEAX);
+	FinalizeEFXInitialization (&Capabilities, &EFXEffect, &EFXSlot, &EFXUsesEAX);
 
 	if (!alIsExtensionPresent ("AL_SOFT_loop_points"))
 	{
@@ -1836,7 +2079,13 @@ void OpenALSoundRenderer::Shutdown ()
 		{
 			alDeleteSources (AllocatedSources, (ALuint *)Sources);
 		}
+		ReleaseEFXResources ();
 	}
+	EFXEffect = 0;
+	EFXSlot = 0;
+	EFXFilter = 0;
+	EFXUsesEAX = false;
+	InvalidReverbPanWarned = false;
 	delete[] Sources;
 	Sources = NULL;
 	AllocatedSources = 0;
@@ -2929,6 +3178,71 @@ void OpenALSoundRenderer::UpdateSoundParams3D (SoundListener *listener, FISoundC
 	}
 }
 
+void OpenALSoundRenderer::ReleaseEFXResources ()
+{
+	::ReleaseEFXResources (&Capabilities, &EFXEffect, &EFXSlot, &EFXFilter, &EFXUsesEAX);
+}
+
+bool OpenALSoundRenderer::ApplyEFXEnvironment (const ReverbContainer *environment)
+{
+	if (!Capabilities.EFXUsable || environment == NULL)
+	{
+		return false;
+	}
+	OpenALReverbParameters parameters = OALBuildReverbParameters (environment->Properties);
+	if (!InvalidReverbPanWarned && parameters.HasInvalidPan)
+	{
+		Printf ("Warning: OpenAL EFX non-finite reverb pan converted to zero.\n");
+		InvalidReverbPanWarned = true;
+	}
+	OpenALEFXFunctions &efx = Capabilities.EFX;
+	alGetError ();
+	if (EFXUsesEAX)
+	{
+		efx.Effectf (EFXEffect, AL_EAXREVERB_GAIN, parameters.Gain);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_GAINHF, parameters.GainHF);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_GAINLF, parameters.GainLF);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_DECAY_TIME, parameters.DecayTime);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_DECAY_HFRATIO, parameters.DecayHFRatio);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_DECAY_LFRATIO, parameters.DecayLFRatio);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_REFLECTIONS_GAIN, parameters.ReflectionsGain);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_REFLECTIONS_DELAY, parameters.ReflectionsDelay);
+		efx.Effectfv (EFXEffect, AL_EAXREVERB_REFLECTIONS_PAN, parameters.ReflectionsPan);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_LATE_REVERB_GAIN, parameters.LateReverbGain);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_LATE_REVERB_DELAY, parameters.LateReverbDelay);
+		efx.Effectfv (EFXEffect, AL_EAXREVERB_LATE_REVERB_PAN, parameters.LateReverbPan);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_ECHO_TIME, parameters.EchoTime);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_ECHO_DEPTH, parameters.EchoDepth);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_MODULATION_TIME, parameters.ModulationTime);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_MODULATION_DEPTH, parameters.ModulationDepth);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_AIR_ABSORPTION_GAINHF, parameters.AirAbsorptionGainHF);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_HFREFERENCE, parameters.HFReference);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_LFREFERENCE, parameters.LFReference);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_ROOM_ROLLOFF_FACTOR, parameters.RoomRolloffFactor);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_DENSITY, parameters.Density);
+		efx.Effectf (EFXEffect, AL_EAXREVERB_DIFFUSION, parameters.Diffusion);
+		efx.Effecti (EFXEffect, AL_EAXREVERB_DECAY_HFLIMIT, parameters.DecayHFLimit ? AL_TRUE : AL_FALSE);
+	}
+	else
+	{
+		efx.Effectf (EFXEffect, AL_REVERB_GAIN, parameters.Gain);
+		efx.Effectf (EFXEffect, AL_REVERB_GAINHF, parameters.GainHF);
+		efx.Effectf (EFXEffect, AL_REVERB_DECAY_TIME, parameters.DecayTime);
+		efx.Effectf (EFXEffect, AL_REVERB_DECAY_HFRATIO, parameters.DecayHFRatio);
+		efx.Effectf (EFXEffect, AL_REVERB_REFLECTIONS_GAIN, parameters.ReflectionsGain);
+		efx.Effectf (EFXEffect, AL_REVERB_REFLECTIONS_DELAY, parameters.ReflectionsDelay);
+		efx.Effectf (EFXEffect, AL_REVERB_LATE_REVERB_GAIN, parameters.LateReverbGain);
+		efx.Effectf (EFXEffect, AL_REVERB_LATE_REVERB_DELAY, parameters.LateReverbDelay);
+		efx.Effectf (EFXEffect, AL_REVERB_AIR_ABSORPTION_GAINHF, parameters.AirAbsorptionGainHF);
+		efx.Effectf (EFXEffect, AL_REVERB_ROOM_ROLLOFF_FACTOR, parameters.RoomRolloffFactor);
+		efx.Effectf (EFXEffect, AL_REVERB_DENSITY, parameters.Density);
+		efx.Effectf (EFXEffect, AL_REVERB_DIFFUSION, parameters.Diffusion);
+		efx.Effecti (EFXEffect, AL_REVERB_DECAY_HFLIMIT, parameters.DecayHFLimit ? AL_TRUE : AL_FALSE);
+	}
+	Capabilities.EFXApplied = alGetError () == AL_NO_ERROR;
+	return Capabilities.EFXApplied;
+}
+
 void OpenALSoundRenderer::UpdateListener (SoundListener *listener)
 {
 	ALfloat orientation[6];
@@ -2987,6 +3301,7 @@ bool OpenALSoundRenderer::IsValid ()
 
 void OpenALSoundRenderer::PrintStatus ()
 {
+	OpenALEFXStatusSnapshot efxStatus = OALGetEFXStatusSnapshot (Capabilities, EFXUsesEAX);
 	if (!InitSuccess)
 	{
 		Printf (TEXTCOLOR_RED "OpenAL sound module is not active.\n");
@@ -3009,10 +3324,19 @@ void OpenALSoundRenderer::PrintStatus ()
 			HRTFContextFailureName (HRTFFailure),
 		Capabilities.HRTFSpecifier.GetChars ()[0] != '\0' ? ", specifier: " : "",
 		Capabilities.HRTFSpecifier.GetChars ()[0] != '\0' ? Capabilities.HRTFSpecifier.GetChars () : "");
-	Printf ("ALC_EXT_EFX: %s, entrypoints: %s, usable: %s, applied: %s\n",
+	Printf ("ALC_EXT_EFX: %s, entrypoints: %s, reverb: %s, filter: %s, applied: %s\n",
 		Capabilities.EFXAdvertised ? "advertised" : "absent", Capabilities.EFXCallable ? "callable" : "missing",
-		Capabilities.EFXUsable ? "yes" : "no", Capabilities.EFXApplied ? "yes" : "no");
-	Printf ("EFX sends: %s\n", Capabilities.EFXSendCount < 0 ? "not queried" : "available");
+		efxStatus.ReverbMode == OALEFXREVERB_EAX ? "EAX" : (efxStatus.ReverbMode == OALEFXREVERB_Standard ? "standard" : "dry"),
+		efxStatus.FilterState == OALEFXFILTER_Available ? "available" : (efxStatus.FilterState == OALEFXFILTER_Failed ? "failed" : "absent"),
+		efxStatus.Applied ? "yes" : "no");
+	if (efxStatus.SendCount < 0)
+	{
+		Printf ("EFX sends: unknown\n");
+	}
+	else
+	{
+		Printf ("EFX sends: %d\n", efxStatus.SendCount);
+	}
 	Printf ("AL_EXT_SOURCE_RADIUS: %s, applied: %s\n", Capabilities.RadiusAdvertised ? "advertised" : "absent",
 		Capabilities.RadiusApplied ? "yes" : "no");
 	Printf ("Doppler: applied: %s (factor remains 0)\n", Capabilities.DopplerApplied ? "yes" : "no");
@@ -3049,12 +3373,24 @@ void OpenALSoundRenderer::PrintDriversList ()
 FString OpenALSoundRenderer::GatherStats ()
 {
 	FString out;
-	out.Format ("device %s, version %s, %d SFX sources, %d active, %d free, %d streams, HRTF %s (%d), EFX %s/%s, sends %s, radius %s",
+	FString sends;
+	OpenALEFXStatusSnapshot efxStatus = OALGetEFXStatusSnapshot (Capabilities, EFXUsesEAX);
+	if (efxStatus.SendCount < 0)
+	{
+		sends = "unknown";
+	}
+	else
+	{
+		sends.Format ("%d", efxStatus.SendCount);
+	}
+	out.Format ("device %s, version %s, %d SFX sources, %d active, %d free, %d streams, HRTF %s (%d), EFX %s/%s reverb %s filter %s applied %s sends %s, radius %s",
 		DeviceName.GetChars (), OpenALVersion.GetChars (),
 		AllocatedSources, (int)ActiveChannels.size (), AllocatedSources - (int)ActiveChannels.size (), (int)ActiveStreams.size (),
 		Capabilities.HRTFAdvertised ? HRTFStatusName (Capabilities) : "absent", Capabilities.HRTFStatus,
 		Capabilities.EFXAdvertised ? "advertised" : "absent", Capabilities.EFXCallable ? "callable" : "missing",
-		Capabilities.EFXSendCount < 0 ? "not-queried" : "available", Capabilities.RadiusAdvertised ? "advertised" : "absent");
+		efxStatus.ReverbMode == OALEFXREVERB_EAX ? "EAX" : (efxStatus.ReverbMode == OALEFXREVERB_Standard ? "standard" : "dry"),
+		efxStatus.FilterState == OALEFXFILTER_Available ? "available" : (efxStatus.FilterState == OALEFXFILTER_Failed ? "failed" : "absent"),
+		efxStatus.Applied ? "yes" : "no", sends.GetChars (), Capabilities.RadiusAdvertised ? "advertised" : "absent");
 	return out;
 }
 
@@ -3078,14 +3414,30 @@ bool OpenALEFXFunctions::IsCallable () const
 {
 	return GenEffects != NULL && DeleteEffects != NULL && Effecti != NULL && Effectf != NULL && Effectfv != NULL &&
 		GenAuxiliaryEffectSlots != NULL && DeleteAuxiliaryEffectSlots != NULL && AuxiliaryEffectSloti != NULL &&
-		AuxiliaryEffectSlotf != NULL && GenFilters != NULL && DeleteFilters != NULL && Filteri != NULL && Filterf != NULL;
+		AuxiliaryEffectSlotf != NULL;
+}
+
+bool OpenALEFXFunctions::IsFilterCallable () const
+{
+	return GenFilters != NULL && DeleteFilters != NULL && Filteri != NULL && Filterf != NULL;
 }
 
 OpenALCapabilities::OpenALCapabilities ()
 	: HRTFAdvertised (false), HRTFActiveKnown (false), HRTFActive (false), HRTFStatusKnown (false), HRTFStatus (0), HRTFSpecifier (), EFXAdvertised (false), EFX (),
-	  EFXCallable (false), EFXUsable (false), EFXApplied (false), EFXSendCount (-1), RadiusAdvertised (false),
+	  EFXCallable (false), EFXFilterCallable (false), EFXFilterUsable (false), EFXUsable (false), EFXApplied (false), EFXSendCount (-1), RadiusAdvertised (false),
 	  RadiusApplied (false), DopplerApplied (false)
 {
+}
+
+OpenALEFXStatusSnapshot OALGetEFXStatusSnapshot (const OpenALCapabilities &capabilities, bool usesEAX)
+{
+	OpenALEFXStatusSnapshot result;
+	result.SendCount = capabilities.EFXSendCount;
+	result.ReverbMode = !capabilities.EFXUsable ? OALEFXREVERB_Dry : (usesEAX ? OALEFXREVERB_EAX : OALEFXREVERB_Standard);
+	result.FilterState = capabilities.EFXFilterUsable ? OALEFXFILTER_Available :
+		(capabilities.EFXFilterCallable ? OALEFXFILTER_Failed : OALEFXFILTER_Absent);
+	result.Applied = capabilities.EFXApplied;
+	return result;
 }
 
 OpenALCapabilities OALBuildCapabilities (bool hrtfAdvertised, bool hrtfActiveKnown, bool hrtfActive,
@@ -3101,11 +3453,12 @@ OpenALCapabilities OALBuildCapabilities (bool hrtfAdvertised, bool hrtfActiveKno
 	capabilities.EFXAdvertised = efxAdvertised;
 	capabilities.EFX = efx;
 	capabilities.EFXCallable = efx.IsCallable ();
+	capabilities.EFXFilterCallable = efx.IsFilterCallable ();
 	capabilities.RadiusAdvertised = radiusAdvertised;
 	return capabilities;
 }
 
-bool OALBuildHRTFContextAttributes (bool hrtfAdvertised, bool hrtfEnabled, int attributes[3])
+bool OALBuildHRTFContextAttributes (bool hrtfAdvertised, bool hrtfEnabled, int attributes[5])
 {
 	if (!hrtfAdvertised)
 	{
@@ -3113,6 +3466,8 @@ bool OALBuildHRTFContextAttributes (bool hrtfAdvertised, bool hrtfEnabled, int a
 	}
 	attributes[0] = ALC_HRTF_SOFT;
 	attributes[1] = hrtfEnabled ? ALC_TRUE : ALC_FALSE;
-	attributes[2] = 0;
+	attributes[2] = ALC_MAX_AUXILIARY_SENDS;
+	attributes[3] = 1;
+	attributes[4] = 0;
 	return true;
 }

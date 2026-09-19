@@ -26,6 +26,10 @@ typedef ALfloat OALfloat;
 #define OAL_APIENTRY AL_APIENTRY
 #endif
 
+#ifndef ALC_MAX_AUXILIARY_SENDS
+#define ALC_MAX_AUXILIARY_SENDS 0x20003
+#endif
+
 typedef void (OAL_APIENTRY *OALGenEffects) (OALsizei, OALuint *);
 typedef void (OAL_APIENTRY *OALDeleteEffects) (OALsizei, const OALuint *);
 typedef void (OAL_APIENTRY *OALEffecti) (OALuint, OALenum, OALint);
@@ -39,6 +43,37 @@ typedef void (OAL_APIENTRY *OALGenFilters) (OALsizei, OALuint *);
 typedef void (OAL_APIENTRY *OALDeleteFilters) (OALsizei, const OALuint *);
 typedef void (OAL_APIENTRY *OALFilteri) (OALuint, OALenum, OALint);
 typedef void (OAL_APIENTRY *OALFilterf) (OALuint, OALenum, OALfloat);
+typedef OALenum (OAL_APIENTRY *OALGetError) ();
+
+struct OpenALReverbParameters
+{
+	float Gain;
+	float GainHF;
+	float GainLF;
+	float DecayTime;
+	float DecayHFRatio;
+	float DecayLFRatio;
+	float ReflectionsGain;
+	float ReflectionsDelay;
+	float ReflectionsPan[3];
+	float LateReverbGain;
+	float LateReverbDelay;
+	float LateReverbPan[3];
+	float EchoTime;
+	float EchoDepth;
+	float ModulationTime;
+	float ModulationDepth;
+	float AirAbsorptionGainHF;
+	float HFReference;
+	float LFReference;
+	float RoomRolloffFactor;
+	float Diffusion;
+	float Density;
+	bool DecayHFLimit;
+	bool HasInvalidPan;
+};
+
+OpenALReverbParameters OALBuildReverbParameters (const REVERB_PROPERTIES &properties);
 
 struct OpenALEFXFunctions
 {
@@ -58,6 +93,7 @@ struct OpenALEFXFunctions
 
 	OpenALEFXFunctions ();
 	bool IsCallable () const;
+	bool IsFilterCallable () const;
 };
 
 struct OpenALCapabilities
@@ -71,6 +107,8 @@ struct OpenALCapabilities
 	bool EFXAdvertised;
 	OpenALEFXFunctions EFX;
 	bool EFXCallable;
+	bool EFXFilterCallable;
+	bool EFXFilterUsable;
 	bool EFXUsable;
 	bool EFXApplied;
 	int EFXSendCount;
@@ -81,10 +119,34 @@ struct OpenALCapabilities
 	OpenALCapabilities ();
 };
 
+enum OpenALEFXReverbMode
+{
+	OALEFXREVERB_Dry,
+	OALEFXREVERB_Standard,
+	OALEFXREVERB_EAX
+};
+
+enum OpenALEFXFilterState
+{
+	OALEFXFILTER_Absent,
+	OALEFXFILTER_Failed,
+	OALEFXFILTER_Available
+};
+
+struct OpenALEFXStatusSnapshot
+{
+	int SendCount;
+	OpenALEFXReverbMode ReverbMode;
+	OpenALEFXFilterState FilterState;
+	bool Applied;
+};
+
+OpenALEFXStatusSnapshot OALGetEFXStatusSnapshot (const OpenALCapabilities &capabilities, bool usesEAX);
+
 OpenALCapabilities OALBuildCapabilities (bool hrtfAdvertised, bool hrtfActiveKnown, bool hrtfActive,
 	bool hrtfStatusKnown, int hrtfStatus,
 	bool efxAdvertised, const OpenALEFXFunctions &efx, bool radiusAdvertised);
-bool OALBuildHRTFContextAttributes (bool hrtfAdvertised, bool hrtfEnabled, int attributes[3]);
+bool OALBuildHRTFContextAttributes (bool hrtfAdvertised, bool hrtfEnabled, int attributes[5]);
 
 enum OpenALContextHRTFFailure
 {
@@ -116,6 +178,7 @@ struct OpenALContextTestResult
 	int DestroyCount;
 	int CloseCount;
 	bool FirstAttributesWereHRTF;
+	bool FirstAttributesRequestedAuxiliarySend;
 	bool SecondAttributesWereNull;
 	bool HRTFAdvertised;
 	bool HRTFExtensionQueriedOnDevice;
@@ -142,10 +205,29 @@ struct OpenALHRTFQueryTestResult
 
 OpenALHRTFQueryTestResult OALTestQueryHRTFCapabilities (bool hrtfAdvertised,
 	bool activeQuerySucceeded, bool active, bool statusQuerySucceeded, int status);
+
+struct OpenALEFXResourceTestResult
+{
+	OpenALEFXResourceTestResult () : Usable (false), UsesEAX (false), Effect (0), Slot (0), Filter (0) {}
+
+	bool Usable;
+	bool UsesEAX;
+	OALuint Effect;
+	OALuint Slot;
+	OALuint Filter;
+};
+
+OpenALEFXResourceTestResult OALTestInitializeEFXResources (const OpenALEFXFunctions &functions,
+	bool filterCallable, int sends, OALGetError getError);
+void OALTestFinalizeEFXInitialization (const OpenALEFXFunctions &functions, OpenALEFXResourceTestResult *resources);
+void OALTestReleaseEFXResources (const OpenALEFXFunctions &functions, OpenALEFXResourceTestResult *resources);
+bool OALTestApplyEFXEnvironment (const OpenALEFXFunctions &functions, const OpenALEFXResourceTestResult &resources,
+	const ReverbContainer *environment, OALGetError getError);
 #endif
 
 class OpenALSoundRenderer;
 class OpenALStreamProducer;
+struct ReverbContainer;
 
 enum OpenALStreamState
 {
@@ -429,6 +511,8 @@ private:
 	bool GetLogicalPosition (FISoundChannel *owner, unsigned int *position) const;
 	void InitializePauseState (OpenALChannel *channel);
 	void ApplyChannelPauseState (OpenALChannel *channel);
+	void ReleaseEFXResources ();
+	bool ApplyEFXEnvironment (const ReverbContainer *environment);
 	unsigned long long GetChannelClock (bool noPause) const;
 	void DestroyStream (OpenALSoundStream *stream);
 	OpenALSoundStream *CreateStreamWithProducer (OpenALStreamProducer *producer, int bufferBytes, int flags, int sampleRate);
@@ -440,6 +524,9 @@ private:
 	void *Device;
 	void *Context;
 	OpenALCapabilities Capabilities;
+	OALuint EFXEffect;
+	OALuint EFXSlot;
+	OALuint EFXFilter;
 	FString OpenALVersion;
 	unsigned int *Sources;
 	int RequestedSources;
@@ -448,6 +535,8 @@ private:
 	bool InitSuccess;
 	bool HRTFAttributesApplied;
 	bool HRTFRequestedEnabled;
+	bool EFXUsesEAX;
+	bool InvalidReverbPanWarned;
 	OpenALContextHRTFFailure HRTFFailure;
 	FString DeviceName;
 	float SfxVolume;

@@ -92,16 +92,68 @@ public:
 	float Z;
 };
 
+struct REVERB_PROPERTIES
+{
+	int Instance;
+	int Environment;
+	float EnvSize;
+	float EnvDiffusion;
+	int Room;
+	int RoomHF;
+	int RoomLF;
+	float DecayTime;
+	float DecayHFRatio;
+	float DecayLFRatio;
+	int Reflections;
+	float ReflectionsDelay;
+	float ReflectionsPan0;
+	float ReflectionsPan1;
+	float ReflectionsPan2;
+	int Reverb;
+	float ReverbDelay;
+	float ReverbPan0;
+	float ReverbPan1;
+	float ReverbPan2;
+	float EchoTime;
+	float EchoDepth;
+	float ModulationTime;
+	float ModulationDepth;
+	float AirAbsorptionHF;
+	float HFReference;
+	float LFReference;
+	float RoomRolloffFactor;
+	float Diffusion;
+	float Density;
+	unsigned int Flags;
+};
+
+#define REVERB_FLAGS_DECAYHFLIMIT 0x00000020
+
+struct ReverbContainer
+{
+	ReverbContainer *Next;
+	const char *Name;
+	unsigned short ID;
+	bool Builtin;
+	bool Modified;
+	REVERB_PROPERTIES Properties;
+	bool SoftwareWater;
+};
+
+extern ReverbContainer *DefaultEnvironments[26];
+extern ReverbContainer *ForcedEnvironment;
+
 class SoundListener
 {
 public:
-	SoundListener () : position (), velocity (), angle (0.f), underwater (false), valid (false) {}
+	SoundListener () : position (), velocity (), angle (0.f), underwater (false), valid (false), Environment (NULL) {}
 
 	FVector3 position;
 	FVector3 velocity;
 	float angle;
 	bool underwater;
 	bool valid;
+	ReverbContainer *Environment;
 };
 
 struct FRolloffInfo

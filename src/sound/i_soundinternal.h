@@ -61,6 +61,8 @@ struct ReverbContainer
 	bool SoftwareWater;
 };
 
+extern ReverbContainer *ForcedEnvironment;
+
 struct SoundListener
 {
 	FVector3 position;

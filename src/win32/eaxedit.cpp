@@ -77,7 +77,6 @@ extern HINSTANCE g_hInst;
 extern HWND Window;
 extern bool ForceWindowed;
 EXTERN_CVAR (Bool, fullscreen)
-extern ReverbContainer *ForcedEnvironment;
 
 HWND EAXEditWindow;
 HWND hPropList;
@@ -652,6 +651,7 @@ INT_PTR CALLBACK EAXProp (HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 					{
 						CurrentEnv->Properties.Flags &= ~EnvFlags[i].Flag;
 					}
+						CurrentEnv->Modified = true;
 					return TRUE;;
 				}
 			}
@@ -736,6 +736,25 @@ void ShowErrorTip (HWND ToolTip, TOOLINFO &ti, HWND hDlg, const char *title)
 	SendMessage (ti.hwnd, EM_SETSEL, 0, -1);
 	MessageBeep (MB_ICONEXCLAMATION);
 	SetTimer (hDlg, 11223, 10000, NULL);
+}
+
+static ReverbContainer *CreateEnvironment (const ReverbContainer *source, int id, const char *name)
+{
+	ReverbContainer *environment = new ReverbContainer;
+	environment->Builtin = false;
+	environment->Modified = true;
+	environment->SoftwareWater = false;
+	environment->ID = id;
+	environment->Name = copystring (name);
+	environment->Next = NULL;
+	environment->Properties = source->Properties;
+	return environment;
+}
+
+static void RestoreProperties (ReverbContainer *environment, const REVERB_PROPERTIES &properties)
+{
+	environment->Properties = properties;
+	environment->Modified = true;
 }
 
 INT_PTR CALLBACK NewEAXProc (HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -863,14 +882,8 @@ INT_PTR CALLBACK NewEAXProc (HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 					return 0;
 				}
 
-				ReverbContainer *env = new ReverbContainer;
 				rev = (ReverbContainer *)item.lParam;
-
-				env->Builtin = false;
-				env->ID = MAKEWORD (id2, id1);
-				env->Name = copystring (buff);
-				env->Next = NULL;
-				env->Properties = rev->Properties;
+				ReverbContainer *env = CreateEnvironment (rev, MAKEWORD (id2, id1), buff);
 				S_AddEnvironment (env);
 
 				EndDialog (hDlg, (INT_PTR)env);
@@ -1297,7 +1310,7 @@ INT_PTR CALLBACK EAXProc (HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 			hWnd = GetDlgItem (hDlg, IDC_CURRENTENVIRONMENT);
 			env = (ReverbContainer *)SendMessage (hWnd, CB_GETITEMDATA,
 				SendMessage (hWnd, CB_GETCURSEL, 0, 0), 0);
-			env->Properties = SavedProperties;
+			RestoreProperties (env, SavedProperties);
 			UpdateControls (env, hDlg);
 			return 0;
 

@@ -7,8 +7,10 @@
 #include "audio_decoder.h"
 
 #include <AL/al.h>
+#include <AL/efx.h>
 #include <chrono>
 #include <limits>
+#include <map>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,7 +22,11 @@ OALTestStringCVar snd_openal_device ("default");
 OALTestFloatCVar snd_sfxvolume (1.f);
 OALTestBoolCVar snd_pitched (true);
 OALTestBoolCVar snd_hrtf (false);
+static ReverbContainer OALTestOffEnvironment = { NULL, "Off", 0, true, false, { 0, }, false };
+ReverbContainer *DefaultEnvironments[26] = { &OALTestOffEnvironment };
+ReverbContainer *ForcedEnvironment = NULL;
 extern bool OALTestForceFloatPCM16Fallback;
+static int OALTestNonFinitePanWarnings = 0;
 
 namespace
 {
@@ -53,6 +59,108 @@ namespace
 	const int OALTestStreamBits8 = 2;
 	const int OALTestStreamBits32 = 4;
 	const int OALTestStreamFloat = 8;
+
+	enum EFXFault
+	{
+		EFXFault_None,
+		EFXFault_EffectGen,
+		EFXFault_EAXType,
+		EFXFault_BothTypes,
+		EFXFault_SlotGen,
+		EFXFault_Attach,
+		EFXFault_FilterGen,
+		EFXFault_FilterType
+	};
+
+	struct EFXFixture
+	{
+		EFXFixture () : Fault (EFXFault_None), Error (AL_NO_ERROR), NextID (1), EffectGenerations (0),
+			SlotGenerations (0), FilterGenerations (0), EffectDeletes (0), SlotDeletes (0), FilterDeletes (0),
+			SlotDetaches (0), CallsAfterRelease (0), Released (false) {}
+
+		EFXFault Fault;
+		ALenum Error;
+		OALuint NextID;
+		int EffectGenerations;
+		int SlotGenerations;
+		int FilterGenerations;
+		int EffectDeletes;
+		int SlotDeletes;
+		int FilterDeletes;
+		int SlotDetaches;
+		int CallsAfterRelease;
+		bool Released;
+		std::map<OALenum, float> Floats;
+		std::map<OALenum, int> Integers;
+	};
+
+	EFXFixture *CurrentEFXFixture = NULL;
+
+	void EFXCall ()
+	{
+		if (CurrentEFXFixture->Released)
+		{
+			++CurrentEFXFixture->CallsAfterRelease;
+		}
+	}
+
+	ALenum OAL_APIENTRY EFXGetError ()
+	{
+		ALenum error = CurrentEFXFixture->Error;
+		CurrentEFXFixture->Error = AL_NO_ERROR;
+		return error;
+	}
+
+	void OAL_APIENTRY EFXGenEffects (OALsizei, OALuint *effect)
+	{
+		EFXCall (); ++CurrentEFXFixture->EffectGenerations; *effect = CurrentEFXFixture->NextID++;
+		if (CurrentEFXFixture->Fault == EFXFault_EffectGen) CurrentEFXFixture->Error = AL_INVALID_OPERATION;
+	}
+
+	void OAL_APIENTRY EFXDeleteEffects (OALsizei, const OALuint *) { EFXCall (); ++CurrentEFXFixture->EffectDeletes; }
+	void OAL_APIENTRY EFXEffecti (OALuint, OALenum property, OALint value)
+	{
+		EFXCall (); CurrentEFXFixture->Integers[property] = value;
+		if (property == AL_EFFECT_TYPE && ((value == AL_EFFECT_EAXREVERB && (CurrentEFXFixture->Fault == EFXFault_EAXType || CurrentEFXFixture->Fault == EFXFault_BothTypes)) ||
+			(value == AL_EFFECT_REVERB && CurrentEFXFixture->Fault == EFXFault_BothTypes))) CurrentEFXFixture->Error = AL_INVALID_ENUM;
+	}
+	void OAL_APIENTRY EFXEffectf (OALuint, OALenum property, OALfloat value) { EFXCall (); CurrentEFXFixture->Floats[property] = value; }
+	void OAL_APIENTRY EFXEffectfv (OALuint, OALenum property, const OALfloat *value) { EFXCall (); CurrentEFXFixture->Floats[property] = value[0]; }
+	void OAL_APIENTRY EFXGenSlots (OALsizei, OALuint *slot)
+	{
+		EFXCall (); ++CurrentEFXFixture->SlotGenerations; *slot = CurrentEFXFixture->NextID++;
+		if (CurrentEFXFixture->Fault == EFXFault_SlotGen) CurrentEFXFixture->Error = AL_INVALID_OPERATION;
+	}
+	void OAL_APIENTRY EFXDeleteSlots (OALsizei, const OALuint *) { EFXCall (); ++CurrentEFXFixture->SlotDeletes; }
+	void OAL_APIENTRY EFXSloti (OALuint, OALenum property, OALint value)
+	{
+		EFXCall (); if (property == AL_EFFECTSLOT_EFFECT && value == AL_EFFECT_NULL) ++CurrentEFXFixture->SlotDetaches;
+		if (property == AL_EFFECTSLOT_EFFECT && value != AL_EFFECT_NULL && CurrentEFXFixture->Fault == EFXFault_Attach) CurrentEFXFixture->Error = AL_INVALID_OPERATION;
+	}
+	void OAL_APIENTRY EFXSlotf (OALuint, OALenum, OALfloat) { EFXCall (); }
+	void OAL_APIENTRY EFXGenFilters (OALsizei, OALuint *filter)
+	{
+		EFXCall (); ++CurrentEFXFixture->FilterGenerations; *filter = CurrentEFXFixture->NextID++;
+		if (CurrentEFXFixture->Fault == EFXFault_FilterGen) CurrentEFXFixture->Error = AL_INVALID_OPERATION;
+	}
+	void OAL_APIENTRY EFXDeleteFilters (OALsizei, const OALuint *) { EFXCall (); ++CurrentEFXFixture->FilterDeletes; }
+	void OAL_APIENTRY EFXFilteri (OALuint, OALenum, OALint)
+	{
+		EFXCall (); if (CurrentEFXFixture->Fault == EFXFault_FilterType) CurrentEFXFixture->Error = AL_INVALID_ENUM;
+	}
+	void OAL_APIENTRY EFXFilterf (OALuint, OALenum, OALfloat) { EFXCall (); }
+
+	OpenALEFXFunctions MakeEFXFunctions ()
+	{
+		OpenALEFXFunctions functions;
+		functions.GenEffects = EFXGenEffects; functions.DeleteEffects = EFXDeleteEffects;
+		functions.Effecti = EFXEffecti; functions.Effectf = EFXEffectf; functions.Effectfv = EFXEffectfv;
+		functions.GenAuxiliaryEffectSlots = EFXGenSlots; functions.DeleteAuxiliaryEffectSlots = EFXDeleteSlots;
+		functions.AuxiliaryEffectSloti = EFXSloti; functions.AuxiliaryEffectSlotf = EFXSlotf;
+		functions.GenFilters = EFXGenFilters; functions.DeleteFilters = EFXDeleteFilters;
+		functions.Filteri = EFXFilteri; functions.Filterf = EFXFilterf;
+		return functions;
+	}
 
 	void Check (bool condition, const char *name)
 	{
@@ -1763,8 +1871,12 @@ namespace
 	}
 
 
-void Printf (const char *, ...)
+void Printf (const char *format, ...)
 {
+	if (strcmp (format, "Warning: OpenAL EFX non-finite reverb pan converted to zero.\n") == 0)
+	{
+		++OALTestNonFinitePanWarnings;
+	}
 }
 
 void DPrintf (const char *, ...)
@@ -1837,7 +1949,7 @@ static void TestPhase2ContextInitialization ()
 {
 	OpenALContextTestResult extensionAbsent = OALTestRunContextInitialization (false, true, OALCONTEXTTEST_NoFailure);
 	Check (extensionAbsent.Success && !extensionAbsent.AttributesApplied && extensionAbsent.OpenCount == 1 &&
-		extensionAbsent.CreateCount == 1 && !extensionAbsent.FirstAttributesWereHRTF,
+		extensionAbsent.CreateCount == 1 && !extensionAbsent.FirstAttributesWereHRTF && extensionAbsent.FirstAttributesRequestedAuxiliarySend,
 		"phase2 absent HRTF extension keeps normal OpenAL context initialization");
 	OpenALContextTestResult hrtfRejected = OALTestRunContextInitialization (true, true, OALCONTEXTTEST_FirstCreateFailure);
 	Check (hrtfRejected.Success && !hrtfRejected.AttributesApplied && hrtfRejected.OpenCount == 2 && hrtfRejected.CreateCount == 2 &&
@@ -1883,9 +1995,10 @@ static void TestPhase2ManualDirectionMapping ()
 static void TestPhase2ContextFailureCleanup ()
 {
 	OpenALContextTestResult basicFailure = OALTestRunContextInitialization (false, true, OALCONTEXTTEST_FirstCreateFailure);
-	Check (!basicFailure.Success && basicFailure.OpenCount == 1 && basicFailure.CreateCount == 1 && basicFailure.DestroyCount == 0 &&
-		basicFailure.CloseCount == 1 && !basicFailure.FirstAttributesWereHRTF,
-		"phase2 basic OpenAL failure closes once without an HRTF retry");
+	Check (basicFailure.Success && basicFailure.OpenCount == 2 && basicFailure.CreateCount == 2 && basicFailure.DestroyCount == 1 &&
+		basicFailure.CloseCount == 2 && !basicFailure.FirstAttributesWereHRTF && basicFailure.FirstAttributesRequestedAuxiliarySend &&
+		basicFailure.SecondAttributesWereNull,
+		"phase2 auxiliary-send attribute failure retries once without attributes on a fresh device");
 	OpenALContextTestResult retryFailure = OALTestRunContextInitialization (true, true, OALCONTEXTTEST_BothMakeCurrentFailures);
 	Check (!retryFailure.Success, "phase2 failed attribute-free retry returns failure");
 	Check (retryFailure.OpenCount == 2 && retryFailure.CreateCount == 2 && retryFailure.MakeCurrentCount == 2,
@@ -1894,15 +2007,20 @@ static void TestPhase2ContextFailureCleanup ()
 		"phase2 failed attribute-free retry cleans both contexts");
 }
 
-static void TestPhase2HRTFCapabilities ()
+static void TestPhase2HRTFContextAttributes ()
 {
-	int attributes[3] = { 0, 0, 0 };
+	int attributes[5] = { 0, 0, 0, 0, 0 };
 	Check (!OALBuildHRTFContextAttributes (false, true, attributes),
 		"phase2 HRTF attributes are absent when the extension is unavailable");
-	Check (OALBuildHRTFContextAttributes (true, true, attributes) && attributes[0] == 0x1992 && attributes[1] == 1 && attributes[2] == 0,
-		"phase2 HRTF startup request explicitly enables advertised HRTF");
+	Check (OALBuildHRTFContextAttributes (true, true, attributes) && attributes[0] == 0x1992 && attributes[1] == 1 &&
+		attributes[2] == ALC_MAX_AUXILIARY_SENDS && attributes[3] == 1 && attributes[4] == 0,
+		"phase2 HRTF startup request explicitly enables advertised HRTF and requests one auxiliary send");
 	Check (OALBuildHRTFContextAttributes (true, false, attributes) && attributes[1] == 0,
 		"phase2 HRTF startup request explicitly disables advertised HRTF");
+}
+
+static void TestPhase2HRTFCapabilityStates ()
+{
 	OpenALEFXFunctions missing;
 	OpenALCapabilities absent = OALBuildCapabilities (false, false, false, false, 0, false, missing, false);
 	Check (!absent.HRTFAdvertised && !absent.EFXAdvertised && !absent.EFXCallable && !absent.RadiusAdvertised,
@@ -1920,6 +2038,12 @@ static void TestPhase2HRTFCapabilities ()
 	OpenALCapabilities unknown = OALBuildCapabilities (true, true, true, true, 777, false, missing, false);
 	Check (unknown.HRTFStatusKnown && unknown.HRTFStatus == 777 && unknown.HRTFActive,
 		"phase2 unknown HRTF numerical status is retained");
+}
+
+static void TestPhase2HRTFCapabilities ()
+{
+	TestPhase2HRTFContextAttributes ();
+	TestPhase2HRTFCapabilityStates ();
 }
 
 static void TestPhase2HRTFActualQuery ()
@@ -1964,9 +2088,256 @@ static void TestPhase2EFXCapabilities ()
 	callable.Filteri = reinterpret_cast<OALFilteri> (static_cast<uintptr_t> (1));
 	callable.Filterf = reinterpret_cast<OALFilterf> (static_cast<uintptr_t> (1));
 	OpenALCapabilities known = OALBuildCapabilities (true, true, true, true, 1, true, callable, true);
-	Check (known.HRTFAdvertised && known.HRTFActiveKnown && known.HRTFStatusKnown && known.HRTFStatus == 1 && known.HRTFActive && known.EFXCallable && !known.EFXUsable &&
+	Check (known.HRTFAdvertised && known.HRTFActiveKnown && known.HRTFStatusKnown && known.HRTFStatus == 1 && known.HRTFActive && known.EFXCallable && known.EFXFilterCallable && !known.EFXUsable &&
 		known.EFXSendCount < 0 && known.RadiusAdvertised && !known.RadiusApplied && !known.DopplerApplied,
 		"phase2 known status separates callable from applied state");
+}
+
+static void TestPhase2EFXStatusSnapshot ()
+{
+	OpenALCapabilities capabilities;
+	capabilities.EFXSendCount = 0;
+	capabilities.EFXFilterCallable = true;
+	capabilities.EFXFilterUsable = true;
+	OpenALEFXStatusSnapshot zeroSends = OALGetEFXStatusSnapshot (capabilities, false);
+	Check (zeroSends.SendCount == 0 && zeroSends.ReverbMode == OALEFXREVERB_Dry &&
+		zeroSends.FilterState == OALEFXFILTER_Available && !zeroSends.Applied,
+		"phase2 EFX status keeps zero sends, dry reverb, available filter, and unapplied routing distinct");
+	capabilities.EFXSendCount = 3;
+	capabilities.EFXUsable = true;
+	capabilities.EFXApplied = true;
+	OpenALEFXStatusSnapshot eax = OALGetEFXStatusSnapshot (capabilities, true);
+	OpenALEFXStatusSnapshot standard = OALGetEFXStatusSnapshot (capabilities, false);
+	Check (eax.SendCount == 3 && eax.ReverbMode == OALEFXREVERB_EAX && eax.Applied &&
+		standard.ReverbMode == OALEFXREVERB_Standard,
+		"phase2 EFX status reports cached numeric sends and the selected reverb mode");
+	capabilities.EFXSendCount = -1;
+	capabilities.EFXFilterUsable = false;
+	OpenALEFXStatusSnapshot failedFilter = OALGetEFXStatusSnapshot (capabilities, false);
+	capabilities.EFXFilterCallable = false;
+	OpenALEFXStatusSnapshot absentFilter = OALGetEFXStatusSnapshot (capabilities, false);
+	Check (failedFilter.SendCount < 0 && failedFilter.FilterState == OALEFXFILTER_Failed &&
+		absentFilter.FilterState == OALEFXFILTER_Absent,
+		"phase2 EFX status distinguishes unknown sends from failed and absent filters");
+}
+
+static bool HasGenericReverbCoreValues (const OpenALReverbParameters &mapped)
+{
+	return NearlyEqual (mapped.Gain, powf (10.f, -.5f)) && NearlyEqual (mapped.GainHF, powf (10.f, -.05f)) &&
+		NearlyEqual (mapped.GainLF, 1.f) && NearlyEqual (mapped.DecayTime, 1.49f) && NearlyEqual (mapped.DecayHFRatio, .83f) &&
+		NearlyEqual (mapped.DecayLFRatio, 1.f) && NearlyEqual (mapped.ReflectionsGain, powf (10.f, -1.301f)) &&
+		NearlyEqual (mapped.ReflectionsDelay, .007f);
+}
+
+static bool HasGenericReverbEffectValues (const OpenALReverbParameters &mapped)
+{
+	return NearlyEqual (mapped.LateReverbGain, powf (10.f, .1f)) && NearlyEqual (mapped.LateReverbDelay, .011f) &&
+		NearlyEqual (mapped.EchoTime, .25f) && NearlyEqual (mapped.EchoDepth, 0.f) && NearlyEqual (mapped.ModulationTime, .25f) &&
+		NearlyEqual (mapped.ModulationDepth, 0.f) && NearlyEqual (mapped.AirAbsorptionGainHF, powf (10.f, -.0025f)) &&
+		NearlyEqual (mapped.HFReference, 5000.f) && NearlyEqual (mapped.LFReference, 250.f) &&
+		NearlyEqual (mapped.RoomRolloffFactor, 0.f) && NearlyEqual (mapped.Diffusion, 1.f) && NearlyEqual (mapped.Density, 1.f) && mapped.DecayHFLimit;
+}
+
+static bool HasClampedReverbScalarValues (const OpenALReverbParameters &mapped)
+{
+	return NearlyEqual (mapped.Gain, 0.f) && NearlyEqual (mapped.ReflectionsGain, 3.16f) && NearlyEqual (mapped.LateReverbGain, 10.f) &&
+		NearlyEqual (mapped.DecayTime, 20.f) && NearlyEqual (mapped.DecayHFRatio, .1f) && NearlyEqual (mapped.DecayLFRatio, 2.f) &&
+		NearlyEqual (mapped.ReflectionsDelay, .3f) && NearlyEqual (mapped.LateReverbDelay, .1f) && NearlyEqual (mapped.EchoTime, .25f) &&
+		NearlyEqual (mapped.EchoDepth, 1.f) && NearlyEqual (mapped.ModulationTime, 4.f) && NearlyEqual (mapped.ModulationDepth, 1.f);
+}
+
+static bool HasClampedReverbSpatialValues (const OpenALReverbParameters &mapped)
+{
+	return NearlyEqual (mapped.AirAbsorptionGainHF, .892f) && NearlyEqual (mapped.HFReference, 20000.f) &&
+		NearlyEqual (mapped.LFReference, 20.f) && NearlyEqual (mapped.RoomRolloffFactor, 10.f) && NearlyEqual (mapped.Diffusion, 0.f) &&
+		NearlyEqual (mapped.Density, 1.f) && NearlyEqual (mapped.ReflectionsPan[0], .70710678f) &&
+		NearlyEqual (mapped.ReflectionsPan[1], .70710678f) && NearlyEqual (mapped.ReflectionsPan[2], 0.f) &&
+		mapped.LateReverbPan[0] == 0.f && mapped.LateReverbPan[1] == 0.f && mapped.LateReverbPan[2] == 0.f && !mapped.DecayHFLimit;
+}
+
+static void TestPhase2ReverbMapping ()
+{
+	REVERB_PROPERTIES generic = { 0, 0, 7.5f, 1.f, -1000, -100, 0, 1.49f, .83f, 1.f, -2602, .007f, 0.f, 0.f, 0.f, 200, .011f, 0.f, 0.f, 0.f, .25f, 0.f, .25f, 0.f, -5.f, 5000.f, 250.f, 0.f, 100.f, 100.f, 0x3f };
+	OpenALReverbParameters mapped = OALBuildReverbParameters (generic);
+	Check (HasGenericReverbCoreValues (mapped),
+		"phase2 generic reverb maps gains, decay, and reflections");
+	Check (HasGenericReverbEffectValues (mapped),
+		"phase2 generic reverb maps every supported EAX field without room double-addition");
+
+	REVERB_PROPERTIES extreme = generic;
+	volatile float zero = 0.f;
+	extreme.Room = -10000; extreme.Reflections = 1000; extreme.Reverb = 2000; extreme.DecayTime = 100.f;
+	extreme.DecayHFRatio = 0.f; extreme.DecayLFRatio = 100.f; extreme.ReflectionsDelay = 2.f; extreme.ReverbDelay = 2.f;
+	extreme.EchoTime = 100.f; extreme.EchoDepth = 2.f; extreme.ModulationTime = 100.f; extreme.ModulationDepth = 2.f;
+	extreme.AirAbsorptionHF = -1000.f; extreme.HFReference = 999999.f; extreme.LFReference = -1.f; extreme.RoomRolloffFactor = 99.f;
+	extreme.Diffusion = -1.f; extreme.Density = 999.f; extreme.ReflectionsPan0 = 2.f; extreme.ReflectionsPan1 = 2.f; extreme.ReflectionsPan2 = 0.f;
+	extreme.ReverbPan0 = 1.f / zero; extreme.ReverbPan1 = 1.f; extreme.ReverbPan2 = 1.f; extreme.Flags = 0;
+	mapped = OALBuildReverbParameters (extreme);
+	Check (HasClampedReverbScalarValues (mapped),
+		"phase2 reverb clamps scalar values");
+	Check (HasClampedReverbSpatialValues (mapped),
+		"phase2 reverb clamps, normalizes listener-relative pan, and ignores non-HF flags");
+	Check (mapped.HasInvalidPan,
+		"phase2 reverb mapper records a non-finite pan without logging");
+
+	REVERB_PROPERTIES sizeOnly = generic;
+	sizeOnly.EnvSize = 100.f;
+	sizeOnly.EnvDiffusion = 0.f;
+	sizeOnly.Flags = REVERB_FLAGS_DECAYHFLIMIT;
+	OpenALReverbParameters sizeMapped = OALBuildReverbParameters (sizeOnly);
+	Check (NearlyEqual (sizeMapped.DecayTime, generic.DecayTime) &&
+		NearlyEqual (sizeMapped.ReflectionsDelay, generic.ReflectionsDelay) && NearlyEqual (sizeMapped.LateReverbDelay, generic.ReverbDelay) &&
+		NearlyEqual (sizeMapped.Diffusion, 1.f) && NearlyEqual (sizeMapped.Density, 1.f),
+		"phase2 EnvSize and EnvDiffusion do not rescale the completed snapshot");
+}
+
+static void TestPhase2EFXSuccessfulResourceOwnership (const OpenALEFXFunctions &functions)
+{
+	EFXFixture fixture;
+	CurrentEFXFixture = &fixture;
+	OpenALEFXResourceTestResult resources = OALTestInitializeEFXResources (functions, true, 1, EFXGetError);
+	Check (resources.Usable && resources.UsesEAX && fixture.EffectGenerations == 1 && fixture.SlotGenerations == 1 && fixture.FilterGenerations == 1,
+		"phase2 EFX owner creates at most one effect slot and optional filter");
+	OALTestReleaseEFXResources (functions, &resources);
+	Check (!resources.Usable && resources.Effect == 0 && resources.Slot == 0 && resources.Filter == 0 &&
+		fixture.EffectDeletes == 1 && fixture.SlotDeletes == 1 && fixture.FilterDeletes == 1 && fixture.SlotDetaches == 1,
+		"phase2 EFX owner releases every allocated resource exactly once");
+	fixture.Released = true;
+	OALTestReleaseEFXResources (functions, &resources);
+	Check (fixture.CallsAfterRelease == 0 && fixture.EffectDeletes == 1 && fixture.SlotDeletes == 1 && fixture.FilterDeletes == 1,
+		"phase2 repeated EFX teardown does not call OpenAL after resources are released");
+	CurrentEFXFixture = NULL;
+}
+
+static void TestPhase2EFXTypeFailures (const OpenALEFXFunctions &functions)
+{
+	OpenALEFXResourceTestResult resources;
+	EFXFixture effectGenerationFailure;
+	effectGenerationFailure.Fault = EFXFault_EffectGen;
+	CurrentEFXFixture = &effectGenerationFailure;
+	resources = OALTestInitializeEFXResources (functions, true, 1, EFXGetError);
+	OALTestReleaseEFXResources (functions, &resources);
+	Check (!resources.Usable && effectGenerationFailure.EffectDeletes == 1 && effectGenerationFailure.SlotDeletes == 0 && effectGenerationFailure.FilterDeletes == 1,
+		"phase2 EFX effect generation error releases its effect and independent filter");
+
+	EFXFixture standardFallback;
+	standardFallback.Fault = EFXFault_EAXType;
+	CurrentEFXFixture = &standardFallback;
+	resources = OALTestInitializeEFXResources (functions, false, 1, EFXGetError);
+	Check (resources.Usable && !resources.UsesEAX && standardFallback.Integers[AL_EFFECT_TYPE] == AL_EFFECT_REVERB,
+		"phase2 EFX rejects EAX type then accepts standard reverb");
+	OALTestReleaseEFXResources (functions, &resources);
+
+	EFXFixture bothTypesFailure;
+	bothTypesFailure.Fault = EFXFault_BothTypes;
+	CurrentEFXFixture = &bothTypesFailure;
+	resources = OALTestInitializeEFXResources (functions, true, 1, EFXGetError);
+	OALTestFinalizeEFXInitialization (functions, &resources);
+	Check (!resources.Usable && resources.Effect == 0 && resources.Slot == 0 && resources.Filter != 0 &&
+		bothTypesFailure.EffectDeletes == 1 && bothTypesFailure.SlotDeletes == 0 && bothTypesFailure.FilterDeletes == 0,
+		"phase2 EFX initialization cleanup releases rejected reverb but retains an independent filter");
+	OALTestReleaseEFXResources (functions, &resources);
+	Check (bothTypesFailure.FilterDeletes == 1 && bothTypesFailure.SlotGenerations == 0,
+		"phase2 EFX shutdown releases the retained type-rejection filter once");
+	CurrentEFXFixture = NULL;
+}
+
+static void TestPhase2EFXSlotFailures (const OpenALEFXFunctions &functions)
+{
+	OpenALEFXResourceTestResult resources;
+	EFXFixture slotFailure;
+	slotFailure.Fault = EFXFault_SlotGen;
+	CurrentEFXFixture = &slotFailure;
+	resources = OALTestInitializeEFXResources (functions, true, 1, EFXGetError);
+	OALTestFinalizeEFXInitialization (functions, &resources);
+	Check (!resources.Usable && resources.Effect == 0 && resources.Slot == 0 && resources.Filter != 0 &&
+		slotFailure.EffectDeletes == 1 && slotFailure.SlotDeletes == 1 && slotFailure.FilterDeletes == 0,
+		"phase2 EFX initialization cleanup deletes a nonzero failed slot and retains its filter");
+	OALTestReleaseEFXResources (functions, &resources);
+	Check (slotFailure.FilterDeletes == 1,
+		"phase2 EFX shutdown releases the retained slot-failure filter once");
+
+	EFXFixture attachFailure;
+	attachFailure.Fault = EFXFault_Attach;
+	CurrentEFXFixture = &attachFailure;
+	resources = OALTestInitializeEFXResources (functions, true, 1, EFXGetError);
+	OALTestFinalizeEFXInitialization (functions, &resources);
+	Check (!resources.Usable && resources.Effect == 0 && resources.Slot == 0 && resources.Filter != 0 &&
+		attachFailure.EffectDeletes == 1 && attachFailure.SlotDeletes == 1 && attachFailure.FilterDeletes == 0,
+		"phase2 EFX initialization cleanup releases attach failure resources but retains its filter");
+	OALTestReleaseEFXResources (functions, &resources);
+	Check (attachFailure.FilterDeletes == 1,
+		"phase2 EFX shutdown releases the retained attach-failure filter once");
+	CurrentEFXFixture = NULL;
+}
+
+static void TestPhase2EFXFilterAndEntrypointFailures (const OpenALEFXFunctions &functions)
+{
+	OpenALEFXResourceTestResult resources;
+	EFXFixture filterGenerationFailure;
+	filterGenerationFailure.Fault = EFXFault_FilterGen;
+	CurrentEFXFixture = &filterGenerationFailure;
+	resources = OALTestInitializeEFXResources (functions, true, 1, EFXGetError);
+	Check (resources.Usable && resources.Filter == 0 && filterGenerationFailure.FilterDeletes == 1,
+		"phase2 EFX filter generation failure preserves usable reverb and deletes nonzero filter");
+	OALTestReleaseEFXResources (functions, &resources);
+
+	EFXFixture filterTypeFailure;
+	filterTypeFailure.Fault = EFXFault_FilterType;
+	CurrentEFXFixture = &filterTypeFailure;
+	resources = OALTestInitializeEFXResources (functions, true, 1, EFXGetError);
+	Check (resources.Usable && resources.Filter == 0 && filterTypeFailure.FilterDeletes == 1,
+		"phase2 EFX filter type rejection preserves usable reverb");
+	OALTestReleaseEFXResources (functions, &resources);
+
+	EFXFixture noSend;
+	CurrentEFXFixture = &noSend;
+	resources = OALTestInitializeEFXResources (functions, true, 0, EFXGetError);
+	Check (!resources.Usable && resources.Filter != 0 && noSend.EffectGenerations == 0 && noSend.SlotGenerations == 0 && noSend.FilterGenerations == 1,
+		"phase2 EFX keeps an independent filter when zero auxiliary sends are available");
+	OALTestReleaseEFXResources (functions, &resources);
+	Check (resources.Filter == 0 && noSend.FilterDeletes == 1,
+		"phase2 EFX releases the independent zero-send filter exactly once");
+
+	EFXFixture missingReverb;
+	OpenALEFXFunctions missingReverbFunctions = functions;
+	missingReverbFunctions.Effectfv = NULL;
+	CurrentEFXFixture = &missingReverb;
+	resources = OALTestInitializeEFXResources (missingReverbFunctions, true, 1, EFXGetError);
+	Check (!resources.Usable && resources.Filter != 0 && missingReverb.EffectGenerations == 0 && missingReverb.FilterGenerations == 1,
+		"phase2 missing reverb entrypoint retains an independently usable filter");
+	OALTestReleaseEFXResources (missingReverbFunctions, &resources);
+	Check (resources.Filter == 0 && missingReverb.FilterDeletes == 1,
+		"phase2 EFX releases a filter when reverb entrypoints are missing");
+
+	EFXFixture typeFailure;
+	typeFailure.Fault = EFXFault_BothTypes;
+	CurrentEFXFixture = &typeFailure;
+	resources = OALTestInitializeEFXResources (functions, true, 1, EFXGetError);
+	Check (!resources.Usable && resources.Filter != 0 && typeFailure.FilterGenerations == 1,
+		"phase2 EFX retains an independent filter when both reverb types are rejected");
+	OALTestReleaseEFXResources (functions, &resources);
+	Check (resources.Filter == 0 && typeFailure.FilterDeletes == 1,
+		"phase2 EFX releases the type-rejection filter exactly once");
+
+	EFXFixture missingFilter;
+	OpenALEFXFunctions missingFilterFunctions = functions;
+	missingFilterFunctions.Filteri = NULL;
+	CurrentEFXFixture = &missingFilter;
+	resources = OALTestInitializeEFXResources (missingFilterFunctions, true, 1, EFXGetError);
+	Check (resources.Usable && resources.Filter == 0 && missingFilter.EffectGenerations == 1 && missingFilter.SlotGenerations == 1,
+		"phase2 missing filter entrypoint does not disable usable reverb");
+	OALTestReleaseEFXResources (missingFilterFunctions, &resources);
+	CurrentEFXFixture = NULL;
+}
+
+static void TestPhase2EFXResourceOwnership ()
+{
+	OpenALEFXFunctions functions = MakeEFXFunctions ();
+	TestPhase2EFXSuccessfulResourceOwnership (functions);
+	TestPhase2EFXTypeFailures (functions);
+	TestPhase2EFXSlotFailures (functions);
+	TestPhase2EFXFilterAndEntrypointFailures (functions);
 }
 
 static void TestPhase2Capabilities ()
@@ -1977,6 +2348,9 @@ static void TestPhase2Capabilities ()
 	TestPhase2HRTFCapabilities ();
 	TestPhase2HRTFActualQuery ();
 	TestPhase2EFXCapabilities ();
+	TestPhase2EFXStatusSnapshot ();
+	TestPhase2ReverbMapping ();
+	TestPhase2EFXResourceOwnership ();
 }
 
 static void TestPhase2RuntimeHRTFRequest (OpenALSoundRenderer &renderer)
@@ -1988,17 +2362,241 @@ static void TestPhase2RuntimeHRTFRequest (OpenALSoundRenderer &renderer)
 	snd_hrtf.Value = requestedAtInit;
 }
 
+typedef void (AL_APIENTRY *OALGetEffectf) (ALuint effect, ALenum parameter, ALfloat *value);
+typedef void (AL_APIENTRY *OALGetEffectfv) (ALuint effect, ALenum parameter, ALfloat *value);
+typedef void (AL_APIENTRY *OALGetEffecti) (ALuint effect, ALenum parameter, ALint *value);
+
+static void PrintReverbProperties (const char *fixture, const REVERB_PROPERTIES &properties)
+{
+	fprintf (stdout, "EFX_INPUT fixture=%s Instance=%d Environment=%d EnvSize=%.9g EnvDiffusion=%.9g Room=%d RoomHF=%d RoomLF=%d DecayTime=%.9g DecayHFRatio=%.9g DecayLFRatio=%.9g Reflections=%d ReflectionsDelay=%.9g ReflectionsPan=(%.9g,%.9g,%.9g) Reverb=%d ReverbDelay=%.9g ReverbPan=(%.9g,%.9g,%.9g) EchoTime=%.9g EchoDepth=%.9g ModulationTime=%.9g ModulationDepth=%.9g AirAbsorptionHF=%.9g HFReference=%.9g LFReference=%.9g RoomRolloffFactor=%.9g Diffusion=%.9g Density=%.9g Flags=0x%x\n",
+		fixture, properties.Instance, properties.Environment, properties.EnvSize, properties.EnvDiffusion, properties.Room, properties.RoomHF, properties.RoomLF,
+		properties.DecayTime, properties.DecayHFRatio, properties.DecayLFRatio, properties.Reflections, properties.ReflectionsDelay,
+		properties.ReflectionsPan0, properties.ReflectionsPan1, properties.ReflectionsPan2, properties.Reverb, properties.ReverbDelay,
+		properties.ReverbPan0, properties.ReverbPan1, properties.ReverbPan2, properties.EchoTime, properties.EchoDepth,
+		properties.ModulationTime, properties.ModulationDepth, properties.AirAbsorptionHF, properties.HFReference, properties.LFReference,
+		properties.RoomRolloffFactor, properties.Diffusion, properties.Density, properties.Flags);
+}
+
+static void PrintReverbParameters (const char *kind, const char *fixture, const OpenALReverbParameters &parameters)
+{
+	fprintf (stdout, "EFX_%s fixture=%s Gain=%.9g GainHF=%.9g GainLF=%.9g DecayTime=%.9g DecayHFRatio=%.9g DecayLFRatio=%.9g ReflectionsGain=%.9g ReflectionsDelay=%.9g ReflectionsPan=(%.9g,%.9g,%.9g) LateReverbGain=%.9g LateReverbDelay=%.9g LateReverbPan=(%.9g,%.9g,%.9g) EchoTime=%.9g EchoDepth=%.9g ModulationTime=%.9g ModulationDepth=%.9g AirAbsorptionGainHF=%.9g HFReference=%.9g LFReference=%.9g RoomRolloffFactor=%.9g Diffusion=%.9g Density=%.9g DecayHFLimit=%d\n",
+		kind, fixture, parameters.Gain, parameters.GainHF, parameters.GainLF, parameters.DecayTime, parameters.DecayHFRatio,
+		parameters.DecayLFRatio, parameters.ReflectionsGain, parameters.ReflectionsDelay, parameters.ReflectionsPan[0], parameters.ReflectionsPan[1], parameters.ReflectionsPan[2],
+		parameters.LateReverbGain, parameters.LateReverbDelay, parameters.LateReverbPan[0], parameters.LateReverbPan[1], parameters.LateReverbPan[2],
+		parameters.EchoTime, parameters.EchoDepth, parameters.ModulationTime, parameters.ModulationDepth, parameters.AirAbsorptionGainHF,
+		parameters.HFReference, parameters.LFReference, parameters.RoomRolloffFactor, parameters.Diffusion, parameters.Density, parameters.DecayHFLimit ? 1 : 0);
+}
+
+static bool CheckEffectFloat (const char *fixture, const char *mode, OALGetEffectf getEffectf, ALuint effect, ALenum token, float expected)
+{
+	ALfloat actual = 0.f;
+	getEffectf (effect, token, &actual);
+	fprintf (stdout, "EFX_QUERY fixture=%s mode=%s token=0x%x expected=%.9g actual=%.9g error=0x%x\n", fixture, mode, token, expected, actual, alGetError ());
+	return NearlyEqual (actual, expected);
+}
+
+static bool CheckEffectVector (const char *fixture, const char *mode, OALGetEffectfv getEffectfv, ALuint effect, ALenum token, const float expected[3])
+{
+	ALfloat actual[3] = { 0.f, 0.f, 0.f };
+	getEffectfv (effect, token, actual);
+	fprintf (stdout, "EFX_QUERY fixture=%s mode=%s token=0x%x expected=(%.9g,%.9g,%.9g) actual=(%.9g,%.9g,%.9g) error=0x%x\n", fixture, mode, token, expected[0], expected[1], expected[2], actual[0], actual[1], actual[2], alGetError ());
+	return NearlyEqual (actual[0], expected[0]) && NearlyEqual (actual[1], expected[1]) && NearlyEqual (actual[2], expected[2]);
+}
+
+static bool CheckEffectInteger (const char *fixture, const char *mode, OALGetEffecti getEffecti, ALuint effect, ALenum token, int expected)
+{
+	ALint actual = 0;
+	getEffecti (effect, token, &actual);
+	fprintf (stdout, "EFX_QUERY fixture=%s mode=%s token=0x%x expected=%d actual=%d error=0x%x\n", fixture, mode, token, expected, actual, alGetError ());
+	return actual == expected;
+}
+
+static bool CheckEAXCoreEffect (const char *fixture, OALGetEffectf getEffectf, ALuint effect,
+	const OpenALReverbParameters &expected)
+{
+	return CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_GAIN, expected.Gain) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_GAINHF, expected.GainHF) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_GAINLF, expected.GainLF) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_DECAY_TIME, expected.DecayTime) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_DECAY_HFRATIO, expected.DecayHFRatio) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_DECAY_LFRATIO, expected.DecayLFRatio) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_REFLECTIONS_GAIN, expected.ReflectionsGain) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_REFLECTIONS_DELAY, expected.ReflectionsDelay) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_LATE_REVERB_GAIN, expected.LateReverbGain) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_LATE_REVERB_DELAY, expected.LateReverbDelay);
+}
+
+static bool CheckEAXSpatialEffect (const char *fixture, OALGetEffectfv getEffectfv, ALuint effect,
+	const OpenALReverbParameters &expected)
+{
+	return CheckEffectVector (fixture, "EAX", getEffectfv, effect, AL_EAXREVERB_REFLECTIONS_PAN, expected.ReflectionsPan) &&
+		CheckEffectVector (fixture, "EAX", getEffectfv, effect, AL_EAXREVERB_LATE_REVERB_PAN, expected.LateReverbPan);
+}
+
+static bool CheckEAXExtendedEffect (const char *fixture, OALGetEffectf getEffectf, OALGetEffecti getEffecti,
+	ALuint effect, const OpenALReverbParameters &expected)
+{
+	return CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_ECHO_TIME, expected.EchoTime) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_ECHO_DEPTH, expected.EchoDepth) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_MODULATION_TIME, expected.ModulationTime) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_MODULATION_DEPTH, expected.ModulationDepth) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_AIR_ABSORPTION_GAINHF, expected.AirAbsorptionGainHF) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_HFREFERENCE, expected.HFReference) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_LFREFERENCE, expected.LFReference) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_ROOM_ROLLOFF_FACTOR, expected.RoomRolloffFactor) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_DENSITY, expected.Density) &&
+		CheckEffectFloat (fixture, "EAX", getEffectf, effect, AL_EAXREVERB_DIFFUSION, expected.Diffusion) &&
+		CheckEffectInteger (fixture, "EAX", getEffecti, effect, AL_EAXREVERB_DECAY_HFLIMIT, expected.DecayHFLimit ? AL_TRUE : AL_FALSE);
+}
+
+static bool CheckEAXEffect (const char *fixture, OpenALSoundRenderer &renderer, const ReverbContainer &environment,
+	OALGetEffectf getEffectf, OALGetEffectfv getEffectfv, OALGetEffecti getEffecti, const OpenALReverbParameters &expected)
+{
+	OpenALEFXFunctions &efx = renderer.Capabilities.EFX;
+	alGetError ();
+	efx.Effecti (renderer.EFXEffect, AL_EFFECT_TYPE, AL_EFFECT_EAXREVERB);
+	bool typeSet = alGetError () == AL_NO_ERROR;
+	renderer.EFXUsesEAX = true;
+	bool applied = renderer.ApplyEFXEnvironment (&environment);
+	fprintf (stdout, "EFX_APPLY fixture=%s mode=EAX type-set=%d applied=%d\n", fixture, typeSet ? 1 : 0, applied ? 1 : 0);
+	return typeSet && applied &&
+		CheckEAXCoreEffect (fixture, getEffectf, renderer.EFXEffect, expected) &&
+		CheckEAXSpatialEffect (fixture, getEffectfv, renderer.EFXEffect, expected) &&
+		CheckEAXExtendedEffect (fixture, getEffectf, getEffecti, renderer.EFXEffect, expected);
+}
+
+static bool CheckStandardEffect (const char *fixture, OpenALSoundRenderer &renderer, const ReverbContainer &environment,
+	OALGetEffectf getEffectf, OALGetEffecti getEffecti, const OpenALReverbParameters &expected)
+{
+	OpenALEFXFunctions &efx = renderer.Capabilities.EFX;
+	alGetError ();
+	efx.Effecti (renderer.EFXEffect, AL_EFFECT_TYPE, AL_EFFECT_REVERB);
+	bool typeSet = alGetError () == AL_NO_ERROR;
+	renderer.EFXUsesEAX = false;
+	bool applied = renderer.ApplyEFXEnvironment (&environment);
+	fprintf (stdout, "EFX_APPLY fixture=%s mode=standard type-set=%d applied=%d eax-token-alias=0x%x\n", fixture, typeSet ? 1 : 0, applied ? 1 : 0, AL_EAXREVERB_GAINLF);
+	return typeSet && applied &&
+		CheckEffectFloat (fixture, "standard", getEffectf, renderer.EFXEffect, AL_REVERB_GAIN, expected.Gain) &&
+		CheckEffectFloat (fixture, "standard", getEffectf, renderer.EFXEffect, AL_REVERB_GAINHF, expected.GainHF) &&
+		CheckEffectFloat (fixture, "standard", getEffectf, renderer.EFXEffect, AL_REVERB_DECAY_TIME, expected.DecayTime) &&
+		CheckEffectFloat (fixture, "standard", getEffectf, renderer.EFXEffect, AL_REVERB_DECAY_HFRATIO, expected.DecayHFRatio) &&
+		CheckEffectFloat (fixture, "standard", getEffectf, renderer.EFXEffect, AL_REVERB_REFLECTIONS_GAIN, expected.ReflectionsGain) &&
+		CheckEffectFloat (fixture, "standard", getEffectf, renderer.EFXEffect, AL_REVERB_REFLECTIONS_DELAY, expected.ReflectionsDelay) &&
+		CheckEffectFloat (fixture, "standard", getEffectf, renderer.EFXEffect, AL_REVERB_LATE_REVERB_GAIN, expected.LateReverbGain) &&
+		CheckEffectFloat (fixture, "standard", getEffectf, renderer.EFXEffect, AL_REVERB_LATE_REVERB_DELAY, expected.LateReverbDelay) &&
+		CheckEffectFloat (fixture, "standard", getEffectf, renderer.EFXEffect, AL_REVERB_AIR_ABSORPTION_GAINHF, expected.AirAbsorptionGainHF) &&
+		CheckEffectFloat (fixture, "standard", getEffectf, renderer.EFXEffect, AL_REVERB_ROOM_ROLLOFF_FACTOR, expected.RoomRolloffFactor) &&
+		CheckEffectFloat (fixture, "standard", getEffectf, renderer.EFXEffect, AL_REVERB_DENSITY, expected.Density) &&
+		CheckEffectFloat (fixture, "standard", getEffectf, renderer.EFXEffect, AL_REVERB_DIFFUSION, expected.Diffusion) &&
+		CheckEffectInteger (fixture, "standard", getEffecti, renderer.EFXEffect, AL_REVERB_DECAY_HFLIMIT, expected.DecayHFLimit ? AL_TRUE : AL_FALSE);
+}
+
+static bool MatchesMappedReverbCore (const OpenALReverbParameters &mapped, const OpenALReverbParameters &expected)
+{
+	return NearlyEqual (mapped.Gain, expected.Gain) && NearlyEqual (mapped.GainHF, expected.GainHF) &&
+		NearlyEqual (mapped.GainLF, expected.GainLF) && NearlyEqual (mapped.DecayTime, expected.DecayTime) &&
+		NearlyEqual (mapped.DecayHFRatio, expected.DecayHFRatio) && NearlyEqual (mapped.DecayLFRatio, expected.DecayLFRatio) &&
+		NearlyEqual (mapped.ReflectionsGain, expected.ReflectionsGain) && NearlyEqual (mapped.ReflectionsDelay, expected.ReflectionsDelay) &&
+		NearlyEqual (mapped.LateReverbGain, expected.LateReverbGain) && NearlyEqual (mapped.LateReverbDelay, expected.LateReverbDelay);
+}
+
+static bool MatchesMappedReverbExtended (const OpenALReverbParameters &mapped, const OpenALReverbParameters &expected)
+{
+	return NearlyEqual (mapped.EchoTime, expected.EchoTime) && NearlyEqual (mapped.EchoDepth, expected.EchoDepth) &&
+		NearlyEqual (mapped.ModulationTime, expected.ModulationTime) && NearlyEqual (mapped.ModulationDepth, expected.ModulationDepth) &&
+		NearlyEqual (mapped.AirAbsorptionGainHF, expected.AirAbsorptionGainHF) && NearlyEqual (mapped.HFReference, expected.HFReference) &&
+		NearlyEqual (mapped.LFReference, expected.LFReference) && NearlyEqual (mapped.RoomRolloffFactor, expected.RoomRolloffFactor) &&
+		NearlyEqual (mapped.Diffusion, expected.Diffusion) && NearlyEqual (mapped.Density, expected.Density) &&
+		mapped.DecayHFLimit == expected.DecayHFLimit;
+}
+
+static bool MatchesMappedReverbPan (const OpenALReverbParameters &mapped, const OpenALReverbParameters &expected)
+{
+	return NearlyEqual (mapped.ReflectionsPan[0], expected.ReflectionsPan[0]) && NearlyEqual (mapped.ReflectionsPan[1], expected.ReflectionsPan[1]) &&
+		NearlyEqual (mapped.ReflectionsPan[2], expected.ReflectionsPan[2]) && NearlyEqual (mapped.LateReverbPan[0], expected.LateReverbPan[0]) &&
+		NearlyEqual (mapped.LateReverbPan[1], expected.LateReverbPan[1]) && NearlyEqual (mapped.LateReverbPan[2], expected.LateReverbPan[2]);
+}
+
+static void RunPhase2EFXQueryFixture (OpenALSoundRenderer &renderer, const char *name, const REVERB_PROPERTIES &properties,
+	const OpenALReverbParameters &expected, OALGetEffectf getEffectf, OALGetEffectfv getEffectfv, OALGetEffecti getEffecti)
+{
+	ReverbContainer environment = { NULL, name, 0, false, false, properties, false };
+	OpenALReverbParameters mapped = OALBuildReverbParameters (properties);
+	PrintReverbProperties (name, properties);
+	PrintReverbParameters ("EXPECTED", name, expected);
+	PrintReverbParameters ("MAPPER", name, mapped);
+	Check (MatchesMappedReverbCore (mapped, expected) && MatchesMappedReverbExtended (mapped, expected) && MatchesMappedReverbPan (mapped, expected),
+		"phase2 complete fixture mapper matches independent expected values");
+	Check (CheckEAXEffect (name, renderer, environment, getEffectf, getEffectfv, getEffecti, expected),
+		"phase2 complete fixture EAX setter/query values match");
+	Check (CheckStandardEffect (name, renderer, environment, getEffectf, getEffecti, expected),
+		"phase2 complete fixture standard setter/query values match without EAX-only tokens");
+}
+
+static void TestPhase2NonFinitePanApplication (OpenALSoundRenderer &renderer, OALGetEffectfv getEffectfv)
+{
+	volatile float zero = 0.f;
+	REVERB_PROPERTIES properties = { 0, 0, 1.f, 0.f, -1000, -100, 0, 1.f, 1.f, 1.f, -1000, .01f, 1.f / zero, 1.f, 1.f, -1000, .01f, 0.f, 0.f, 0.f, .1f, 0.f, .1f, 0.f, -5.f, 5000.f, 250.f, 0.f, 100.f, 100.f, 0 };
+	ReverbContainer environment = { NULL, "nonfinite-pan", 0, false, false, properties, false };
+	ALfloat pan[3] = { 1.f, 1.f, 1.f };
+	OALTestNonFinitePanWarnings = 0;
+	alGetError ();
+	renderer.Capabilities.EFX.Effecti (renderer.EFXEffect, AL_EFFECT_TYPE, AL_EFFECT_EAXREVERB);
+	bool eaxTypeSelected = alGetError () == AL_NO_ERROR;
+	renderer.EFXUsesEAX = true;
+	bool firstApplied = renderer.ApplyEFXEnvironment (&environment);
+	bool secondApplied = renderer.ApplyEFXEnvironment (&environment);
+	getEffectfv (renderer.EFXEffect, AL_EAXREVERB_REFLECTIONS_PAN, pan);
+	Check (eaxTypeSelected && firstApplied && secondApplied && pan[0] == 0.f && pan[1] == 0.f && pan[2] == 0.f && OALTestNonFinitePanWarnings == 1,
+		"phase2 EFX applies invalid pan as zero and reports it once per renderer");
+}
+
+static int RunPhase2EFXQuery (OpenALSoundRenderer &renderer)
+{
+	OALGetEffectf getEffectf = reinterpret_cast<OALGetEffectf> (alGetProcAddress ("alGetEffectf"));
+	OALGetEffectfv getEffectfv = reinterpret_cast<OALGetEffectfv> (alGetProcAddress ("alGetEffectfv"));
+	OALGetEffecti getEffecti = reinterpret_cast<OALGetEffecti> (alGetProcAddress ("alGetEffecti"));
+	if (!renderer.Capabilities.EFXUsable || getEffectf == NULL || getEffectfv == NULL || getEffecti == NULL)
+	{
+		fprintf (stderr, "SKIP: EFX resources or official alGetEffect* query entrypoints are unavailable\n");
+		return 77;
+	}
+
+	const REVERB_PROPERTIES properties[] =
+	{
+		{ 0, 0, 1.f, 0.f, -10000, -10000, -10000, .1f, .1f, .1f, -10000, 0.f, 0.f, 0.f, 0.f, -10000, 0.f, 0.f, 0.f, 0.f, .075f, 0.f, .04f, 0.f, -100.f, 1000.f, 20.f, 0.f, 0.f, 0.f, 0 },
+		{ 0, 0, 7.5f, 1.f, -1000, -100, 0, 1.49f, .83f, 1.f, -2602, .007f, 0.f, 0.f, 0.f, 200, .011f, 0.f, 0.f, 0.f, .25f, 0.f, .25f, 0.f, -5.f, 5000.f, 250.f, 0.f, 100.f, 100.f, 0x3f },
+		{ 4, 17, 90.f, .1f, -600, -1200, -2400, 12.5f, .4f, 1.8f, -500, .2f, 2.f, -1.f, 0.f, 1000, .09f, -2.f, 1.f, 2.f, .2f, .8f, .6f, .9f, -50.f, 15000.f, 500.f, 7.f, 35.f, 80.f, REVERB_FLAGS_DECAYHFLIMIT },
+		{ 2, 8, 3.f, .9f, -2000, -400, -800, .25f, 1.75f, .3f, -3000, .02f, 0.f, 0.f, 0.f, -1000, .03f, 1.f, 0.f, 0.f, .08f, .15f, .05f, .1f, -100.f, 1200.f, 900.f, .5f, 5.f, 10.f, 0 }
+	};
+	const char *names[] = { "Off", "Generic", "Strong", "Short" };
+	const OpenALReverbParameters expected[] =
+	{
+		{ .00001f, .00001f, .00001f, .1f, .1f, .1f, .00001f, 0.f, { 0.f, 0.f, 0.f }, .00001f, 0.f, { 0.f, 0.f, 0.f }, .075f, 0.f, .04f, 0.f, .892f, 1000.f, 20.f, 0.f, 0.f, 0.f, false },
+		{ .316227766f, .891250938f, 1.f, 1.49f, .83f, 1.f, .050003454f, .007f, { 0.f, 0.f, 0.f }, 1.25892544f, .011f, { 0.f, 0.f, 0.f }, .25f, 0.f, .25f, 0.f, .994260073f, 5000.f, 250.f, 0.f, 1.f, 1.f, true },
+		{ .501187234f, .251188636f, .063095734f, 12.5f, .4f, 1.8f, .562341332f, .2f, { .89442718f, -.44721359f, 0.f }, 3.1622777f, .09f, { -.66666669f, .33333334f, .66666669f }, .2f, .8f, .6f, .9f, .944060862f, 15000.f, 500.f, 7.f, .35f, .8f, true },
+		{ .1f, .630957365f, .398107171f, .25f, 1.75f, .3f, .031622775f, .02f, { 0.f, 0.f, 0.f }, .316227766f, .03f, { 1.f, 0.f, 0.f }, .08f, .15f, .05f, .1f, .892f, 1200.f, 900.f, .5f, .05f, .1f, false }
+	};
+
+	for (size_t index = 0; index < sizeof (properties) / sizeof (properties[0]); ++index)
+	{
+		RunPhase2EFXQueryFixture (renderer, names[index], properties[index], expected[index], getEffectf, getEffectfv, getEffecti);
+	}
+	TestPhase2NonFinitePanApplication (renderer, getEffectfv);
+	return Failures == 0 ? 0 : 1;
+}
+
 static bool IsKnownOperation (const char *operation)
 {
 	return operation == NULL || strcmp (operation, "--phase2-unit-only") == 0 ||
 		strcmp (operation, "--phase2-status") == 0 || strcmp (operation, "--phase1b-direct-memory") == 0 ||
 		strcmp (operation, "--phase1b-file-slice") == 0 || strcmp (operation, "--phase2-listen-six-directions") == 0 ||
-		strcmp (operation, "--phase2-status-hrtf-on") == 0;
+		strcmp (operation, "--phase2-status-hrtf-on") == 0 || strcmp (operation, "--phase2-efx-query") == 0;
 }
 
 static int PrintUsage (const char *program)
 {
-	fprintf (stderr, "Usage: %s [--phase2-unit-only|--phase2-status|--phase2-status-hrtf-on|--phase1b-direct-memory|--phase1b-file-slice|--phase2-listen-six-directions]\n", program);
+	fprintf (stderr, "Usage: %s [--phase2-unit-only|--phase2-status|--phase2-status-hrtf-on|--phase2-efx-query|--phase1b-direct-memory|--phase1b-file-slice|--phase2-listen-six-directions]\n", program);
 	return 2;
 }
 
@@ -2145,55 +2743,9 @@ static int RunPhase2SixDirectionListening (OpenALSoundRenderer &renderer)
 	return 0;
 }
 
-int main (int argc, char **argv)
+static int RunDefaultRendererTests (OpenALSoundRenderer &renderer, std::vector<BYTE> &longSamples,
+	std::vector<BYTE> &shortSamples)
 {
-	const char *phase1bOperation = argc == 2 ? argv[1] : NULL;
-	int initialResult;
-	if (RunInitialOperation (phase1bOperation, argv[0], &initialResult))
-	{
-		return initialResult;
-	}
-	if (IsPhase2ListeningOperation (phase1bOperation) || (phase1bOperation != NULL && strcmp (phase1bOperation, "--phase2-status-hrtf-on") == 0)) snd_hrtf.Value = true;
-	std::vector<BYTE> longSamples = MakeSamples (8000);
-	std::vector<BYTE> shortSamples = MakeSamples (160);
-	snd_channels.Value = 2;
-	int priorityResult = RunPriorityRendererTests (longSamples);
-	if (priorityResult != 0)
-	{
-		return priorityResult;
-	}
-	snd_channels.Value = 1;
-	{
-	OpenALSoundRenderer renderer;
-	if (!renderer.IsValid ())
-	{
-		if (renderer.Device == NULL && renderer.Context == NULL)
-		{
-			fprintf (stderr, "SKIP: OpenAL device/context could not initialize\n");
-			return 77;
-		}
-		fprintf (stderr, "FAILED: OpenAL renderer could not initialize after context creation\n");
-		return 1;
-	}
-	if (IsPhase2ListeningOperation (phase1bOperation)) return RunPhase2SixDirectionListening (renderer);
-	if (PrintPhase2StatusIfRequested (phase1bOperation, renderer))
-	{
-		return 0;
-	}
-	TestPhase2RuntimeHRTFRequest (renderer);
-	if (phase1bOperation != NULL)
-	{
-		if (strcmp (phase1bOperation, "--phase1b-direct-memory") == 0)
-		{
-			TestPhase1BDirectMemory (renderer);
-		}
-		else
-		{
-			TestPhase1BFileSlice (renderer);
-		}
-		return Failures == 0 ? 0 : 1;
-	}
-
 	SoundHandle longSound = renderer.LoadSoundRaw (&longSamples[0], (int)longSamples.size (), 8000, 1, -16, -1);
 	SoundHandle shortSound = renderer.LoadSoundRaw (&shortSamples[0], (int)shortSamples.size (), 8000, 1, -16, -1);
 	std::vector<BYTE> stereoSamples = MakeStereoSamples (8000);
@@ -2224,6 +2776,63 @@ int main (int argc, char **argv)
 	renderer.UnloadSound (shortSound);
 	renderer.UnloadSound (stereoSound);
 	Check (alGetError () == AL_NO_ERROR, "normal renderer sound unloads leave no OpenAL error");
+	return Failures == 0 ? 0 : 1;
+}
+
+static int RunRendererOperation (const char *operation, std::vector<BYTE> &longSamples, std::vector<BYTE> &shortSamples)
+{
+	OpenALSoundRenderer renderer;
+	if (!renderer.IsValid ())
+	{
+		if (renderer.Device == NULL && renderer.Context == NULL)
+		{
+			fprintf (stderr, "SKIP: OpenAL device/context could not initialize\n");
+			return 77;
+		}
+		fprintf (stderr, "FAILED: OpenAL renderer could not initialize after context creation\n");
+		return 1;
+	}
+	if (IsPhase2ListeningOperation (operation)) return RunPhase2SixDirectionListening (renderer);
+	if (PrintPhase2StatusIfRequested (operation, renderer)) return 0;
+	if (operation != NULL && strcmp (operation, "--phase2-efx-query") == 0) return RunPhase2EFXQuery (renderer);
+	TestPhase2RuntimeHRTFRequest (renderer);
+	if (operation != NULL)
+	{
+		if (strcmp (operation, "--phase1b-direct-memory") == 0)
+		{
+			TestPhase1BDirectMemory (renderer);
+		}
+		else
+		{
+			TestPhase1BFileSlice (renderer);
+		}
+		return Failures == 0 ? 0 : 1;
+	}
+	return RunDefaultRendererTests (renderer, longSamples, shortSamples);
+}
+
+int main (int argc, char **argv)
+{
+	const char *phase1bOperation = argc == 2 ? argv[1] : NULL;
+	int initialResult;
+	if (RunInitialOperation (phase1bOperation, argv[0], &initialResult))
+	{
+		return initialResult;
+	}
+	if (IsPhase2ListeningOperation (phase1bOperation) || (phase1bOperation != NULL && strcmp (phase1bOperation, "--phase2-status-hrtf-on") == 0)) snd_hrtf.Value = true;
+	std::vector<BYTE> longSamples = MakeSamples (8000);
+	std::vector<BYTE> shortSamples = MakeSamples (160);
+	snd_channels.Value = 2;
+	int priorityResult = RunPriorityRendererTests (longSamples);
+	if (priorityResult != 0)
+	{
+		return priorityResult;
+	}
+	snd_channels.Value = 1;
+	int rendererResult = RunRendererOperation (phase1bOperation, longSamples, shortSamples);
+	if (rendererResult != 0)
+	{
+		return rendererResult;
 	}
 	TestCrossRendererResetHandoff ();
 	return Failures == 0 ? 0 : 1;

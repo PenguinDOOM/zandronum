@@ -1,66 +1,99 @@
-# Native OpenAL Soft: Phase 2A-2
+# Native OpenAL Soft: Phase 2B-1
 
 ## Scope
 
-This document describes the current 2A-2 capability, HRTF request, and status
-layer. EFX, radius, underwater, and Doppler activation remain outside this
-unit. The existing FMOD backend, `snd_backend` selection, fallback behavior,
-audio feature activation, CVAR defaults, and compatibility behavior remain
+This document describes the implemented 2B-1 shared environment state, EFX
+resource ownership, capability probing, and numeric adapter. The existing FMOD
+backend, `snd_backend` selection, fallback behavior, music selection, CVAR
+defaults, compatibility behavior, `AL_NONE` distance model, and manual rolloff
+remain unchanged.
+
+2B-1 owns one EFX effect, one auxiliary slot, and the filter capability for the
+current OpenAL context. It requests one auxiliary send and records the actual
+`ALC_MAX_AUXILIARY_SENDS` value, including zero; `unknown` is reserved for a
+failed query. EFX resource availability is independent from filter availability.
+Initialization attempts EAX reverb first, then standard reverb, then dry
+operation; a failed optional path does not stop ordinary OpenAL playback.
+Resource cleanup is tracked for partial allocation failures and remains within
+the owning context.
+
+This stage prepares resources and the adapter only. SFX send routing is not
+enabled here. Water pitch/low-pass, virtual-position callbacks, source radius,
+and Doppler remain later work.
+
+## Shared Environment State
+
+`ForcedEnvironment` has one non-owning definition in the environment owner;
+FMOD and OpenAL consume the shared declaration. New environments initialize
+`Modified` to true and `SoftwareWater` to false. Flag edits and Revert notify
+the same modification state as numeric edits, and replacing or unloading an
+environment clears a forced reference before the object is removed. The
+environment structure layout, parser ranges, presets, and saved format are
 unchanged.
 
-2A-2 takes one capability snapshot after the OpenAL context is current. The
-snapshot is cached and is used by `snd_status` and the concise renderer stats;
-capabilities are not queried every frame. `snd_hrtf` is owned by
-`i_sound.cpp`, remains a Bool with default `false`, and retains archive/global
-configuration without a callback. FMOD consumes it through `EXTERN_CVAR`.
+The OpenAL adapter consumes a snapshot. It does not write converted values back
+to the shared environment. `ForcedEnvironment` is the sole definition of the
+environment owner; there is no per-backend duplicate state.
 
-## What The Status Means
+## Numeric Mapping
 
-The status output keeps these states separate:
+Millibel gains use:
 
-- **Advertised:** the device reports the extension or capability.
-- **Callable:** the required function entry points were resolved.
-- **Operational / usable:** the capability has passed the checks needed for
-  actual use. In 2A-1 this is not an activation step.
-- **Applied:** the renderer has applied the feature to runtime audio objects.
+$$g(m)=10^{m/2000}.$$
 
-2A-2 reports capability information and the initial HRTF request state. It does not create EFX effects,
-auxiliary sends, or filters; it does not query EFX send limits; and it does not
-apply any EFX path. Consequently, EFX may be reported as advertised/callable
-while sends remain `not queried`, usable remains false, and applied remains
-false. Radius may be advertised but remains unapplied. Doppler remains
-unapplied with the OpenAL Doppler factor at `0`; the existing manual rolloff
-and `AL_NONE` distance model remain in force.
+Room, reflections, and late reverb are separate gain fields; Room is not
+pre-added to either later gain. Density and Diffusion are the existing SFX
+percent values divided by 100. Each target is clamped to its EFX range. NaN
+uses the target default, infinities clamp by sign, and non-finite pan becomes
+the zero vector.
 
-The HRTF fields are distinct: the initialization request is the `ALC_HRTF_SOFT`
-attribute derived from the `snd_hrtf` value captured at context creation, the
-current CVAR is the later user setting, actual active state is the independent
-`ALC_HRTF_SOFT` query with its own known/unknown flag, status is the independent
-`ALC_HRTF_STATUS_SOFT` query with its own known/unknown flag and numeric reason,
-and the specifier is the separate `ALC_HRTF_SPECIFIER_SOFT` string
-(`0x1995`). The implementation queries the opened `ALCdevice`, not a null
-device. A query failure reports `unknown`, not `off`; an unknown numeric status
-also does not imply inactive. The previous enabled-only inference was incorrect:
-statuses such as `required` (3) and `headphones-detected` (4) can coexist with
-active HRTF, so the manual active gate uses only a known actual-active result.
+Pan remains listener-relative XYZ. Components are not independently clamped;
+vectors with length greater than one are normalized while preserving direction.
+The source coordinate transform, 96-unit distance conversion, and any source
+Z reversal are not applied to reverb pan. `EnvSize` is not rescaled into
+Density, and size-history flags do not alter time or level for a complete
+snapshot. Only reverb flag bit `0x20` maps to the HF decay limit. Unsupported
+standard-reverb tokens are not emitted.
 
-The status output separates the request captured at initialization from the
-current `snd_hrtf` value. Changing the CVAR after initialization is therefore
-pending until the existing `snd_reset` recreation boundary is used.
+`EchoTime` and `EchoDepth` are retained and queryable as API values. In the
+validated runtime they are not evidence of an acoustic echo DSP path. The
+OpenAL API identity observed locally is `1.1 ALSOFT`; OpenAL Soft 1.25.2 is a
+dependency pin in the planned CI provenance, not a proven local runtime
+version.
 
-If an optional-attribute context cannot be created or made current, the
-failed context/device is closed and a new device/context is attempted once
-without the optional HRTF attributes. The status records the retry disposition
-(`attribute context creation failed; retried without attributes` or
-`attribute context current activation failed; retried without attributes`). If
-the basic context also fails, the existing FMOD fallback remains the boundary.
-This retry does not prove that HRTF is active.
+## Capability and Status Semantics
 
-The implementation does not add HRTF profile selection, live context reset,
-EFX objects or sends,
-water filtering/reverb, source radius application, Doppler motion, or new
-activation/fallback rules. Those are later work and are not enabled by this
-unit.
+Status keeps these states distinct:
+
+- **Advertised:** the context reports the extension.
+- **Callable:** required entry points were resolved.
+- **Usable:** the required resource/type operation succeeded.
+- **Applied:** runtime source routing has attached the feature.
+
+In 2B-1, EAX and standard reverb application are tested during resource
+initialization, while source sends are still unapplied. A device may therefore
+report a usable effect resource without claiming that SFX are routed through
+it. The status output uses `EAX`, `standard`, or `dry` for reverb selection;
+`available`, `failed`, or `absent` for the independent filter state; and `yes`
+or `no` for applied routing. A filter can be usable independently of the
+reverb result. If both reverb types fail, dry playback remains available. The
+lifecycle tests also cover zero sends, missing filter entry points, both
+reverb types being rejected, and auxiliary-slot failure. Non-finite reverb pan
+is converted to zero and warns at most once per renderer/context.
+
+## Deferred Boundaries
+
+The following are intentionally outside 2B-1:
+
+- environment selection and SFX send attach/detach, including failure-time dry
+  fallback and music dry routing (2B-2);
+- `snd_waterlp` pitch/low-pass behavior, `SoftwareWater`, and virtual position
+  state (2B-3); and
+- source radius and Doppler behavior (2C/2D).
+
+No full acoustic equivalence with FMOD is claimed. In particular, the legacy
+water wet graph, Q=2 behavior, wet-tail filtering, listener velocity, and
+additional environment routing are not active in this stage.
 
 ## Runtime Identity
 
@@ -110,6 +143,20 @@ For an actual OpenAL context and status snapshot, run:
 ```powershell
 build-v143\tools\Release\openal_lifecycle_tests.exe --phase2-status
 ```
+
+The 2B-1 mapper/query fixture run covered `Off`, `Generic`, `Strong`, and
+`Short`: four inputs, eight EAX/standard applications, and 144 parameter
+queries. The expected mapper values matched the queried values, including
+gain conversion, percentage density/diffusion, range clamping, pan handling,
+and the `0x20` flag. The device-free run is `--phase2-unit-only`; the
+`--phase2-efx-query` run performs `alGetEffect` queries against an actual
+OpenAL device/context. Exit code 77 means that no device/context was
+available and is a skip, not a pass. A real-device `--phase2-status` run also
+passed and reported `EFX sends: 1`,
+`reverb: EAX`, `filter: available`, and `applied: no`.
+
+The Release product/test build and focused CTest records are retained as
+validation evidence. Resource-owner fault-injection unit tests also passed.
 
 The earlier 2A-1 status record included `OpenAL Soft`, `1.1 ALSOFT`, HRTF
 status `enabled (1)`, EFX `advertised/callable`, sends `not-queried`, and
@@ -185,8 +232,7 @@ directions are clear or require a correction for individual listening
 variation.
 
 Do not treat this baseline as evidence that EFX, radius, water processing, or
-Doppler is active. The final Cppcheck evidence for the corrected source passed
-with exit code 0, `New=0`, and `UnresolvedVendor=0`. The final Release and
+Doppler is active. The final Release and
 NO_SOUND/SERVERONLY records also have valid exit-code-0 results. Historical 2A-1
 analyzer and source-hash records remain historical phase evidence and are not
 presented as new 2A-2 measurements. Earlier automatic NO_SOUND and SERVERONLY
@@ -198,8 +244,8 @@ No setup, reset, or installation was performed for that analysis.
 
 ## Deferred Work
 
-Later units may add HRTF profile selection or live context reset, create and
-apply EFX resources, add water processing, apply radius, or calibrate and
-enable source-only Doppler. The existing `snd_reset` path recreates the
-renderer and is the current HRTF application boundary; live
-`alcResetDeviceSOFT` is not implemented.
+Later units may add HRTF profile selection or live context reset, route and
+apply EFX sends, add water processing, apply radius, or calibrate and enable
+source-only Doppler. The existing `snd_reset` path recreates the renderer and
+is the current HRTF application boundary; live `alcResetDeviceSOFT` is not
+implemented.

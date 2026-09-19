@@ -80,6 +80,20 @@ extern HINSTANCE g_hInst;
 #include "s_sound.h"
 
 CVAR (Bool, snd_hrtf, false, CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
+CVAR (Bool, snd_waterreverb, true, CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
+
+// Underwater low-pass filter cutoff frequency. Set to 0 to disable the filter.
+CUSTOM_CVAR (Float, snd_waterlp, 250, CVAR_ARCHIVE|CVAR_GLOBALCONFIG)
+{
+	if (*self < 10 && *self != 0)
+	{
+		self = 10;
+	}
+	else if (*self > 22000)
+	{
+		self = 22000;
+	}
+}
 #include "v_text.h"
 #include "gi.h"
 
