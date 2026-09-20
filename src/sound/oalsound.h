@@ -133,6 +133,22 @@ enum OpenALEFXFilterState
 	OALEFXFILTER_Available
 };
 
+enum OpenALEFXFailure
+{
+	OALEFXFAIL_None,
+	OALEFXFAIL_Unavailable,
+	OALEFXFAIL_Properties,
+	OALEFXFAIL_SlotAttach,
+	OALEFXFAIL_WetSend,
+	OALEFXFAIL_DrySend,
+	OALEFXFAIL_AirAbsorption,
+	OALEFXFAIL_DirectFilterAuto,
+	OALEFXFAIL_SendGainAuto,
+	OALEFXFAIL_SendGainHFAuto,
+	OALEFXFAIL_DirectFilter,
+	OALEFXFAIL_SourceRadius
+};
+
 struct OpenALEFXStatusSnapshot
 {
 	int SendCount;
@@ -157,6 +173,15 @@ enum OpenALContextHRTFFailure
 };
 
 #ifdef OAL_LIFECYCLE_TEST
+struct OpenALEFXSourceAssignment
+{
+	unsigned int Source;
+	int Slot;
+	int Send;
+	int Filter;
+	int Error;
+};
+
 enum OpenALContextTestFailure
 {
 	OALCONTEXTTEST_NoFailure,
@@ -306,6 +331,7 @@ public:
 	unsigned long long AllocationSerial;
 	bool Looping;
 	bool NoPause;
+	bool NoReverb;
 	bool Is3D;
 	bool IsArea;
 	bool WasPlayingBeforePause;
@@ -513,12 +539,27 @@ private:
 	void ApplyChannelPauseState (OpenALChannel *channel);
 	void ReleaseEFXResources ();
 	bool ApplyEFXEnvironment (const ReverbContainer *environment);
+	bool SetEFXSourceSend (unsigned int source, int slot, int send, int filter);
+	bool EnsureEFXSourceDry (unsigned int source);
+	bool ResetEFXSourceProperty (unsigned int source, OALenum property, int value, bool floating, OpenALEFXFailure failure);
+	bool ResetEFXSource (unsigned int source);
+	bool ApplyChannelEFX (OpenALChannel *channel);
+	bool ApplyEFXEnvironmentToChannels ();
+	void DrainEFXEnvironmentFailure ();
+	void FailEFXEnvironment ();
+	void RetireEFXSource (OpenALChannel *channel);
+	void RecordEFXFailure (OpenALEFXFailure failure);
+	void UpdateEFXEnvironment (SoundListener *listener);
 	unsigned long long GetChannelClock (bool noPause) const;
 	void DestroyStream (OpenALSoundStream *stream);
 	OpenALSoundStream *CreateStreamWithProducer (OpenALStreamProducer *producer, int bufferBytes, int flags, int sampleRate);
 
 #ifdef OAL_LIFECYCLE_TEST
 	void InjectStartFailureForTest ();
+	void InjectStartSetupFailureForTest ();
+	void InjectEFXSourceFailureForTest (OpenALEFXFailure failure = OALEFXFAIL_WetSend, bool persistent = false, unsigned int source = 0);
+	void ClearEFXSourceFailureForTest ();
+	bool InjectEFXSourceFailure (unsigned int source, OpenALEFXFailure failure);
 #endif
 
 	void *Device;
@@ -552,12 +593,30 @@ private:
 	EInactiveState InactiveState;
 	bool SyncPaused;
 	bool PendingStartNoPause;
+	bool EFXEnvironmentInitialized;
+	bool EFXFailureDraining;
+	const ReverbContainer *LastAttemptedEnvironment;
+	const ReverbContainer *LastAppliedEnvironment;
+	OpenALEFXFailure EFXFailure;
 	std::vector<OpenALChannel *> ActiveChannels;
 	std::vector<OpenALSoundStream *> ActiveStreams;
 	std::vector<LogicalPosition> LogicalPositions;
 	std::vector<unsigned int> RetiringSources;
 #ifdef OAL_LIFECYCLE_TEST
 	bool FailNextStart;
+	bool FailNextStartSetup;
+	OpenALEFXFailure FailNextEFXSourceAssign;
+	bool PersistentEFXSourceFailure;
+	unsigned int FailEFXSourceAssignSource;
+	unsigned int EFXSourceFailureCalls;
+	bool EFXSourceFailureCallLimitExceeded;
+	unsigned int LastEFXSource;
+	int LastEFXSlot;
+	int LastEFXSend;
+	int LastEFXFilter;
+	int LastEFXSourceError;
+	int LastEFXSourceFailureError;
+	std::vector<OpenALEFXSourceAssignment> EFXSourceAssignments;
 #endif
 };
 

@@ -88,6 +88,19 @@ bool OALTestAcceptsEncodedInputSize (unsigned int bytes)
 #define AL_FORMAT_STEREO_FLOAT32 0x10011
 #endif
 
+#ifndef AL_AUXILIARY_SEND_FILTER
+#define AL_AUXILIARY_SEND_FILTER 0x20006
+#define AL_AIR_ABSORPTION_FACTOR 0x20007
+#define AL_DIRECT_FILTER_GAINHF_AUTO 0x2000A
+#define AL_AUXILIARY_SEND_FILTER_GAIN_AUTO 0x2000B
+#define AL_AUXILIARY_SEND_FILTER_GAINHF_AUTO 0x2000C
+#define AL_DIRECT_FILTER 0x20005
+#endif
+
+#ifndef AL_SOURCE_RADIUS
+#define AL_SOURCE_RADIUS 0x1031
+#endif
+
 #ifndef ALC_SOFT_HRTF
 #define ALC_SOFT_HRTF 1
 #define ALC_HRTF_SOFT 0x1992
@@ -453,6 +466,27 @@ namespace
 		case OALHRTFCONTEXT_CreateFailed: return "attribute context creation failed; retried without attributes";
 		case OALHRTFCONTEXT_MakeCurrentFailed: return "attribute context current activation failed; retried without attributes";
 		default: return "attributes accepted";
+		}
+	}
+
+	const char *EFXFailureName (const OpenALCapabilities &capabilities, const ReverbContainer *lastAppliedEnvironment, OpenALEFXFailure failure)
+	{
+		const char *name = !capabilities.EFXAdvertised || !capabilities.EFXCallable ? "unavailable" :
+			lastAppliedEnvironment == DefaultEnvironments[0] ? "dry-off" : "none";
+		switch (failure)
+		{
+		case OALEFXFAIL_Properties: return "properties";
+		case OALEFXFAIL_SlotAttach: return "slot-attach";
+		case OALEFXFAIL_WetSend: return "wet-send";
+		case OALEFXFAIL_DrySend: return "dry-send";
+		case OALEFXFAIL_AirAbsorption: return "air-absorption";
+		case OALEFXFAIL_DirectFilterAuto: return "direct-filter-auto";
+		case OALEFXFAIL_SendGainAuto: return "send-gain-auto";
+		case OALEFXFAIL_SendGainHFAuto: return "send-gainhf-auto";
+		case OALEFXFAIL_DirectFilter: return "direct-filter";
+		case OALEFXFAIL_SourceRadius: return "source-radius";
+		case OALEFXFAIL_Unavailable: return "unavailable";
+		default: return name;
 		}
 	}
 
@@ -1129,7 +1163,7 @@ OpenALSound::OpenALSound ()
 OpenALChannel::OpenALChannel ()
 	: Source (0), Sound (NULL), Owner (NULL), Gain (0.f), Pitch (1.f), Priority (0),
 	  RolloffGain (1.f), EffectiveGain (0.f), Distance (0.f), DistanceScale (1.f),
-	  CachedPosition (0), LogicalStartFrame (0), AllocationSerial (0), Looping (false), NoPause (false), Is3D (false), IsArea (false),
+	  CachedPosition (0), LogicalStartFrame (0), AllocationSerial (0), Looping (false), NoPause (false), NoReverb (false), Is3D (false), IsArea (false),
 	  WasPlayingBeforePause (false), PauseReasons (0), Rolloff (), EndReason (OALEND_None),
 	  FinalizeState (OALFINAL_Active)
 {
@@ -1965,9 +1999,12 @@ OpenALSoundRenderer::OpenALSoundRenderer ()
 		MusicVolume (1.f), NextAllocationSerial (0), NextLogicalPositionToken (~0ull), PausableOutputFrames (0),
 	  NonPausableOutputFrames (0), PausableFrameRemainder (0), NonPausableFrameRemainder (0),
 	  LastClockMilliseconds (0), SfxPaused (0), InactiveState (INACTIVE_Active),
-	  SyncPaused (false), PendingStartNoPause (false), EFXUsesEAX (false), InvalidReverbPanWarned (false)
+	  SyncPaused (false), PendingStartNoPause (false), EFXEnvironmentInitialized (false), EFXFailureDraining (false),
+	  LastAttemptedEnvironment (NULL), LastAppliedEnvironment (NULL), EFXFailure (OALEFXFAIL_None), EFXUsesEAX (false), InvalidReverbPanWarned (false)
 #ifdef OAL_LIFECYCLE_TEST
-	  , FailNextStart (false)
+	  , FailNextStart (false), FailNextStartSetup (false), FailNextEFXSourceAssign (OALEFXFAIL_None), PersistentEFXSourceFailure (false),
+	  FailEFXSourceAssignSource (0), EFXSourceFailureCalls (0), EFXSourceFailureCallLimitExceeded (false), LastEFXSource (0), LastEFXSlot (0),
+	  LastEFXSend (0), LastEFXFilter (0), LastEFXSourceError (AL_NO_ERROR), LastEFXSourceFailureError (AL_NO_ERROR)
 #endif
 {
 	InitSuccess = Init ();
@@ -2086,6 +2123,9 @@ void OpenALSoundRenderer::Shutdown ()
 	EFXFilter = 0;
 	EFXUsesEAX = false;
 	InvalidReverbPanWarned = false;
+	EFXEnvironmentInitialized = false;
+	LastAttemptedEnvironment = NULL;
+	LastAppliedEnvironment = NULL;
 	delete[] Sources;
 	Sources = NULL;
 	AllocatedSources = 0;
@@ -2408,6 +2448,11 @@ OpenALSoundStream *OpenALSoundRenderer::CreateStreamWithProducer (OpenALStreamPr
 	}
 	stream->Source = source;
 	memcpy (stream->Buffers, buffers, sizeof (buffers));
+	if (!ResetEFXSource (source))
+	{
+		delete stream;
+		return NULL;
+	}
 	stream->SetInactive (InactiveState == INACTIVE_Complete);
 	ActiveStreams.push_back (stream);
 	return stream;
@@ -2566,6 +2611,7 @@ OpenALChannel *OpenALSoundRenderer::CreateChannel (unsigned int source, OpenALSo
 	channel->Priority = priority;
 	channel->Looping = (flags & SNDF_LOOP) != 0;
 	channel->NoPause = (flags & SNDF_NOPAUSE) != 0;
+	channel->NoReverb = (flags & SNDF_NOREVERB) != 0;
 	channel->AllocationSerial = ++NextAllocationSerial;
 	InitializePauseState (channel);
 	return channel;
@@ -2726,6 +2772,48 @@ FISoundChannel *OpenALSoundRenderer::PublishChannel (OpenALChannel *channel, FIS
 void OpenALSoundRenderer::InjectStartFailureForTest ()
 {
 	FailNextStart = true;
+}
+
+void OpenALSoundRenderer::InjectStartSetupFailureForTest ()
+{
+	FailNextStartSetup = true;
+}
+
+void OpenALSoundRenderer::InjectEFXSourceFailureForTest (OpenALEFXFailure failure, bool persistent, unsigned int source)
+{
+	FailNextEFXSourceAssign = failure;
+	PersistentEFXSourceFailure = persistent;
+	FailEFXSourceAssignSource = source;
+	EFXSourceFailureCalls = 0;
+	EFXSourceFailureCallLimitExceeded = false;
+}
+
+void OpenALSoundRenderer::ClearEFXSourceFailureForTest ()
+{
+	FailNextEFXSourceAssign = OALEFXFAIL_None;
+	PersistentEFXSourceFailure = false;
+	FailEFXSourceAssignSource = 0;
+}
+
+bool OpenALSoundRenderer::InjectEFXSourceFailure (unsigned int source, OpenALEFXFailure failure)
+{
+	if (FailNextEFXSourceAssign != failure ||
+		(FailEFXSourceAssignSource != 0 && FailEFXSourceAssignSource != source))
+	{
+		return false;
+	}
+	++EFXSourceFailureCalls;
+	if (PersistentEFXSourceFailure && EFXSourceFailureCalls > 32)
+	{
+		EFXSourceFailureCallLimitExceeded = true;
+		ClearEFXSourceFailureForTest ();
+		return false;
+	}
+	if (!PersistentEFXSourceFailure)
+	{
+		ClearEFXSourceFailureForTest ();
+	}
+	return true;
 }
 #endif
 
@@ -2948,6 +3036,27 @@ FISoundChannel *OpenALSoundRenderer::Start2D (SoundHandle sfx, float volume, int
 	alSourcei (source, AL_LOOPING, channel->Looping ? AL_TRUE : AL_FALSE);
 	alSourcef (source, AL_PITCH, channel->Pitch);
 	ApplyChannelGain (channel);
+#ifdef OAL_LIFECYCLE_TEST
+	if (FailNextStartSetup)
+	{
+		FailNextStartSetup = false;
+		alSourcei (0, AL_BUFFER, 0);
+	}
+#endif
+	if (alGetError () != AL_NO_ERROR)
+	{
+		alSourceStop (source);
+		alSourcei (source, AL_BUFFER, 0);
+		delete channel;
+		return NULL;
+	}
+	if (!ApplyChannelEFX (channel))
+	{
+		alSourceStop (source);
+		alSourcei (source, AL_BUFFER, 0);
+		delete channel;
+		return NULL;
+	}
 	return PublishChannel (channel, reuseChan, restart);
 }
 
@@ -2999,6 +3108,27 @@ FISoundChannel *OpenALSoundRenderer::StartSound3D (SoundHandle sfx, SoundListene
 	alSourcei (source, AL_LOOPING, channel->Looping ? AL_TRUE : AL_FALSE);
 	alSourcef (source, AL_PITCH, channel->Pitch);
 	ApplySpatialState (channel, listener, pos, vel);
+#ifdef OAL_LIFECYCLE_TEST
+	if (FailNextStartSetup)
+	{
+		FailNextStartSetup = false;
+		alSourcei (0, AL_BUFFER, 0);
+	}
+#endif
+	if (alGetError () != AL_NO_ERROR)
+	{
+		alSourceStop (source);
+		alSourcei (source, AL_BUFFER, 0);
+		delete channel;
+		return NULL;
+	}
+	if (!ApplyChannelEFX (channel))
+	{
+		alSourceStop (source);
+		alSourcei (source, AL_BUFFER, 0);
+		delete channel;
+		return NULL;
+	}
 	return PublishChannel (channel, reuseChan, restart);
 }
 
@@ -3239,8 +3369,222 @@ bool OpenALSoundRenderer::ApplyEFXEnvironment (const ReverbContainer *environmen
 		efx.Effectf (EFXEffect, AL_REVERB_DIFFUSION, parameters.Diffusion);
 		efx.Effecti (EFXEffect, AL_REVERB_DECAY_HFLIMIT, parameters.DecayHFLimit ? AL_TRUE : AL_FALSE);
 	}
+	if (alGetError () != AL_NO_ERROR)
+	{
+		Capabilities.EFXApplied = false;
+		RecordEFXFailure (OALEFXFAIL_Properties);
+		return false;
+	}
+	efx.AuxiliaryEffectSloti (EFXSlot, AL_EFFECTSLOT_EFFECT, EFXEffect);
 	Capabilities.EFXApplied = alGetError () == AL_NO_ERROR;
+	if (!Capabilities.EFXApplied)
+	{
+		RecordEFXFailure (OALEFXFAIL_SlotAttach);
+	}
 	return Capabilities.EFXApplied;
+}
+
+bool OpenALSoundRenderer::SetEFXSourceSend (unsigned int source, int slot, int send, int filter)
+{
+	alGetError ();
+	alSource3i (source, AL_AUXILIARY_SEND_FILTER, slot, send, filter);
+	ALenum error = alGetError ();
+#ifdef OAL_LIFECYCLE_TEST
+	LastEFXSource = source;
+	LastEFXSlot = slot;
+	LastEFXSend = send;
+	LastEFXFilter = filter;
+	if (InjectEFXSourceFailure (source, slot != 0 ? OALEFXFAIL_WetSend : OALEFXFAIL_DrySend))
+	{
+		alSource3i (0, AL_AUXILIARY_SEND_FILTER, slot, send, filter);
+		error = alGetError ();
+	}
+	LastEFXSourceError = error;
+	OpenALEFXSourceAssignment assignment = { source, slot, send, filter, error };
+	EFXSourceAssignments.push_back (assignment);
+	if (error != AL_NO_ERROR)
+	{
+		LastEFXSourceFailureError = error;
+	}
+#endif
+	if (error != AL_NO_ERROR)
+	{
+		RecordEFXFailure (slot != 0 ? OALEFXFAIL_WetSend : OALEFXFAIL_DrySend);
+	}
+	return error == AL_NO_ERROR;
+}
+
+void OpenALSoundRenderer::RecordEFXFailure (OpenALEFXFailure failure)
+{
+	if (failure != OALEFXFAIL_None)
+	{
+		EFXFailure = failure;
+	}
+}
+
+bool OpenALSoundRenderer::EnsureEFXSourceDry (unsigned int source)
+{
+	return !Capabilities.EFXCallable || SetEFXSourceSend (source, 0, 0, 0);
+}
+
+bool OpenALSoundRenderer::ResetEFXSourceProperty (unsigned int source, OALenum property, int value, bool floating, OpenALEFXFailure failure)
+{
+	alGetError ();
+	if (floating) alSourcef (source, property, 0.f);
+	else alSourcei (source, property, value);
+#ifdef OAL_LIFECYCLE_TEST
+	if (InjectEFXSourceFailure (source, failure))
+	{
+		if (floating) alSourcef (0, property, 0.f);
+		else alSourcei (0, property, value);
+	}
+#endif
+	if (alGetError () == AL_NO_ERROR)
+	{
+		return true;
+	}
+	RecordEFXFailure (failure);
+	return false;
+}
+
+bool OpenALSoundRenderer::ResetEFXSource (unsigned int source)
+{
+	bool reset = EnsureEFXSourceDry (source);
+	if (Capabilities.EFXCallable)
+	{
+		reset = ResetEFXSourceProperty (source, AL_AIR_ABSORPTION_FACTOR, 0, true, OALEFXFAIL_AirAbsorption) && reset;
+		reset = ResetEFXSourceProperty (source, AL_DIRECT_FILTER_GAINHF_AUTO, AL_FALSE, false, OALEFXFAIL_DirectFilterAuto) && reset;
+		reset = ResetEFXSourceProperty (source, AL_AUXILIARY_SEND_FILTER_GAIN_AUTO, AL_FALSE, false, OALEFXFAIL_SendGainAuto) && reset;
+		reset = ResetEFXSourceProperty (source, AL_AUXILIARY_SEND_FILTER_GAINHF_AUTO, AL_FALSE, false, OALEFXFAIL_SendGainHFAuto) && reset;
+	}
+	if (Capabilities.EFXFilterCallable)
+	{
+		reset = ResetEFXSourceProperty (source, AL_DIRECT_FILTER, 0, false, OALEFXFAIL_DirectFilter) && reset;
+	}
+	if (Capabilities.RadiusAdvertised)
+	{
+		reset = ResetEFXSourceProperty (source, AL_SOURCE_RADIUS, 0, true, OALEFXFAIL_SourceRadius) && reset;
+	}
+	return reset;
+}
+
+void OpenALSoundRenderer::RetireEFXSource (OpenALChannel *channel)
+{
+	if (channel != NULL && channel->FinalizeState == OALFINAL_Active)
+	{
+		CachePosition (channel);
+		alSourceStop (channel->Source);
+		channel->EndReason = OALEND_BackendError;
+		channel->FinalizeState = OALFINAL_Pending;
+	}
+}
+
+bool OpenALSoundRenderer::ApplyChannelEFX (OpenALChannel *channel)
+{
+	if (channel == NULL || channel->FinalizeState != OALFINAL_Active)
+	{
+		return true;
+	}
+	if (!ResetEFXSource (channel->Source))
+	{
+		RetireEFXSource (channel);
+		FailEFXEnvironment ();
+		return false;
+	}
+	if (Capabilities.EFXApplied && LastAttemptedEnvironment != NULL &&
+		LastAttemptedEnvironment != DefaultEnvironments[0] && !channel->NoReverb)
+	{
+		if (!SetEFXSourceSend (channel->Source, (ALint)EFXSlot, 0, 0))
+		{
+			FailEFXEnvironment ();
+			if (!ResetEFXSource (channel->Source)) RetireEFXSource (channel);
+			return false;
+		}
+	}
+	return true;
+}
+
+bool OpenALSoundRenderer::ApplyEFXEnvironmentToChannels ()
+{
+	bool applied = true;
+	for (size_t index = 0; index < ActiveChannels.size (); )
+	{
+		OpenALChannel *channel = ActiveChannels[index];
+		applied = ApplyChannelEFX (channel) && applied;
+		if (index < ActiveChannels.size () && ActiveChannels[index] == channel)
+		{
+			++index;
+		}
+	}
+	return applied;
+}
+
+void OpenALSoundRenderer::DrainEFXEnvironmentFailure ()
+{
+	for (size_t index = 0; index < ActiveChannels.size (); ++index)
+	{
+		OpenALChannel *channel = ActiveChannels[index];
+		if (channel != NULL && channel->FinalizeState == OALFINAL_Active && !ResetEFXSource (channel->Source))
+		{
+			RetireEFXSource (channel);
+		}
+	}
+}
+
+void OpenALSoundRenderer::FailEFXEnvironment ()
+{
+	Capabilities.EFXApplied = false;
+	LastAppliedEnvironment = NULL;
+	if (!EFXFailureDraining)
+	{
+		EFXFailureDraining = true;
+		DrainEFXEnvironmentFailure ();
+		EFXFailureDraining = false;
+	}
+}
+
+void OpenALSoundRenderer::UpdateEFXEnvironment (SoundListener *listener)
+{
+	ReverbContainer *environment;
+	bool modified;
+	if (listener == NULL || !listener->valid)
+	{
+		return;
+	}
+	environment = ForcedEnvironment != NULL ? ForcedEnvironment :
+		(listener->Environment != NULL ? listener->Environment : DefaultEnvironments[0]);
+	if (environment == NULL)
+	{
+		return;
+	}
+	modified = environment->Modified;
+	environment->Modified = false;
+	if (EFXEnvironmentInitialized && environment == LastAttemptedEnvironment && !modified)
+	{
+		return;
+	}
+	EFXEnvironmentInitialized = true;
+	LastAttemptedEnvironment = environment;
+	if (environment == DefaultEnvironments[0])
+	{
+		Capabilities.EFXApplied = false;
+		EFXFailure = OALEFXFAIL_None;
+		LastAppliedEnvironment = environment;
+		if (!ApplyEFXEnvironmentToChannels ())
+		{
+			LastAppliedEnvironment = NULL;
+		}
+		return;
+	}
+	EFXFailure = OALEFXFAIL_None;
+	if (ApplyEFXEnvironment (environment) && ApplyEFXEnvironmentToChannels ())
+	{
+		LastAppliedEnvironment = environment;
+	}
+	else
+	{
+		FailEFXEnvironment ();
+	}
 }
 
 void OpenALSoundRenderer::UpdateListener (SoundListener *listener)
@@ -3261,6 +3605,7 @@ void OpenALSoundRenderer::UpdateListener (SoundListener *listener)
 	alListener3f (AL_POSITION, position.X, position.Y, position.Z);
 	alListener3f (AL_VELOCITY, 0.f, 0.f, 0.f);
 	alListenerfv (AL_ORIENTATION, orientation);
+	UpdateEFXEnvironment (listener);
 }
 
 void OpenALSoundRenderer::UpdateSounds ()
@@ -3302,6 +3647,7 @@ bool OpenALSoundRenderer::IsValid ()
 void OpenALSoundRenderer::PrintStatus ()
 {
 	OpenALEFXStatusSnapshot efxStatus = OALGetEFXStatusSnapshot (Capabilities, EFXUsesEAX);
+	const char *efxFailureName = EFXFailureName (Capabilities, LastAppliedEnvironment, EFXFailure);
 	if (!InitSuccess)
 	{
 		Printf (TEXTCOLOR_RED "OpenAL sound module is not active.\n");
@@ -3324,11 +3670,11 @@ void OpenALSoundRenderer::PrintStatus ()
 			HRTFContextFailureName (HRTFFailure),
 		Capabilities.HRTFSpecifier.GetChars ()[0] != '\0' ? ", specifier: " : "",
 		Capabilities.HRTFSpecifier.GetChars ()[0] != '\0' ? Capabilities.HRTFSpecifier.GetChars () : "");
-	Printf ("ALC_EXT_EFX: %s, entrypoints: %s, reverb: %s, filter: %s, applied: %s\n",
+	Printf ("ALC_EXT_EFX: %s, entrypoints: %s, reverb: %s, filter: %s, applied: %s, failure: %s\n",
 		Capabilities.EFXAdvertised ? "advertised" : "absent", Capabilities.EFXCallable ? "callable" : "missing",
 		efxStatus.ReverbMode == OALEFXREVERB_EAX ? "EAX" : (efxStatus.ReverbMode == OALEFXREVERB_Standard ? "standard" : "dry"),
 		efxStatus.FilterState == OALEFXFILTER_Available ? "available" : (efxStatus.FilterState == OALEFXFILTER_Failed ? "failed" : "absent"),
-		efxStatus.Applied ? "yes" : "no");
+		efxStatus.Applied ? "yes" : "no", efxFailureName);
 	if (efxStatus.SendCount < 0)
 	{
 		Printf ("EFX sends: unknown\n");
@@ -3337,6 +3683,7 @@ void OpenALSoundRenderer::PrintStatus ()
 	{
 		Printf ("EFX sends: %d\n", efxStatus.SendCount);
 	}
+	Printf ("EFX room rolloff: reverb parameter only; source-distance attenuation is not applied.\n");
 	Printf ("AL_EXT_SOURCE_RADIUS: %s, applied: %s\n", Capabilities.RadiusAdvertised ? "advertised" : "absent",
 		Capabilities.RadiusApplied ? "yes" : "no");
 	Printf ("Doppler: applied: %s (factor remains 0)\n", Capabilities.DopplerApplied ? "yes" : "no");

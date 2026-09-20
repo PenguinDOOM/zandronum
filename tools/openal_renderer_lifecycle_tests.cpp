@@ -54,6 +54,7 @@ namespace
 
 	std::vector<CallbackEvent> Events;
 	int Failures = 0;
+	std::string LastPrintf;
 	FISoundChannel *ForcedNextOwner = NULL;
 	const int OALTestStreamMono = 1;
 	const int OALTestStreamBits8 = 2;
@@ -169,6 +170,25 @@ namespace
 			fprintf (stderr, "FAILED: %s\n", name);
 			++Failures;
 		}
+	}
+
+	bool SourceWasSetDrySince (const OpenALSoundRenderer &renderer, unsigned int source, size_t firstAssignment)
+	{
+		for (size_t index = firstAssignment; index < renderer.EFXSourceAssignments.size (); ++index)
+		{
+			const OpenALEFXSourceAssignment &assignment = renderer.EFXSourceAssignments[index];
+			if (assignment.Source == source && assignment.Slot == 0 && assignment.Send == 0 &&
+				assignment.Filter == 0 && assignment.Error == AL_NO_ERROR)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool SourceWasSetDry (const OpenALSoundRenderer &renderer, unsigned int source)
+	{
+		return SourceWasSetDrySince (renderer, source, 0);
 	}
 
 	std::vector<BYTE> MakeSamples (unsigned int frames)
@@ -1277,6 +1297,354 @@ namespace
 		ReleaseOwner (noPause);
 	}
 
+	void TestEFXEnvironmentSelectionAndContinuing2D (OpenALSoundRenderer &renderer, SoundHandle sound,
+		SoundListener &listener, ReverbContainer &environment)
+	{
+		FISoundChannel *normal = renderer.StartSound (sound, .5f, 128, 0, 0, NULL);
+		Check (normal != NULL, "phase2 EFX routing starts a normal 2D source");
+		if (normal != NULL)
+		{
+			OpenALChannel *channel = (OpenALChannel *)normal->SysChannel;
+			Check (alIsSource (channel->Source) == AL_TRUE && renderer.LastEFXSource == channel->Source &&
+				renderer.LastEFXSlot == (int)renderer.EFXSlot && renderer.LastEFXSend == 0 &&
+				renderer.LastEFXFilter == 0 && renderer.LastEFXSourceError == AL_NO_ERROR,
+				"phase2 EFX routing wets normal 2D sources with a successful source send call");
+		}
+		environment.Modified = true;
+		renderer.UpdateListener (&listener);
+		Check (!environment.Modified && renderer.LastAppliedEnvironment == &environment,
+			"phase2 EFX routing consumes Modified and reapplies the selected environment");
+		listener.Environment = NULL;
+		renderer.UpdateListener (&listener);
+		if (normal != NULL)
+		{
+			OpenALChannel *channel = (OpenALChannel *)normal->SysChannel;
+			Check (renderer.LastEFXSource == channel->Source && renderer.LastEFXSlot == 0 && renderer.LastEFXSend == 0 &&
+				renderer.LastEFXFilter == 0 && renderer.LastEFXSourceError == AL_NO_ERROR,
+				"phase2 EFX routing dries continuing sources when Off is selected");
+		}
+		ForcedEnvironment = &environment;
+		renderer.UpdateListener (&listener);
+		Check (renderer.LastAppliedEnvironment == &environment, "phase2 EFX routing gives forced environments precedence");
+		if (normal != NULL)
+		{
+			OpenALChannel *channel = (OpenALChannel *)normal->SysChannel;
+			Check (renderer.LastEFXSource == channel->Source && renderer.LastEFXSlot == (int)renderer.EFXSlot &&
+				renderer.LastEFXSourceError == AL_NO_ERROR,
+				"phase2 EFX routing wets continuing sources when forced routing replaces Off");
+			StopAndDrain (renderer, normal);
+			ReleaseOwner (normal);
+		}
+	}
+
+	void TestEFXSourceRoutingEligibility (OpenALSoundRenderer &renderer, SoundHandle sound,
+		SoundListener &listener, FRolloffInfo &rolloff)
+	{
+		FISoundChannel *noReverb = renderer.StartSound (sound, .5f, 128, 0, SNDF_NOREVERB, NULL);
+		Check (noReverb != NULL, "phase2 EFX routing starts a NOREVERB source");
+		if (noReverb != NULL)
+		{
+			OpenALChannel *channel = (OpenALChannel *)noReverb->SysChannel;
+			Check (renderer.LastEFXSource == channel->Source && renderer.LastEFXSlot == 0 && renderer.LastEFXSend == 0 &&
+				renderer.LastEFXFilter == 0 && renderer.LastEFXSourceError == AL_NO_ERROR,
+				"phase2 EFX routing keeps NOREVERB sources dry");
+			StopAndDrain (renderer, noReverb);
+			ReleaseOwner (noReverb);
+		}
+		FISoundChannel *spatial = renderer.StartSound3D (sound, &listener, .5f, &rolloff, 1.f, 128, 0,
+			FVector3 (32.f, 0.f, 0.f), FVector3 (), 0, 0, NULL);
+		Check (spatial != NULL, "phase2 EFX routing starts a 3D source");
+		if (spatial != NULL)
+		{
+			OpenALChannel *channel = (OpenALChannel *)spatial->SysChannel;
+			Check (renderer.LastEFXSource == channel->Source && renderer.LastEFXSlot == (int)renderer.EFXSlot &&
+				renderer.LastEFXSend == 0 && renderer.LastEFXFilter == 0 && renderer.LastEFXSourceError == AL_NO_ERROR,
+				"phase2 EFX routing wets 3D sources with a successful source send call");
+			StopAndDrain (renderer, spatial);
+			ReleaseOwner (spatial);
+		}
+		FISoundChannel *noPause = renderer.StartSound (sound, .5f, 128, 0, SNDF_NOPAUSE, NULL);
+		Check (noPause != NULL, "phase2 EFX routing starts a NOPAUSE source");
+		if (noPause != NULL)
+		{
+			OpenALChannel *channel = (OpenALChannel *)noPause->SysChannel;
+			Check (renderer.LastEFXSource == channel->Source && renderer.LastEFXSlot == (int)renderer.EFXSlot &&
+				renderer.LastEFXSend == 0 && renderer.LastEFXFilter == 0 && renderer.LastEFXSourceError == AL_NO_ERROR,
+				"phase2 EFX routing keeps NOPAUSE sources wet-eligible");
+			StopAndDrain (renderer, noPause);
+			ReleaseOwner (noPause);
+		}
+	}
+
+	void TestEFXFailureRecoveryAndStreamRouting (OpenALSoundRenderer &renderer, SoundHandle sound,
+		SoundListener &listener, ReverbContainer &environment)
+	{
+		renderer.InjectEFXSourceFailureForTest ();
+		FISoundChannel *failedWet = renderer.StartSound (sound, .5f, 128, 0, 0, NULL);
+		Check (failedWet == NULL && renderer.LastEFXSourceFailureError == AL_INVALID_NAME &&
+			!renderer.Capabilities.EFXApplied && renderer.LastAppliedEnvironment == NULL &&
+			renderer.LastEFXSlot == 0 && renderer.LastEFXSourceError == AL_NO_ERROR,
+			"phase2 EFX routing rejects a new source after a failed wet attach and dry recovery");
+		renderer.UpdateListener (&listener);
+		Check (!renderer.Capabilities.EFXApplied && renderer.LastAppliedEnvironment == NULL,
+			"phase2 EFX routing does not retry an unchanged failed environment");
+		environment.Modified = true;
+		renderer.UpdateListener (&listener);
+		Check (!environment.Modified && renderer.Capabilities.EFXApplied && renderer.LastAppliedEnvironment == &environment,
+			"phase2 EFX routing retries a failed environment after modification");
+		OpenALSoundStream *stream = renderer.CreatePatternStreamForTest (16, 0, 0, 8);
+		Check (stream != NULL, "phase2 EFX routing creates a dry test stream");
+		if (stream != NULL)
+		{
+			Check (renderer.LastEFXSource == stream->Source && renderer.LastEFXSlot == 0 && renderer.LastEFXSend == 0 &&
+				renderer.LastEFXFilter == 0 && renderer.LastEFXSourceError == AL_NO_ERROR,
+				"phase2 EFX routing keeps music streams dry");
+			delete stream;
+		}
+	}
+
+	void TestEFXStartFailureDriesExistingSource (OpenALSoundRenderer &renderer, SoundHandle sound,
+		SoundListener &listener, ReverbContainer &environment)
+	{
+		FRolloffInfo rolloff = MakeLinearRolloff (0.f, 100.f);
+		FISoundChannel *continuing2D = renderer.StartSound (sound, .5f, 128, 0, SNDF_LOOP, NULL);
+		OpenALChannel *continuing2DChannel = continuing2D == NULL ? NULL : (OpenALChannel *)continuing2D->SysChannel;
+		Check (continuing2DChannel != NULL, "phase2 EFX starts a wet 2D loop before a failed 3D source start");
+		size_t firstAssignment = renderer.EFXSourceAssignments.size ();
+		renderer.InjectEFXSourceFailureForTest ();
+		Check (renderer.StartSound3D (sound, &listener, .5f, &rolloff, 1.f, 128, 0,
+			FVector3 (32.f, 0.f, 0.f), FVector3 (), 0, 0, NULL) == NULL && !renderer.Capabilities.EFXApplied &&
+			renderer.LastAppliedEnvironment == NULL && continuing2DChannel != NULL &&
+			SourceWasSetDrySince (renderer, continuing2DChannel->Source, firstAssignment),
+			"phase2 EFX explicitly dries the existing 2D loop after a failed 3D start");
+		renderer.UpdateListener (&listener);
+		Check (!renderer.Capabilities.EFXApplied && renderer.LastAppliedEnvironment == NULL,
+			"phase2 EFX does not retry an unchanged environment after a failed 3D start");
+		environment.Modified = true;
+		renderer.UpdateListener (&listener);
+		StopAndDrain (renderer, continuing2D);
+		ReleaseOwner (continuing2D);
+		FISoundChannel *continuing3D = renderer.StartSound3D (sound, &listener, .5f, &rolloff, 1.f, 128, 0,
+			FVector3 (64.f, 0.f, 0.f), FVector3 (), 0, SNDF_LOOP, NULL);
+		OpenALChannel *continuing3DChannel = continuing3D == NULL ? NULL : (OpenALChannel *)continuing3D->SysChannel;
+		Check (continuing3DChannel != NULL, "phase2 EFX starts a wet 3D loop before a failed 2D source start");
+		firstAssignment = renderer.EFXSourceAssignments.size ();
+		renderer.InjectEFXSourceFailureForTest ();
+		Check (renderer.StartSound (sound, .5f, 128, 0, 0, NULL) == NULL && !renderer.Capabilities.EFXApplied &&
+			renderer.LastAppliedEnvironment == NULL && continuing3DChannel != NULL &&
+			SourceWasSetDrySince (renderer, continuing3DChannel->Source, firstAssignment),
+			"phase2 EFX explicitly dries the existing 3D loop after a failed 2D start");
+		environment.Modified = true;
+		renderer.UpdateListener (&listener);
+		Check (renderer.Capabilities.EFXApplied && renderer.LastAppliedEnvironment == &environment,
+			"phase2 EFX recovers modified environments after failed 2D and 3D starts");
+		StopAndDrain (renderer, continuing3D);
+		ReleaseOwner (continuing3D);
+	}
+
+	void TestEFXEnvironmentFailureStatus (OpenALSoundRenderer &renderer, SoundHandle sound,
+		SoundListener &listener, ReverbContainer &environment)
+	{
+		FISoundChannel *loop = renderer.StartSound (sound, .5f, 128, 0, SNDF_LOOP, NULL);
+		OpenALChannel *channel = loop == NULL ? NULL : (OpenALChannel *)loop->SysChannel;
+		OALuint effect = renderer.EFXEffect;
+		OALuint slot = renderer.EFXSlot;
+		Check (channel != NULL, "phase2 EFX starts a loop for environment failure status");
+		renderer.EFXEffect = 0;
+		environment.Modified = true;
+		renderer.UpdateListener (&listener);
+		LastPrintf.clear ();
+		renderer.PrintStatus ();
+		Check (renderer.EFXFailure == OALEFXFAIL_Properties && !renderer.Capabilities.EFXApplied &&
+			renderer.LastAppliedEnvironment == NULL && channel != NULL && SourceWasSetDry (renderer, channel->Source) &&
+			LastPrintf.find ("failure: properties") != std::string::npos,
+			"phase2 EFX records property failures through UpdateListener after dry fallback");
+		renderer.EFXEffect = effect;
+		environment.Modified = true;
+		renderer.UpdateListener (&listener);
+		renderer.EFXSlot = 0;
+		environment.Modified = true;
+		renderer.UpdateListener (&listener);
+		LastPrintf.clear ();
+		renderer.PrintStatus ();
+		Check (renderer.EFXFailure == OALEFXFAIL_SlotAttach && !renderer.Capabilities.EFXApplied &&
+			renderer.LastAppliedEnvironment == NULL && channel != NULL && SourceWasSetDry (renderer, channel->Source) &&
+			LastPrintf.find ("failure: slot-attach") != std::string::npos,
+			"phase2 EFX records slot attach failures through UpdateListener after dry fallback");
+		renderer.EFXSlot = slot;
+		environment.Modified = true;
+		renderer.UpdateListener (&listener);
+		StopAndDrain (renderer, loop);
+		ReleaseOwner (loop);
+	}
+
+	void TestEFXActiveFailureRetiresSource (OpenALSoundRenderer &multiRenderer, SoundHandle multiSound,
+		SoundListener &listener, ReverbContainer &environment)
+	{
+		size_t eventCount = Events.size ();
+		FISoundChannel *first = multiRenderer.StartSound (multiSound, .5f, 128, 0, SNDF_LOOP, NULL);
+		FISoundChannel *second = multiRenderer.StartSound (multiSound, .5f, 128, 0, SNDF_LOOP, NULL);
+		Check (first != NULL && second != NULL, "phase2 EFX starts two wet looping sources for update failure routing");
+		multiRenderer.InjectEFXSourceFailureForTest ();
+		environment.Modified = true;
+		multiRenderer.UpdateListener (&listener);
+		Check (first != NULL && first->SysChannel != NULL, "phase2 EFX keeps the active source dry after its wet attach fails");
+		Check (second != NULL && second->SysChannel != NULL, "phase2 EFX continues routing the later active source after removal");
+		Check (Events.size () == eventCount, "phase2 EFX does not end dry-recovered active sources");
+		Check (!multiRenderer.Capabilities.EFXApplied && multiRenderer.LastAppliedEnvironment == NULL,
+			"phase2 EFX invalidates the environment cache after an active wet attach failure");
+		StopAndDrain (multiRenderer, first);
+		StopAndDrain (multiRenderer, second);
+		ReleaseOwner (first);
+		ReleaseOwner (second);
+
+		environment.Modified = true;
+		multiRenderer.UpdateListener (&listener);
+		eventCount = Events.size ();
+		FISoundChannel *loop = multiRenderer.StartSound (multiSound, .5f, 128, 0, SNDF_LOOP, NULL);
+		OpenALChannel *activeChannel = loop != NULL ? (OpenALChannel *)loop->SysChannel : NULL;
+		if (activeChannel == NULL)
+		{
+			Check (false, "phase2 EFX starts an active loop with an OpenAL source for dry-detach failure routing");
+			ReleaseOwner (loop);
+			return;
+		}
+		unsigned int retiredSource = activeChannel->Source;
+		multiRenderer.InjectEFXSourceFailureForTest (OALEFXFAIL_DrySend);
+		environment.Modified = true;
+		multiRenderer.UpdateListener (&listener);
+		multiRenderer.UpdateSounds ();
+		Check (loop != NULL && loop->SysChannel == NULL, "phase2 EFX removes an active loop after dry-detach failure");
+		ALint retiredState = AL_INITIAL;
+		alGetSourcei (retiredSource, AL_SOURCE_STATE, &retiredState);
+		Check (alIsSource (retiredSource) == AL_TRUE && alGetError () == AL_NO_ERROR && retiredState == AL_STOPPED,
+			"phase2 EFX stops the failed loop before source reuse is allowed");
+		Check (Events.size () == eventCount + 1, "phase2 EFX ends a dry-detach failure exactly once");
+		Check (IsExpectedEvent (eventCount, OALEND_BackendError), "phase2 EFX reports dry-detach failure as a backend error");
+		ReleaseOwner (loop);
+	}
+
+	void TestPersistentEFXFailureDrainsChannels (OpenALSoundRenderer &renderer, SoundHandle sound,
+		SoundListener &listener, ReverbContainer &environment, OpenALEFXFailure failure)
+	{
+		size_t eventCount = Events.size ();
+		FISoundChannel *bad = renderer.StartSound (sound, .5f, 128, 0, SNDF_LOOP, NULL);
+		FISoundChannel *healthy = renderer.StartSound (sound, .5f, 128, 0, SNDF_LOOP, NULL);
+		OpenALChannel *badChannel = bad == NULL ? NULL : (OpenALChannel *)bad->SysChannel;
+		OpenALChannel *healthyChannel = healthy == NULL ? NULL : (OpenALChannel *)healthy->SysChannel;
+		if (badChannel == NULL || healthyChannel == NULL)
+		{
+			Check (false, "phase2 EFX starts active sources for persistent failure draining");
+			ReleaseOwner (bad);
+			ReleaseOwner (healthy);
+			return;
+		}
+		unsigned int retiredSource = badChannel->Source;
+		size_t firstAssignment = renderer.EFXSourceAssignments.size ();
+		renderer.InjectEFXSourceFailureForTest (failure, true, retiredSource);
+		environment.Modified = true;
+		renderer.UpdateListener (&listener);
+		renderer.UpdateSounds ();
+		renderer.ClearEFXSourceFailureForTest ();
+		ALint retiredState = AL_INITIAL;
+		alGetSourcei (retiredSource, AL_SOURCE_STATE, &retiredState);
+		Check (!renderer.EFXSourceFailureCallLimitExceeded && bad->SysChannel == NULL && healthy->SysChannel != NULL &&
+			SourceWasSetDrySince (renderer, healthyChannel->Source, firstAssignment),
+			"phase2 EFX persistently failing active sources retire without blocking healthy dry fallback");
+		Check (alIsSource (retiredSource) == AL_TRUE && alGetError () == AL_NO_ERROR && retiredState == AL_STOPPED,
+			"phase2 EFX persistently failing sources stop before reuse is allowed");
+		Check (Events.size () == eventCount + 1 && IsExpectedEvent (eventCount, OALEND_BackendError),
+			"phase2 EFX persistently failing sources report one backend error");
+		environment.Modified = true;
+		renderer.UpdateListener (&listener);
+		Check (renderer.Capabilities.EFXApplied && renderer.LastAppliedEnvironment == &environment,
+			"phase2 EFX clears persistent test faults before environment recovery");
+		StopAndDrain (renderer, healthy);
+		ReleaseOwner (bad);
+		ReleaseOwner (healthy);
+	}
+
+	void TestEFXResetFailureStages (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		renderer.InjectEFXSourceFailureForTest (OALEFXFAIL_AirAbsorption);
+		Check (renderer.StartSound (sound, .5f, 128, 0, SNDF_LOOP, NULL) == NULL &&
+			renderer.EFXFailure == OALEFXFAIL_AirAbsorption,
+			"phase2 EFX treats an air-absorption reset failure as a failed source start");
+		renderer.InjectEFXSourceFailureForTest (OALEFXFAIL_DirectFilterAuto);
+		Check (renderer.StartSound (sound, .5f, 128, 0, SNDF_LOOP, NULL) == NULL &&
+			renderer.EFXFailure == OALEFXFAIL_DirectFilterAuto,
+			"phase2 EFX treats a direct-filter auto reset failure as a failed source start");
+		if (renderer.Capabilities.RadiusAdvertised)
+		{
+			FISoundChannel *radius = renderer.StartSound (sound, .5f, 128, 0, SNDF_LOOP, NULL);
+			ALfloat value = -1.f;
+			if (radius != NULL)
+			{
+				alGetSourcef (((OpenALChannel *)radius->SysChannel)->Source, AL_SOURCE_RADIUS, &value);
+			}
+			Check (radius != NULL && alGetError () == AL_NO_ERROR && NearlyEqual (value, 0.f),
+				"phase2 EFX resets advertised source radius to zero without enabling radius behavior");
+			StopAndDrain (renderer, radius);
+			ReleaseOwner (radius);
+		}
+	}
+
+	void TestPhase2EFXRouting (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		ReverbContainer off = { NULL, "Off", 0, true, false, { 0, }, false };
+		ReverbContainer environment = { NULL, "Routing", 1, false, false,
+			{ 0, 0, 7.5f, 1.f, -1000, -100, 0, 1.49f, .83f, 1.f, -2602, .007f, 0.f, 0.f, 0.f, 200, .011f, 0.f, 0.f, 0.f, .25f, 0.f, .25f, 0.f, -5.f, 5000.f, 250.f, 0.f, 100.f, 100.f, 0x3f }, false };
+		ReverbContainer *savedDefault = DefaultEnvironments[0];
+		ReverbContainer *savedForced = ForcedEnvironment;
+		SoundListener listener;
+		FRolloffInfo rolloff = MakeLinearRolloff (0.f, 100.f);
+		if (!renderer.Capabilities.EFXUsable)
+		{
+			return;
+		}
+		DefaultEnvironments[0] = &off;
+		ForcedEnvironment = NULL;
+		listener.valid = true;
+		listener.Environment = &environment;
+		renderer.UpdateListener (&listener);
+		Check (renderer.LastAppliedEnvironment == &environment, "phase2 EFX routing applies a selected environment");
+		TestEFXEnvironmentSelectionAndContinuing2D (renderer, sound, listener, environment);
+		TestEFXSourceRoutingEligibility (renderer, sound, listener, rolloff);
+		TestEFXFailureRecoveryAndStreamRouting (renderer, sound, listener, environment);
+		TestEFXEnvironmentFailureStatus (renderer, sound, listener, environment);
+		TestEFXResetFailureStages (renderer, sound);
+		ForcedEnvironment = savedForced;
+		DefaultEnvironments[0] = savedDefault;
+	}
+
+	void TestTwoSourceEFXFailure (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		ReverbContainer off = { NULL, "Off", 0, true, false, { 0, }, false };
+		ReverbContainer environment = { NULL, "Routing", 1, false, false,
+			{ 0, 0, 7.5f, 1.f, -1000, -100, 0, 1.49f, .83f, 1.f, -2602, .007f, 0.f, 0.f, 0.f, 200, .011f, 0.f, 0.f, 0.f, .25f, 0.f, .25f, 0.f, -5.f, 5000.f, 250.f, 0.f, 100.f, 100.f, 0x3f }, false };
+		ReverbContainer *savedDefault = DefaultEnvironments[0];
+		ReverbContainer *savedForced = ForcedEnvironment;
+		SoundListener listener;
+		DefaultEnvironments[0] = &off;
+		ForcedEnvironment = NULL;
+		listener.valid = true;
+		listener.Environment = &environment;
+		if (!renderer.Capabilities.EFXUsable)
+		{
+			Check (false, "phase2 EFX initializes the two-source renderer for update failure routing");
+		}
+		else
+		{
+			renderer.UpdateListener (&listener);
+			TestEFXStartFailureDriesExistingSource (renderer, sound, listener, environment);
+			TestEFXActiveFailureRetiresSource (renderer, sound, listener, environment);
+			TestPersistentEFXFailureDrainsChannels (renderer, sound, listener, environment, OALEFXFAIL_AirAbsorption);
+			TestPersistentEFXFailureDrainsChannels (renderer, sound, listener, environment, OALEFXFAIL_DrySend);
+		}
+		ForcedEnvironment = savedForced;
+		DefaultEnvironments[0] = savedDefault;
+	}
+
 	void TestInactiveMuteAndComplete (OpenALSoundRenderer &renderer, SoundHandle sound)
 	{
 		FISoundChannel *channel = renderer.StartSound (sound, 0.75f, 128, 80, SNDF_LOOP, NULL);
@@ -1771,6 +2139,17 @@ namespace
 		Check (failedNoPause == NULL && evictedLoop->StartTime.AsOne == renderer.NonPausableOutputFrames, "failed NOPAUSE start records the immediate nonpausable clock class");
 		renderer.SetSfxPaused (false, 1);
 		ReleaseOwner (evictedLoop);
+		renderer.InjectStartSetupFailureForTest ();
+		Check (renderer.StartSound (sound, 0.5f, 128, 0, SNDF_LOOP, NULL) == NULL && renderer.ActiveChannels.empty () &&
+			openalSound->References == 0 && alGetError () == AL_NO_ERROR,
+			"early 2D source setup errors fail before EFX can clear the error or publish a channel");
+		SoundListener listener;
+		FRolloffInfo rolloff = MakeLinearRolloff (0.f, 100.f);
+		listener.valid = true;
+		renderer.InjectStartSetupFailureForTest ();
+		Check (renderer.StartSound3D (sound, &listener, 0.5f, &rolloff, 1.f, 128, 0, FVector3 (), FVector3 (), 0, SNDF_LOOP, NULL) == NULL &&
+			renderer.ActiveChannels.empty () && openalSound->References == 0 && alGetError () == AL_NO_ERROR,
+			"early 3D source setup errors fail before EFX can clear the error or publish a channel");
 	}
 
 	static bool TestDelayedLoopHandoff (std::vector<BYTE> &loopSamples)
@@ -1873,6 +2252,12 @@ namespace
 
 void Printf (const char *format, ...)
 {
+	char text[1024];
+	va_list arguments;
+	va_start (arguments, format);
+	vsnprintf (text, sizeof (text), format, arguments);
+	va_end (arguments);
+	LastPrintf += text;
 	if (strcmp (format, "Warning: OpenAL EFX non-finite reverb pan converted to zero.\n") == 0)
 	{
 		++OALTestNonFinitePanWarnings;
@@ -1939,6 +2324,7 @@ static int RunPriorityRendererTests (std::vector<BYTE> &longSamples)
 		return 1;
 	}
 	TestPriorityOrdering (priorityRenderer, prioritySound);
+	TestTwoSourceEFXFailure (priorityRenderer, prioritySound);
 	TestEffectiveGainOrdering (priorityRenderer, prioritySound);
 	TestPauseReasonsAndClocks (priorityRenderer, prioritySound);
 	priorityRenderer.UnloadSound (prioritySound);
@@ -2763,6 +3149,7 @@ static int RunDefaultRendererTests (OpenALSoundRenderer &renderer, std::vector<B
 	TestEvictedOwnerReuseAfterFailedStart (renderer, longSound);
 	TestFailedStartDoesNotPublish (renderer, longSound);
 	Test3DState (renderer, stereoSound);
+	TestPhase2EFXRouting (renderer, longSound);
 	TestInactiveMuteAndComplete (renderer, longSound);
 	TestRestartPositions (renderer, longSound);
 	TestEarlyClockAbstimeRestart (renderer);

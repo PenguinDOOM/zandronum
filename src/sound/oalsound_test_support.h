@@ -7,6 +7,10 @@
 
 typedef unsigned char BYTE;
 
+#ifndef AL_SOURCE_RADIUS
+#define AL_SOURCE_RADIUS 0x1031
+#endif
+
 union OALTestQwordUnion
 {
 	struct { unsigned int Lo, Hi; };
@@ -169,6 +173,13 @@ enum
 	ROLLOFF_Linear,
 	ROLLOFF_Log,
 	ROLLOFF_Custom
+};
+
+enum
+{
+	SNDF_NOPAUSE = 2,
+	SNDF_AREA = 4,
+	SNDF_NOREVERB = 16
 };
 
 enum EInactiveState

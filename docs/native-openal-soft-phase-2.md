@@ -1,12 +1,12 @@
-# Native OpenAL Soft: Phase 2B-1
+# Native OpenAL Soft: Phase 2B-2
 
 ## Scope
 
-This document describes the implemented 2B-1 shared environment state, EFX
-resource ownership, capability probing, and numeric adapter. The existing FMOD
-backend, `snd_backend` selection, fallback behavior, music selection, CVAR
-defaults, compatibility behavior, `AL_NONE` distance model, and manual rolloff
-remain unchanged.
+This document describes the implemented 2B-1 shared environment state and
+numeric adapter together with the 2B-2 OpenAL EFX environment routing. The
+existing FMOD backend, `snd_backend` selection, fallback behavior, music
+selection, CVAR defaults, compatibility behavior, `AL_NONE` distance model,
+and manual rolloff remain unchanged.
 
 2B-1 owns one EFX effect, one auxiliary slot, and the filter capability for the
 current OpenAL context. It requests one auxiliary send and records the actual
@@ -17,9 +17,8 @@ operation; a failed optional path does not stop ordinary OpenAL playback.
 Resource cleanup is tracked for partial allocation failures and remains within
 the owning context.
 
-This stage prepares resources and the adapter only. SFX send routing is not
-enabled here. Water pitch/low-pass, virtual-position callbacks, source radius,
-and Doppler remain later work.
+2B-2 adds source send routing on top of those resources. Water pitch/low-pass,
+virtual-position callbacks, source radius, and Doppler remain later work.
 
 ## Shared Environment State
 
@@ -78,15 +77,15 @@ it. The status output uses `EAX`, `standard`, or `dry` for reverb selection;
 or `no` for applied routing. A filter can be usable independently of the
 reverb result. If both reverb types fail, dry playback remains available. The
 lifecycle tests also cover zero sends, missing filter entry points, both
-reverb types being rejected, and auxiliary-slot failure. Non-finite reverb pan
-is converted to zero and warns at most once per renderer/context.
+reverb types being rejected, and auxiliary-slot failure. An absent EFX
+extension or unavailable device is an early capability path, not a successful
+source-routing test. Non-finite reverb pan is converted to zero and warns at
+most once per renderer/context.
 
 ## Deferred Boundaries
 
-The following are intentionally outside 2B-1:
+The following are intentionally outside 2B-2:
 
-- environment selection and SFX send attach/detach, including failure-time dry
-  fallback and music dry routing (2B-2);
 - `snd_waterlp` pitch/low-pass behavior, `SoftwareWater`, and virtual position
   state (2B-3); and
 - source radius and Doppler behavior (2C/2D).
@@ -157,6 +156,34 @@ passed and reported `EFX sends: 1`,
 
 The Release product/test build and focused CTest records are retained as
 validation evidence. Resource-owner fault-injection unit tests also passed.
+
+For 2B-2, the valid Release product and lifecycle-test build, focused CTest
+(`2/2`), and direct routing, continuing-source, and error-handling runs are
+retained and reused; they were not rerun for the manual resumption. These
+automated assertions cover valid-listener forced/listener/Off selection,
+modified/retry behavior, 2D `SNDF_NOREVERB`, a wet 3D source,
+`SNDF_NOPAUSE`, dry music, source reuse, and failure recovery through the
+product setter and error observations described below. The current test file
+does not assert invalid-listener hold or a 3D `SNDF_NOREVERB` source; those
+remain code-level behavior, not claimed test coverage.
+
+The current full Cppcheck capture uses the review3-fix working-tree manifest
+`completes/native-openal-soft-phase-2/2b-2/cppcheck-input/review3-fix-working-tree-capture-88dcd6fcff83fd3ce5cd8d11e7c00cfdf7697874/manifest.json`
+for commit `88dcd6fcff83fd3ce5cd8d11e7c00cfdf7697874`. Today's parent
+verification matched the HEAD, all four working-tree hashes, and all four
+payload hashes. The completed full result is retained at
+`completes/native-openal-soft-phase-2/2b-2/cppcheck-full/run-20260921-032239-3a718c294ede40528a843c3d6811d1e4/final-result.json`:
+Cppcheck passed with exit code 0, `Raw=601078`, `Baseline=7503`, `New=0`, and
+`UnresolvedVendor=0`. The corresponding raw log ended with zero new
+diagnostics, `Cppcheck passed`, `END`, and `EXIT_CODE0`. The formal parent
+review3 Lizard result also passed with exit code 0 and
+`REAL_INDEX_UNCHANGED=True`. These are verified facts for the current review3
+input. Independent round 4 is approved/green, while the commit remains
+pending, so this document makes no overall Phase 2 completion claim. The
+earlier second-narrowrepair Cppcheck result
+and parent Lizard result are historical evidence only; the earlier B1 raw
+fixture and query evidence remains valid historical B1 evidence and is not
+recast as B2 routing evidence.
 
 The earlier 2A-1 status record included `OpenAL Soft`, `1.1 ALSOFT`, HRTF
 status `enabled (1)`, EFX `advertised/callable`, sends `not-queried`, and
@@ -242,10 +269,77 @@ Codacy local analysis is not reported here: the Windows-native MCP path is
 unsupported, while the WSL CLI currently lacks the repository configuration.
 No setup, reset, or installation was performed for that analysis.
 
+## Environment Routing
+
+For a valid listener, the selected environment is `ForcedEnvironment`, then
+the listener environment, then `DefaultEnvironments[0]` (`Off`). An invalid or
+missing listener leaves the current environment and source assignments
+unchanged; this is verified by the code path but is not covered by the current
+lifecycle assertions. `LastAttemptedEnvironment` and `LastAppliedEnvironment`
+are kept separate: the former records the selection attempt, while the latter
+changes only after the effect parameters and all active source sends succeed.
+
+An environment's `Modified` flag is consumed when its selection is attempted.
+An unchanged repeat is not retried; editing the environment, selecting another
+environment, or resetting the renderer permits a new attempt. A failed effect
+or source-send operation globally latches the renderer to dry routing, records
+a failure reason, detaches all sends, and does not mix partially applied
+sources. A wet-send failure is checked immediately rather than swallowed. The
+failure path is non-reentrant: a persistent EFX environment-drain failure
+remains latched until reset or re-selection, while an active source that cannot
+be detached is stopped and retired after the finite backend-error cleanup path.
+A source that can be made dry remains active. History offsets after failure and
+persistent reset/detach behavior are covered by the lifecycle tests.
+Re-editing or reselection is the recovery boundary.
+
+Normal 2D and 3D sources use the selected wet environment except when the
+selected environment is `Off` or the source has `SNDF_NOREVERB`. `SNDF_NOPAUSE`
+does not make a source dry; it remains wet-eligible. Music, encoded streams,
+callbacks, and software-generated music remain dry and have no EFX send or
+filter. New and reused sources and streams are explicitly reset to dry, with
+air absorption, automatic send/filter gain correction, and the direct filter
+reset to their dry defaults; the manual source gain is applied once. When the
+radius capability is advertised, source radius is capability-guardedly reset
+to zero; 2B-2 does not activate radius behavior. `RoomRolloffFactor` is
+retained as an EFX
+parameter, but it does not reproduce FMOD's distance attenuation in this
+`AL_NONE` plus manual-rolloff arrangement. No water processing, virtual-radius
+handling, or Doppler is enabled by 2B-2.
+
+The routing tests observe product-side source setter calls and OpenAL error
+results, together with runtime lifecycle behavior. OpenAL Soft rejects the
+send/filter getter readback used by a more direct inspection, so those setter
+and error observations are not presented as getter readback. They establish
+routing control flow and failure handling, not acoustic equivalence with FMOD.
+
+The resumed manual session used the hash-verified isolated runtime, with the
+launch record retained at
+`completes/native-openal-soft-phase-2/2b-2/runtime/launch-resume.json`.
+The user confirmed that OpenAL and EFX were usable and that the game was
+operable. With `Generic` selected and Test in level enabled, a single pistol
+shot had a tail; after switching to `Off` and letting the old tail decay, a
+new shot had no tail. After disabling Test in level and closing the editor,
+the user confirmed normal SFX and that the forced tail was gone. These
+observations cover the Generic-versus-Off tail and forced-clear behavior only;
+they are explicit user observation, not an AI measurement or complete
+listening validation of the latest executable. A subsequent
+`snd_backend fmod`, `snd_reset`, `snd_musicvolume 0.5`, and `snd_status`
+check was also confirmed by the user as displaying FMOD with both music and
+pistol SFX audible. That is reusable normal FMOD-path evidence, not latest
+OpenAL executable listening evidence.
+
+The session ran as PID 33868. The requested `-logfile` did not create a file,
+so no new runtime backend-log claim is made. The custom-environment unload
+path was not manually exercised; the manual editor-close result is not
+claimed as map-change or custom-unload success. The document makes no
+acoustic-equivalence claim, and the existing limitation that API `1.1 ALSOFT`
+does not prove an OpenAL Soft `1.25.2` runtime remains in force.
+
 ## Deferred Work
 
-Later units may add HRTF profile selection or live context reset, route and
-apply EFX sends, add water processing, apply radius, or calibrate and enable
-source-only Doppler. The existing `snd_reset` path recreates the renderer and
-is the current HRTF application boundary; live `alcResetDeviceSOFT` is not
-implemented.
+Later units may add HRTF profile selection or live context reset, water
+processing, apply radius, or calibrate and enable source-only Doppler. The
+existing `snd_reset` path recreates the renderer and is the current HRTF
+application boundary; live `alcResetDeviceSOFT` is not implemented. Full
+acoustic equivalence with FMOD, including the distance behavior of
+`RoomRolloffFactor`, is not claimed.
