@@ -22,6 +22,8 @@ OALTestStringCVar snd_openal_device ("default");
 OALTestFloatCVar snd_sfxvolume (1.f);
 OALTestBoolCVar snd_pitched (true);
 OALTestBoolCVar snd_hrtf (false);
+OALTestBoolCVar snd_waterreverb (true);
+OALTestFloatCVar snd_waterlp (250.f);
 static ReverbContainer OALTestOffEnvironment = { NULL, "Off", 0, true, false, { 0, }, false };
 ReverbContainer *DefaultEnvironments[26] = { &OALTestOffEnvironment };
 ReverbContainer *ForcedEnvironment = NULL;
@@ -150,6 +152,15 @@ namespace
 		EFXCall (); if (CurrentEFXFixture->Fault == EFXFault_FilterType) CurrentEFXFixture->Error = AL_INVALID_ENUM;
 	}
 	void OAL_APIENTRY EFXFilterf (OALuint, OALenum, OALfloat) { EFXCall (); }
+	int WaterFilterFailureCalls = 0;
+	void OAL_APIENTRY FailWaterFilterf (OALuint, OALenum, OALfloat)
+	{
+		if (WaterFilterFailureCalls != 0)
+		{
+			if (WaterFilterFailureCalls > 0) --WaterFilterFailureCalls;
+			alSourcei (0, AL_DIRECT_FILTER, 0);
+		}
+	}
 
 	OpenALEFXFunctions MakeEFXFunctions ()
 	{
@@ -1249,6 +1260,19 @@ namespace
 		return offset < 0 ? 0 : (unsigned int)offset;
 	}
 
+	bool ReadWaterFilter (OpenALSoundRenderer &renderer, float *gainHF, float *gain)
+	{
+		LPALGETFILTERF getFilterf = (LPALGETFILTERF)alGetProcAddress ("alGetFilterf");
+		if (getFilterf == NULL || renderer.EFXFilter == 0)
+		{
+			return false;
+		}
+		alGetError ();
+		getFilterf (renderer.EFXFilter, AL_LOWPASS_GAINHF, gainHF);
+		getFilterf (renderer.EFXFilter, AL_LOWPASS_GAIN, gain);
+		return alGetError () == AL_NO_ERROR;
+	}
+
 	void AdvanceTestClock (OpenALSoundRenderer &renderer, unsigned int milliseconds)
 	{
 		TestMilliseconds += milliseconds;
@@ -1259,6 +1283,80 @@ namespace
 	{
 		return sampleFrame < loopStart ? (unsigned int)sampleFrame :
 			loopStart + (unsigned int)((sampleFrame - loopStart) % (loopEnd - loopStart));
+	}
+
+	void TestStoppedSourcePositionResolution (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		OpenALSound *openalSound = (OpenALSound *)sound.data;
+		FISoundChannel *nonLoop = renderer.StartSound (sound, .5f, 128, 80, 0, NULL);
+		OpenALChannel *nonLoopChannel = nonLoop == NULL ? NULL : (OpenALChannel *)nonLoop->SysChannel;
+		Check (nonLoopChannel != NULL, "stopped-source non-loop fixture starts");
+		if (nonLoopChannel != NULL)
+		{
+			alSourcei (nonLoopChannel->Source, AL_SAMPLE_OFFSET, 123);
+			alSourcePause (nonLoopChannel->Source);
+			Check (renderer.GetPosition (nonLoop) == 123, "paused source position takes the valid OpenAL sample offset");
+			alSourceStop (nonLoopChannel->Source);
+			Check (renderer.GetPosition (nonLoop) == openalSound->Frames,
+				"natural non-loop stop reports terminal frames before UpdateSounds");
+		}
+		renderer.UpdateSounds ();
+		ReleaseOwner (nonLoop);
+
+		FISoundChannel *loop = renderer.StartSound (sound, .5f, 128, 80, SNDF_LOOP, NULL);
+		OpenALChannel *loopChannel = loop == NULL ? NULL : (OpenALChannel *)loop->SysChannel;
+		Check (loopChannel != NULL, "stopped-source loop fixture starts");
+		if (loopChannel != NULL)
+		{
+			alSourcei (loopChannel->Source, AL_SAMPLE_OFFSET, 234);
+			alSourcePause (loopChannel->Source);
+			Check (renderer.GetPosition (loop) == 234, "paused loop position takes the valid OpenAL sample offset");
+			renderer.InjectPositionQueryFailureForTest ();
+			Check (renderer.GetPosition (loop) == 234, "failed position query keeps the cached loop position");
+			alSourceStop (loopChannel->Source);
+			Check (renderer.GetPosition (loop) == 234, "unexpected loop stop keeps its cached position");
+		}
+		renderer.UpdateSounds ();
+		ReleaseOwner (loop);
+
+		FISoundChannel *explicitStop = renderer.StartSound (sound, .5f, 128, 80, 0, NULL);
+		OpenALChannel *explicitStopChannel = explicitStop == NULL ? NULL : (OpenALChannel *)explicitStop->SysChannel;
+		Check (explicitStopChannel != NULL, "explicit-stop position fixture starts");
+		if (explicitStopChannel != NULL)
+		{
+			alSourcei (explicitStopChannel->Source, AL_SAMPLE_OFFSET, 345);
+			alSourcePause (explicitStopChannel->Source);
+			renderer.StopChannel (explicitStop);
+			Check (renderer.GetPosition (explicitStop) == 345,
+				"explicit stop preserves the pre-stop source position rather than terminal frames");
+		}
+		renderer.UpdateSounds ();
+		ReleaseOwner (explicitStop);
+	}
+
+	void TestNaturalFinishPoolEviction (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		OpenALSound *openalSound = (OpenALSound *)sound.data;
+		size_t eventCount = Events.size ();
+		unsigned long long clock = renderer.PausableOutputFrames;
+		FISoundChannel *natural = renderer.StartSound (sound, .1f, 128, 0, 0, NULL);
+		OpenALChannel *naturalChannel = natural == NULL ? NULL : (OpenALChannel *)natural->SysChannel;
+		Check (naturalChannel != NULL, "natural pool-eviction fixture starts");
+		if (naturalChannel != NULL)
+		{
+			alSourceStop (naturalChannel->Source);
+			FISoundChannel *evictor = renderer.StartSound (sound, .9f, 128, 80, SNDF_LOOP, NULL);
+			Check (evictor != NULL && IsExpectedEvent (eventCount, OALEND_Natural) && natural->SysChannel == NULL &&
+				renderer.GetPosition (natural) == openalSound->Frames && Events.size () == eventCount + 1 &&
+				renderer.PausableOutputFrames == clock,
+				"natural non-loop pool eviction preserves terminal completion and callback semantics without clock advance");
+			StopAndDrain (renderer, evictor);
+			FISoundChannel *restarted = renderer.StartSound (sound, .1f, 128, 0, 0, natural);
+			Check (restarted == NULL && renderer.GetPosition (natural) == openalSound->Frames,
+				"terminal pool-evicted non-loop owner cannot restart after its source is free");
+			ReleaseOwner (evictor);
+		}
+		ReleaseOwner (natural);
 	}
 
 	void TestPauseReasonsAndClocks (OpenALSoundRenderer &renderer, SoundHandle sound)
@@ -1450,6 +1548,12 @@ namespace
 		OALuint effect = renderer.EFXEffect;
 		OALuint slot = renderer.EFXSlot;
 		Check (channel != NULL, "phase2 EFX starts a loop for environment failure status");
+		listener.underwater = true;
+		snd_waterlp.Value = 250.f;
+		renderer.UpdateListener (&listener);
+		Check (channel != NULL && renderer.LastDirectFilterSource == channel->Source &&
+			renderer.LastDirectFilter == (int)renderer.EFXFilter && renderer.LastDirectFilterError == AL_NO_ERROR,
+			"phase2 EFX attaches the water low-pass before an environment failure");
 		renderer.EFXEffect = 0;
 		environment.Modified = true;
 		renderer.UpdateListener (&listener);
@@ -1459,6 +1563,9 @@ namespace
 			renderer.LastAppliedEnvironment == NULL && channel != NULL && SourceWasSetDry (renderer, channel->Source) &&
 			LastPrintf.find ("failure: properties") != std::string::npos,
 			"phase2 EFX records property failures through UpdateListener after dry fallback");
+		Check (channel != NULL && renderer.LastDirectFilterSource == channel->Source &&
+			renderer.LastDirectFilter == (int)renderer.EFXFilter && renderer.LastDirectFilterError == AL_NO_ERROR,
+			"phase2 EFX keeps the direct water low-pass after a reverb property failure");
 		renderer.EFXEffect = effect;
 		environment.Modified = true;
 		renderer.UpdateListener (&listener);
@@ -1473,6 +1580,8 @@ namespace
 			"phase2 EFX records slot attach failures through UpdateListener after dry fallback");
 		renderer.EFXSlot = slot;
 		environment.Modified = true;
+		renderer.UpdateListener (&listener);
+		listener.underwater = false;
 		renderer.UpdateListener (&listener);
 		StopAndDrain (renderer, loop);
 		ReleaseOwner (loop);
@@ -1688,18 +1797,13 @@ namespace
 		Check (earlyRestored == earlySaved && abs ((int)SourceOffset (earlySaved) - (int)earlySavedFrame) <= 1,
 			"early-clock SNDF_ABSTIME directly seeks the saved sample frame");
 		AdvanceTestClock (renderer, earlyElapsedMilliseconds);
+		unsigned int expected = renderer.GetPosition (earlySaved);
 		FISoundChannel *earlyEvictor = renderer.StartSound (loopSound, 0.5f, 128, 81, SNDF_LOOP, NULL);
-		unsigned long long elapsedOutputFramesAtEviction = (unsigned long long)renderer.GetOutputRate () * earlyElapsedMilliseconds / 1000;
-		unsigned long long expectedEarlySamples = earlySavedFrame +
-			(unsigned long long)((long double)elapsedOutputFramesAtEviction * 8000 / renderer.GetOutputRate ());
-		unsigned int expected = ExpectedLoopPosition (expectedEarlySamples, 100, 500);
-		unsigned int zeroOriginExpected = ExpectedLoopPosition (
-			(unsigned long long)((long double)elapsedOutputFramesAtEviction * 8000 / renderer.GetOutputRate ()), 100, 500);
 		Check (earlyEvictor != NULL && earlySaved->SysChannel == NULL, "early-clock ABSTIME source can be re-evicted");
 		StopAndDrain (renderer, earlyEvictor);
 		unsigned int serializedPosition = renderer.GetPosition (earlySaved);
-		Check (abs ((int)serializedPosition - (int)expected) <= 2 && expected != earlySavedFrame && expected != zeroOriginExpected,
-			"early-clock logical phase differs from both saved position and zero-origin phase");
+		Check (abs ((int)serializedPosition - (int)expected) <= 2,
+			"early-clock eviction retains the actual OpenAL phase");
 		earlySaved->StartTime.AsOne = serializedPosition;
 		FISoundChannel *earlyRestoredAgain = renderer.StartSound (loopSound, 0.5f, 128, 80, SNDF_LOOP | SNDF_ABSTIME, earlySaved);
 		Check (earlyRestoredAgain == earlySaved && abs ((int)SourceOffset (earlySaved) - (int)serializedPosition) <= 1,
@@ -1720,12 +1824,11 @@ namespace
 		FISoundChannel *boundary = renderer.StartSound (loopSound, 0.5f, 128, 80, SNDF_LOOP, NULL);
 		Check (boundary != NULL && boundary->StartTime.AsOne == (1ull << 63), "bit-63 logical clock remains an ordinary clock value");
 		AdvanceTestClock (renderer, 137);
+		unsigned int expected = renderer.GetPosition (boundary);
 		FISoundChannel *evictor = renderer.StartSound (loopSound, 0.5f, 128, 81, SNDF_LOOP, NULL);
-		unsigned long long elapsedOutputFrames = (unsigned long long)renderer.GetOutputRate () * 137 / 1000;
-		unsigned int expected = ExpectedLoopPosition ((unsigned long long)((long double)elapsedOutputFrames * 8000 / renderer.GetOutputRate ()), 100, 500);
 		unsigned int serializedPosition = renderer.GetPosition (boundary);
 		Check (evictor != NULL && boundary->SysChannel == NULL && abs ((int)serializedPosition - (int)expected) <= 2,
-			"bit-63 eviction retains the ordinary logical phase");
+			"bit-63 eviction retains the actual OpenAL phase");
 		StopAndDrain (renderer, evictor);
 		FISoundChannel *restarted = renderer.StartSound (loopSound, 0.5f, 128, 80, SNDF_LOOP, boundary);
 		Check (restarted == boundary && abs ((int)SourceOffset (boundary) - (int)expected) <= 2,
@@ -1769,6 +1872,240 @@ namespace
 		renderer.PausableOutputFrames = 0;
 		renderer.PausableFrameRemainder = 0;
 		renderer.LastClockMilliseconds = TestMilliseconds;
+	}
+
+	void TestWaterLowPassStateAndReadback (OpenALSoundRenderer &renderer, SoundHandle sound, SoundListener &listener, ReverbContainer &softwareWater)
+	{
+		FISoundChannel *normal = renderer.StartSound (sound, .5f, 192, 80, SNDF_LOOP, NULL);
+		Check (normal != NULL, "water pitch starts a normal loop");
+		listener.underwater = true;
+		renderer.UpdateListener (&listener);
+		ALfloat normalPitch = 0.f;
+		ALfloat gainHF = 0.f;
+		ALfloat gain = 0.f;
+		if (normal != NULL) alGetSourcef (((OpenALChannel *)normal->SysChannel)->Source, AL_PITCH, &normalPitch);
+		Check (NearlyEqual (normalPitch, 1.5f * .7937005f), "water pitch applies once to pausable sounds");
+		Check (ReadWaterFilter (renderer, &gainHF, &gain) && gainHF >= .001f && gainHF <= 1.f && NearlyEqual (gain, 1.f),
+			"water low-pass assigns readable EFX filter gain values");
+		fprintf (stdout, "WATER_FILTER_ACTUAL output_rate=%.9g cutoff=%.9g gainhf=%.9g gain=%.9g\n",
+			renderer.GetOutputRate (), (float)snd_waterlp, gainHF, gain);
+		unsigned int positionBeforeCutoffChange = normal == NULL ? 0 : SourceOffset (normal);
+		ALfloat pitchBeforeCutoffChange = normalPitch;
+		float gainHFAt250 = gainHF;
+		snd_waterlp.Value = 1000.f;
+		renderer.UpdateListener (&listener);
+		if (normal != NULL) alGetSourcef (((OpenALChannel *)normal->SysChannel)->Source, AL_PITCH, &normalPitch);
+		Check (ReadWaterFilter (renderer, &gainHF, &gain) && gainHF > gainHFAt250 &&
+			normal != NULL && SourceOffset (normal) == positionBeforeCutoffChange && NearlyEqual (normalPitch, pitchBeforeCutoffChange),
+			"water low-pass updates the active cutoff without changing pitch or cursor");
+		snd_waterlp.Value = 0.f;
+		renderer.UpdateListener (&listener);
+		if (normal != NULL) alGetSourcef (((OpenALChannel *)normal->SysChannel)->Source, AL_PITCH, &normalPitch);
+		Check (NearlyEqual (normalPitch, 1.5f), "waterlp zero disables ordinary underwater pitch");
+		softwareWater.SoftwareWater = true;
+		listener.underwater = false;
+		listener.Environment = &softwareWater;
+		renderer.UpdateListener (&listener);
+		if (normal != NULL) alGetSourcef (((OpenALChannel *)normal->SysChannel)->Source, AL_PITCH, &normalPitch);
+		Check (NearlyEqual (normalPitch, 1.5f * .7937005f), "software water keeps pitch active while waterlp zero bypasses filtering");
+		StopAndDrain (renderer, normal);
+		ReleaseOwner (normal);
+		FISoundChannel *noPause = renderer.StartSound (sound, .5f, 192, 80, SNDF_LOOP | SNDF_NOPAUSE, NULL);
+		ALfloat noPausePitch = 0.f;
+		if (noPause != NULL) alGetSourcef (((OpenALChannel *)noPause->SysChannel)->Source, AL_PITCH, &noPausePitch);
+		Check (noPause != NULL && NearlyEqual (noPausePitch, 1.5f), "water pitch excludes NOPAUSE sounds");
+		snd_waterlp.Value = 250.f;
+		renderer.UpdateListener (&listener);
+		Check (noPause != NULL && renderer.LastEFXSource == ((OpenALChannel *)noPause->SysChannel)->Source && renderer.LastEFXFilter == 0,
+			"water low-pass keeps NOPAUSE sources unfiltered on the reverb send");
+		int savedOutputRate = renderer.OutputRate;
+		renderer.OutputRate = 8000;
+		renderer.UpdateListener (&listener);
+		Check (!renderer.WaterFilterActive, "low output rates bypass water low-pass when its clamped gain is unachievable");
+		renderer.OutputRate = savedOutputRate;
+		renderer.UpdateListener (&listener);
+		StopAndDrain (renderer, noPause);
+		ReleaseOwner (noPause);
+	}
+
+	void TestWaterFilterFailureBypass (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		SoundListener listener;
+		OALFilterf originalFilterf;
+		FISoundChannel *existing;
+		FISoundChannel *newSource;
+		if (!renderer.Capabilities.EFXFilterUsable)
+		{
+			return;
+		}
+		listener.valid = true;
+		listener.underwater = true;
+		listener.Environment = DefaultEnvironments[0];
+		snd_waterlp.Value = 250.f;
+		renderer.UpdateListener (&listener);
+		existing = renderer.StartSound (sound, .5f, 128, 0, SNDF_LOOP, NULL);
+		originalFilterf = renderer.Capabilities.EFX.Filterf;
+		WaterFilterFailureCalls = 1;
+		renderer.Capabilities.EFX.Filterf = FailWaterFilterf;
+		snd_waterlp.Value = 1000.f;
+		renderer.UpdateListener (&listener);
+		Check (existing != NULL && existing->SysChannel != NULL && renderer.EFXFailure == OALEFXFAIL_DirectFilter &&
+			renderer.LastDirectFilterSource == ((OpenALChannel *)existing->SysChannel)->Source && renderer.LastDirectFilter == 0 &&
+			renderer.LastDirectFilterError == AL_NO_ERROR,
+			"water filter setter failure keeps an existing voice playing with its direct filter detached");
+		StopAndDrain (renderer, existing);
+		WaterFilterFailureCalls = -1;
+		newSource = renderer.StartSound (sound, .5f, 128, 0, SNDF_LOOP, NULL);
+		Check (newSource != NULL && newSource->SysChannel != NULL && renderer.LastDirectFilter == 0 &&
+			renderer.LastDirectFilterError == AL_NO_ERROR,
+			"persistent water filter setter failure starts new sources unfiltered");
+		renderer.Capabilities.EFX.Filterf = originalFilterf;
+		WaterFilterFailureCalls = 0;
+		snd_waterlp.Value = 250.f;
+		renderer.UpdateListener (&listener);
+		Check (newSource != NULL && newSource->SysChannel != NULL && renderer.LastDirectFilter == (int)renderer.EFXFilter &&
+			renderer.LastDirectFilterError == AL_NO_ERROR,
+			"water filter recovers after the setter fault is removed");
+		StopAndDrain (renderer, newSource);
+		ReleaseOwner (existing);
+		ReleaseOwner (newSource);
+		listener.underwater = false;
+		renderer.UpdateListener (&listener);
+	}
+
+	void TestInitialVirtualWaterCursor (OpenALSoundRenderer &renderer, SoundHandle sound, SoundListener &listener)
+	{
+		listener.underwater = true;
+		renderer.UpdateListener (&listener);
+		FISoundChannel *virtualOwner = new FISoundChannel;
+		renderer.MarkVirtualStart (virtualOwner, sound, 128, SNDF_LOOP);
+		unsigned long long token = virtualOwner->StartTime.AsOne;
+		AdvanceTestClock (renderer, 100);
+		listener.underwater = false;
+		renderer.UpdateListener (&listener);
+		AdvanceTestClock (renderer, 100);
+		listener.underwater = true;
+		renderer.UpdateListener (&listener);
+		AdvanceTestClock (renderer, 100);
+		unsigned long long outputFrames = (unsigned long long)renderer.GetOutputRate () * 100 / 1000;
+		unsigned int expectedVirtualPosition = (unsigned int)((long double)outputFrames * 8000 * .7937005f / renderer.GetOutputRate ()) * 2 +
+			(unsigned int)((long double)outputFrames * 8000 / renderer.GetOutputRate ());
+		unsigned int savedVirtualPosition = renderer.GetPosition (virtualOwner);
+		Check (token != 0 && virtualOwner->SysChannel == NULL && virtualOwner->StartTime.AsOne == token,
+			"virtual water loop keeps its logical token through water-state rebases before connection");
+		Check (abs ((int)savedVirtualPosition - (int)expectedVirtualPosition) <= 4,
+			"virtual water loop accumulates the old and new pitch segments before connection");
+		FISoundChannel *connectedVirtual = renderer.StartSound (sound, .5f, 128, 80, SNDF_LOOP, virtualOwner);
+		unsigned int connectedVirtualPosition = SourceOffset (connectedVirtual);
+		fprintf (stdout, "VIRTUAL_WATER_POSITION expected=%u saved=%u connected=%u\n",
+			expectedVirtualPosition, savedVirtualPosition, connectedVirtualPosition);
+		Check (connectedVirtual == virtualOwner && abs ((int)connectedVirtualPosition - (int)savedVirtualPosition) <= 2,
+			"virtual water loop preserves its saved phase through its first source connection");
+		StopAndDrain (renderer, connectedVirtual);
+		ReleaseOwner (virtualOwner);
+		listener.underwater = false;
+		listener.Environment = DefaultEnvironments[0];
+		renderer.UpdateListener (&listener);
+	}
+
+	void TestWaterPitchAndInitialVirtual (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		SoundListener listener;
+		ReverbContainer softwareWater = OALTestOffEnvironment;
+		listener.valid = true;
+		listener.Environment = DefaultEnvironments[0];
+		snd_waterlp.Value = 250.f;
+		renderer.UpdateListener (&listener);
+		TestWaterLowPassStateAndReadback (renderer, sound, listener, softwareWater);
+		TestWaterFilterFailureBypass (renderer, sound);
+		listener.underwater = false;
+		listener.Environment = &softwareWater;
+		snd_waterlp.Value = 250.f;
+		renderer.UpdateListener (&listener);
+		snd_pitched.Value = false;
+		FISoundChannel *unpitched = renderer.StartSound (sound, .5f, 192, 80, SNDF_LOOP, NULL);
+		ALfloat unpitchedPitch = 0.f;
+		if (unpitched != NULL) alGetSourcef (((OpenALChannel *)unpitched->SysChannel)->Source, AL_PITCH, &unpitchedPitch);
+		Check (unpitched != NULL && NearlyEqual (unpitchedPitch, .7937005f), "unpitched water starts retain the water pitch multiplier");
+		listener.Environment = DefaultEnvironments[0];
+		renderer.UpdateListener (&listener);
+		if (unpitched != NULL) alGetSourcef (((OpenALChannel *)unpitched->SysChannel)->Source, AL_PITCH, &unpitchedPitch);
+		Check (NearlyEqual (unpitchedPitch, 1.f), "unpitched water exits restore the base pitch exactly");
+		snd_waterreverb.Value = false;
+		renderer.UpdateListener (&listener);
+		Check (!renderer.WaterPitchActive && !renderer.WaterFilterActive, "legacy snd_waterreverb does not alter dry water routing");
+		snd_waterreverb.Value = true;
+		snd_pitched.Value = true;
+		StopAndDrain (renderer, unpitched);
+		ReleaseOwner (unpitched);
+		TestInitialVirtualWaterCursor (renderer, sound, listener);
+	}
+
+	void TestTerminalVirtualOneShot (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		OpenALSound *openalSound = (OpenALSound *)sound.data;
+		SoundListener listener;
+		listener.valid = true;
+		listener.Environment = DefaultEnvironments[0];
+		renderer.UpdateListener (&listener);
+		FISoundChannel *owner = new FISoundChannel;
+		renderer.MarkVirtualStart (owner, sound, 128, 0);
+		unsigned long long token = owner->StartTime.AsOne;
+		AdvanceTestClock (renderer, 2000);
+		unsigned int beforeWater = renderer.GetPosition (owner);
+		listener.underwater = true;
+		renderer.UpdateListener (&listener);
+		unsigned int afterWater = renderer.GetPosition (owner);
+		FISoundChannel *restarted = renderer.StartSound (sound, .5f, 128, 80, 0, owner);
+		Check (token != 0 && beforeWater == openalSound->Frames && afterWater == openalSound->Frames &&
+			restarted == NULL && owner->SysChannel == NULL && owner->StartTime.AsOne == token,
+			"terminal virtual one-shot keeps its end frame through water rebasing and cannot restart");
+		renderer.MarkStartTime (owner);
+		ReleaseOwner (owner);
+		listener.underwater = false;
+		renderer.UpdateListener (&listener);
+	}
+
+	void TestEvictionAdoptsSourcePosition (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		OpenALSound *openalSound = (OpenALSound *)sound.data;
+		SoundListener listener;
+		listener.valid = true;
+		listener.Environment = DefaultEnvironments[0];
+		renderer.UpdateListener (&listener);
+		FISoundChannel *owner = renderer.StartSound (sound, .5f, 128, 0, SNDF_LOOP, NULL);
+		OpenALChannel *channel = owner == NULL ? NULL : (OpenALChannel *)owner->SysChannel;
+		Check (channel != NULL, "eviction source-position fixture starts");
+		if (channel == NULL)
+		{
+			ReleaseOwner (owner);
+			return;
+		}
+		alSourcePause (channel->Source);
+		alSourcei (channel->Source, AL_SAMPLE_OFFSET, 321);
+		Check (renderer.GetPosition (owner) == 321, "eviction fixture caches the deliberately divergent OpenAL offset");
+		FISoundChannel *evictor = renderer.StartSound (sound, .9f, 128, 80, SNDF_LOOP, NULL);
+		AdvanceTestClock (renderer, 100);
+		unsigned int firstSegment = (unsigned int)((long double)renderer.GetOutputRate () * 8000 * 100 / (1000 * renderer.GetOutputRate ()));
+		listener.underwater = true;
+		renderer.UpdateListener (&listener);
+		AdvanceTestClock (renderer, 100);
+		unsigned int secondSegment = (unsigned int)((long double)renderer.GetOutputRate () * 8000 * .7937005f * 100 / (1000 * renderer.GetOutputRate ()));
+		unsigned int expected = ExpectedLoopPosition (321 + firstSegment + secondSegment, 0, openalSound->Frames);
+		unsigned int oldClockEstimate = ExpectedLoopPosition (firstSegment + secondSegment, 0, openalSound->Frames);
+		unsigned int saved = renderer.GetPosition (owner);
+		Check (evictor != NULL && owner->SysChannel == NULL && abs ((int)saved - (int)expected) <= 2 &&
+			abs ((int)saved - (int)oldClockEstimate) > 100,
+			"pool eviction adopts the OpenAL offset and preserves piecewise virtual pitch progress");
+		StopAndDrain (renderer, evictor);
+		FISoundChannel *restarted = renderer.StartSound (sound, .5f, 128, 80, SNDF_LOOP, owner);
+		Check (restarted == owner && abs ((int)SourceOffset (owner) - (int)saved) <= 2,
+			"pool-evicted owner restarts from the adopted virtual cursor");
+		StopAndDrain (renderer, owner);
+		ReleaseOwner (owner);
+		ReleaseOwner (evictor);
+		listener.underwater = false;
+		renderer.UpdateListener (&listener);
 	}
 
 	void TestRestartPositions (OpenALSoundRenderer &renderer, SoundHandle sound)
@@ -2082,10 +2419,12 @@ namespace
 	{
 		FISoundChannel *evicted = renderer.StartSound (sound, 0.1f, 128, 0, SNDF_LOOP, NULL);
 		AdvanceTestClock (renderer, 100);
+		unsigned int positionBeforeEviction = renderer.GetPosition (evicted);
 		FISoundChannel *evictor = renderer.StartSound (sound, 0.9f, 128, 80, SNDF_LOOP, NULL);
 		unsigned int savedPosition = renderer.GetPosition (evicted);
-		Check (evicted != NULL && evictor != NULL && evicted->SysChannel == NULL && savedPosition > 0,
-			"evicted looping owner retains a nonzero logical phase for saving");
+		Check (evicted != NULL && evictor != NULL && evicted->SysChannel == NULL &&
+			abs ((int)savedPosition - (int)positionBeforeEviction) <= 2,
+			"evicted looping owner retains its actual OpenAL phase for saving");
 		StopAndDrain (renderer, evictor);
 		FISoundChannel *restored = renderer.StartSound (sound, 0.1f, 128, 0, SNDF_LOOP, evicted);
 		Check (restored == evicted && abs ((int)SourceOffset (restored) - (int)savedPosition) <= 2,
@@ -2166,12 +2505,14 @@ namespace
 			SoundHandle loopSound = oldRenderer.LoadSoundRaw (&loopSamples[0], (int)loopSamples.size (), 8000, 1, -16, 100, 500);
 			loopOwner = oldRenderer.StartSound (loopSound, 0.5f, 192, 0, SNDF_LOOP, NULL);
 			TestMilliseconds += 137;
+			unsigned int positionBeforeEviction = oldRenderer.GetPosition (loopOwner);
 			FISoundChannel *loopEvictor = oldRenderer.StartSound (loopSound, 0.5f, 128, 80, SNDF_LOOP, NULL);
 			Check (loopOwner != NULL && loopEvictor != NULL && loopOwner->SysChannel == NULL,
 				"pool eviction leaves the pitched loop resolver owner detached");
 			TestMilliseconds += 25;
-			unsigned long long delayedOutputFrames = (unsigned long long)oldRenderer.GetOutputRate () * 162 / 1000;
-			unsigned long long delayedSampleFrames = delayedOutputFrames * 8000 * 3 / (2 * (unsigned int)oldRenderer.GetOutputRate ());
+			unsigned long long delayedOutputFrames = (unsigned long long)oldRenderer.GetOutputRate () * 25 / 1000;
+			unsigned long long delayedSampleFrames = positionBeforeEviction + delayedOutputFrames * 8000 * 3 /
+				(2 * (unsigned int)oldRenderer.GetOutputRate ());
 			unsigned int expectedLoopCursor = ExpectedLoopPosition (delayedSampleFrames, 100, 500);
 			Check (oldRenderer.ResolveEvictedPosition (loopOwner, &loopCursor) && abs ((int)loopCursor - (int)expectedLoopCursor) <= 2,
 				"old renderer resolves the delayed pitched custom-loop cursor");
@@ -2212,12 +2553,14 @@ namespace
 			SoundHandle oneShotSound = oldRenderer.LoadSoundRaw (&oneShotSamples[0], (int)oneShotSamples.size (), 8000, 1, -16, -1);
 			oneShotOwner = oldRenderer.StartSound (oneShotSound, 0.5f, 128, 0, 0, NULL);
 			TestMilliseconds += 10;
+			unsigned int positionBeforeEviction = oldRenderer.GetPosition (oneShotOwner);
 			FISoundChannel *oneShotEvictor = oldRenderer.StartSound (oneShotSound, 0.5f, 128, 80, SNDF_LOOP, NULL);
 			Check (oneShotOwner != NULL && oneShotEvictor != NULL && oneShotOwner->SysChannel == NULL,
 				"pool eviction leaves the expired one-shot resolver owner detached");
 			TestMilliseconds += 20;
-			Check (oldRenderer.ResolveEvictedPosition (oneShotOwner, &expiredPosition) && expiredPosition == 160,
-				"old renderer resolves the delayed expired one-shot sample-frame sentinel");
+			unsigned int expectedPosition = positionBeforeEviction + 160;
+			Check (oldRenderer.ResolveEvictedPosition (oneShotOwner, &expiredPosition) && expiredPosition == expectedPosition,
+				"old renderer resolves the delayed one-shot cursor from its actual OpenAL phase");
 			StopAndDrain (oldRenderer, oneShotEvictor);
 			ReleaseOwner (oneShotEvictor);
 			oldRenderer.UnloadSound (oneShotSound);
@@ -3150,6 +3493,11 @@ static int RunDefaultRendererTests (OpenALSoundRenderer &renderer, std::vector<B
 	TestFailedStartDoesNotPublish (renderer, longSound);
 	Test3DState (renderer, stereoSound);
 	TestPhase2EFXRouting (renderer, longSound);
+	TestWaterPitchAndInitialVirtual (renderer, longSound);
+	TestTerminalVirtualOneShot (renderer, longSound);
+	TestEvictionAdoptsSourcePosition (renderer, longSound);
+	TestStoppedSourcePositionResolution (renderer, longSound);
+	TestNaturalFinishPoolEviction (renderer, longSound);
 	TestInactiveMuteAndComplete (renderer, longSound);
 	TestRestartPositions (renderer, longSound);
 	TestEarlyClockAbstimeRestart (renderer);

@@ -97,6 +97,12 @@ bool OALTestAcceptsEncodedInputSize (unsigned int bytes)
 #define AL_DIRECT_FILTER 0x20005
 #endif
 
+#ifndef AL_FILTER_LOWPASS
+#define AL_FILTER_LOWPASS 0x0001
+#define AL_LOWPASS_GAIN 0x0001
+#define AL_LOWPASS_GAINHF 0x0002
+#endif
+
 #ifndef AL_SOURCE_RADIUS
 #define AL_SOURCE_RADIUS 0x1031
 #endif
@@ -119,6 +125,8 @@ EXTERN_CVAR (String, snd_openal_device)
 EXTERN_CVAR (Float, snd_sfxvolume)
 EXTERN_CVAR (Bool, snd_pitched)
 EXTERN_CVAR (Bool, snd_hrtf)
+EXTERN_CVAR (Bool, snd_waterreverb)
+EXTERN_CVAR (Float, snd_waterlp)
 
 namespace
 {
@@ -1999,12 +2007,13 @@ OpenALSoundRenderer::OpenALSoundRenderer ()
 		MusicVolume (1.f), NextAllocationSerial (0), NextLogicalPositionToken (~0ull), PausableOutputFrames (0),
 	  NonPausableOutputFrames (0), PausableFrameRemainder (0), NonPausableFrameRemainder (0),
 	  LastClockMilliseconds (0), SfxPaused (0), InactiveState (INACTIVE_Active),
-	  SyncPaused (false), PendingStartNoPause (false), EFXEnvironmentInitialized (false), EFXFailureDraining (false),
+	  SyncPaused (false), PendingStartNoPause (false), WaterPitchActive (false), WaterFilterActive (false), WaterFilterGainHF (0.f), EFXEnvironmentInitialized (false), EFXFailureDraining (false),
 	  LastAttemptedEnvironment (NULL), LastAppliedEnvironment (NULL), EFXFailure (OALEFXFAIL_None), EFXUsesEAX (false), InvalidReverbPanWarned (false)
 #ifdef OAL_LIFECYCLE_TEST
-	  , FailNextStart (false), FailNextStartSetup (false), FailNextEFXSourceAssign (OALEFXFAIL_None), PersistentEFXSourceFailure (false),
+	  , FailNextStart (false), FailNextStartSetup (false), FailNextPositionQuery (false), FailNextEFXSourceAssign (OALEFXFAIL_None), PersistentEFXSourceFailure (false),
 	  FailEFXSourceAssignSource (0), EFXSourceFailureCalls (0), EFXSourceFailureCallLimitExceeded (false), LastEFXSource (0), LastEFXSlot (0),
-	  LastEFXSend (0), LastEFXFilter (0), LastEFXSourceError (AL_NO_ERROR), LastEFXSourceFailureError (AL_NO_ERROR)
+	  LastEFXSend (0), LastEFXFilter (0), LastEFXSourceError (AL_NO_ERROR), LastEFXSourceFailureError (AL_NO_ERROR),
+	  LastDirectFilterSource (0), LastDirectFilter (0), LastDirectFilterError (AL_NO_ERROR)
 #endif
 {
 	InitSuccess = Init ();
@@ -2365,6 +2374,17 @@ void OpenALSoundRenderer::UnloadSound (SoundHandle sfx)
 	{
 		return;
 	}
+	for (size_t index = 0; index < LogicalPositions.size (); )
+	{
+		if (LogicalPositions[index].Sound == sound)
+		{
+			LogicalPositions.erase (LogicalPositions.begin () + index);
+		}
+		else
+		{
+			++index;
+		}
+	}
 	sound->DeferredDelete = true;
 	if (sound->References == 0)
 	{
@@ -2601,6 +2621,21 @@ bool OpenALSoundRenderer::PrepareRestart (OpenALSound *sound, float pitch, bool 
 		sound->Frames, loopStart, loopEnd, &restart->Position);
 }
 
+float OpenALSoundRenderer::GetEffectivePitch (float basePitch, bool noPause) const
+{
+	return WaterPitchActive && !noPause ? basePitch * 0.7937005f : basePitch;
+}
+
+void OpenALSoundRenderer::RebaseLogicalPosition (LogicalPosition *logicalPosition, unsigned int position, float pitch)
+{
+	if (logicalPosition != NULL)
+	{
+		logicalPosition->StartPosition = position;
+		logicalPosition->StartClock = GetChannelClock (logicalPosition->NoPause);
+		logicalPosition->Pitch = pitch;
+	}
+}
+
 OpenALChannel *OpenALSoundRenderer::CreateChannel (unsigned int source, OpenALSound *sound, float volume, float pitch, int priority, int flags)
 {
 	OpenALChannel *channel = new OpenALChannel;
@@ -2779,6 +2814,11 @@ void OpenALSoundRenderer::InjectStartSetupFailureForTest ()
 	FailNextStartSetup = true;
 }
 
+void OpenALSoundRenderer::InjectPositionQueryFailureForTest ()
+{
+	FailNextPositionQuery = true;
+}
+
 void OpenALSoundRenderer::InjectEFXSourceFailureForTest (OpenALEFXFailure failure, bool persistent, unsigned int source)
 {
 	FailNextEFXSourceAssign = failure;
@@ -2883,16 +2923,63 @@ void OpenALSoundRenderer::RemoveActiveChannel (OpenALChannel *channel)
 	}
 }
 
+bool OpenALSoundRenderer::ResolveChannelPosition (OpenALChannel *channel, unsigned int *position) const
+{
+	ALint offset = 0;
+	ALint state = AL_INITIAL;
+	if (channel == NULL || position == NULL || channel->Sound == NULL)
+	{
+		return false;
+	}
+#ifdef OAL_LIFECYCLE_TEST
+	if (const_cast<OpenALSoundRenderer *> (this)->FailNextPositionQuery)
+	{
+		const_cast<OpenALSoundRenderer *> (this)->FailNextPositionQuery = false;
+		return false;
+	}
+#endif
+	alGetSourcei (channel->Source, AL_SOURCE_STATE, &state);
+	if (alGetError () != AL_NO_ERROR)
+	{
+		return false;
+	}
+	if (state == AL_STOPPED)
+	{
+		if (!channel->Looping && channel->EndReason == OALEND_None)
+		{
+			*position = channel->Sound->Frames;
+			return true;
+		}
+		return false;
+	}
+	if (state != AL_PLAYING && state != AL_PAUSED)
+	{
+		return false;
+	}
+	alGetSourcei (channel->Source, AL_SAMPLE_OFFSET, &offset);
+	if (alGetError () != AL_NO_ERROR)
+	{
+		return false;
+	}
+	alGetSourcei (channel->Source, AL_SOURCE_STATE, &state);
+	if (alGetError () != AL_NO_ERROR || (state != AL_PLAYING && state != AL_PAUSED))
+	{
+		return false;
+	}
+	if (offset < 0 || (unsigned int)offset >= channel->Sound->Frames)
+	{
+		return false;
+	}
+	*position = (unsigned int)offset;
+	return true;
+}
+
 unsigned int OpenALSoundRenderer::CachePosition (OpenALChannel *channel)
 {
-	ALint position = 0;
-	if (channel->FinalizeState == OALFINAL_Active)
+	unsigned int position = 0;
+	if (ResolveChannelPosition (channel, &position))
 	{
-		alGetSourcei (channel->Source, AL_SAMPLE_OFFSET, &position);
-		if (alGetError () == AL_NO_ERROR && position >= 0)
-		{
-			channel->CachedPosition = (unsigned int)position;
-		}
+		channel->CachedPosition = position;
 	}
 	return channel->CachedPosition;
 }
@@ -2947,6 +3034,7 @@ void OpenALSoundRenderer::ApplySpatialState (OpenALChannel *channel, SoundListen
 void OpenALSoundRenderer::FinalizeChannel (OpenALChannel *channel, OpenALEndReason reason)
 {
 	OpenALSound *sound;
+	bool preserveTerminalPosition = false;
 	if (channel == NULL || channel->FinalizeState == OALFINAL_Finalizing || channel->FinalizeState == OALFINAL_Finalized)
 	{
 		return;
@@ -2958,9 +3046,11 @@ void OpenALSoundRenderer::FinalizeChannel (OpenALChannel *channel, OpenALEndReas
 	else
 	{
 		CachePosition (channel);
-		if (reason == OALEND_PoolEviction && channel->Sound != NULL && channel->CachedPosition >= channel->Sound->Frames && channel->Sound->Frames > 0)
+		if (reason == OALEND_PoolEviction && !channel->Looping && channel->Sound != NULL &&
+			channel->CachedPosition >= channel->Sound->Frames && channel->Sound->Frames > 0)
 		{
-			channel->CachedPosition = channel->Sound->Frames - 1;
+			reason = OALEND_Natural;
+			preserveTerminalPosition = true;
 		}
 	}
 	channel->EndReason = reason;
@@ -2969,11 +3059,12 @@ void OpenALSoundRenderer::FinalizeChannel (OpenALChannel *channel, OpenALEndReas
 	RetiringSources.push_back (channel->Source);
 	if (channel->Owner != NULL)
 	{
-		if (reason == OALEND_PoolEviction)
+		if (reason == OALEND_PoolEviction || preserveTerminalPosition)
 		{
 			LogicalPosition *logicalPosition = const_cast<LogicalPosition *> (FindLogicalPosition (channel->Owner));
 			if (logicalPosition != NULL)
 			{
+				RebaseLogicalPosition (logicalPosition, channel->CachedPosition, channel->Pitch);
 				logicalPosition->OwnerToken = AllocateLogicalPositionToken ();
 				channel->Owner->StartTime.AsOne = logicalPosition->OwnerToken;
 			}
@@ -3015,7 +3106,7 @@ FISoundChannel *OpenALSoundRenderer::Start2D (SoundHandle sfx, float volume, int
 	{
 		return NULL;
 	}
-	pitchRatio = snd_pitched ? pitch / 128.f : 1.f;
+	pitchRatio = GetEffectivePitch (snd_pitched ? pitch / 128.f : 1.f, (flags & SNDF_NOPAUSE) != 0);
 	if (!PrepareRestart (sound, pitchRatio, (flags & SNDF_LOOP) != 0, (flags & SNDF_NOPAUSE) != 0, reuseChan, flags, &restart))
 	{
 		return NULL;
@@ -3083,7 +3174,7 @@ FISoundChannel *OpenALSoundRenderer::StartSound3D (SoundHandle sfx, SoundListene
 	}
 	rolloffGain = CalculateRolloffGain (*rolloff, distscale, listener, pos, &distance);
 	effectiveGain = volume * SfxVolume * rolloffGain;
-	pitchRatio = snd_pitched ? pitch / 128.f : 1.f;
+	pitchRatio = GetEffectivePitch (snd_pitched ? pitch / 128.f : 1.f, (flags & SNDF_NOPAUSE) != 0);
 	if (!PrepareRestart (sound, pitchRatio, (flags & SNDF_LOOP) != 0, (flags & SNDF_NOPAUSE) != 0, reuseChan, flags, &restart))
 	{
 		return NULL;
@@ -3165,6 +3256,35 @@ void OpenALSoundRenderer::MarkStartTime (FISoundChannel *channel)
 	PendingStartNoPause = false;
 }
 
+void OpenALSoundRenderer::MarkVirtualStart (FISoundChannel *channel, SoundHandle handle, int pitch, int flags)
+{
+	OpenALSound *sound = (OpenALSound *)handle.data;
+	LogicalPosition *logicalPosition;
+	AdvanceClocks ();
+	if (channel == NULL || sound == NULL || sound->DeferredDelete)
+	{
+		MarkStartTime (channel);
+		return;
+	}
+	ForgetLogicalPosition (channel);
+	LogicalPositions.push_back (LogicalPosition ());
+	logicalPosition = &LogicalPositions.back ();
+	logicalPosition->Owner = channel;
+	logicalPosition->Sound = sound;
+	logicalPosition->StartClock = GetChannelClock ((flags & SNDF_NOPAUSE) != 0);
+	logicalPosition->StartPosition = 0;
+	logicalPosition->OwnerToken = AllocateLogicalPositionToken ();
+	logicalPosition->SampleRate = sound->SampleRate;
+	logicalPosition->Frames = sound->Frames;
+	logicalPosition->LoopStart = sound->HasLoop ? sound->LoopStart : 0;
+	logicalPosition->LoopEnd = sound->HasLoop ? sound->LoopEnd : sound->Frames;
+	logicalPosition->Pitch = GetEffectivePitch (snd_pitched ? pitch / 128.f : 1.f, (flags & SNDF_NOPAUSE) != 0);
+	logicalPosition->Looping = (flags & SNDF_LOOP) != 0;
+	logicalPosition->NoPause = (flags & SNDF_NOPAUSE) != 0;
+	channel->StartTime.AsOne = logicalPosition->OwnerToken;
+	PendingStartNoPause = false;
+}
+
 unsigned int OpenALSoundRenderer::GetPosition (FISoundChannel *owner)
 {
 	OpenALChannel *channel = owner == NULL ? NULL : (OpenALChannel *)owner->SysChannel;
@@ -3174,7 +3294,7 @@ unsigned int OpenALSoundRenderer::GetPosition (FISoundChannel *owner)
 	{
 		return CachePosition (channel);
 	}
-	return GetLogicalPosition (owner, &position) ? position : 0;
+	return ResolveEvictedPosition (owner, &position) ? position : 0;
 }
 
 bool OpenALSoundRenderer::ResolveEvictedPosition (FISoundChannel *owner, unsigned int *position)
@@ -3427,6 +3547,29 @@ bool OpenALSoundRenderer::EnsureEFXSourceDry (unsigned int source)
 	return !Capabilities.EFXCallable || SetEFXSourceSend (source, 0, 0, 0);
 }
 
+bool OpenALSoundRenderer::ClearWaterFilter (OpenALChannel *channel)
+{
+	if (channel == NULL || !Capabilities.EFXFilterCallable)
+	{
+		return true;
+	}
+	alGetError ();
+	alSourcei (channel->Source, AL_DIRECT_FILTER, 0);
+#ifdef OAL_LIFECYCLE_TEST
+	LastDirectFilterSource = channel->Source;
+	LastDirectFilter = 0;
+	LastDirectFilterError = alGetError ();
+	if (LastDirectFilterError == AL_NO_ERROR)
+#else
+	if (alGetError () == AL_NO_ERROR)
+#endif
+	{
+		return true;
+	}
+	RecordEFXFailure (OALEFXFAIL_DirectFilter);
+	return false;
+}
+
 bool OpenALSoundRenderer::ResetEFXSourceProperty (unsigned int source, OALenum property, int value, bool floating, OpenALEFXFailure failure)
 {
 	alGetError ();
@@ -3481,6 +3624,8 @@ void OpenALSoundRenderer::RetireEFXSource (OpenALChannel *channel)
 
 bool OpenALSoundRenderer::ApplyChannelEFX (OpenALChannel *channel)
 {
+	int filter = 0;
+	bool waterFilterApplied;
 	if (channel == NULL || channel->FinalizeState != OALFINAL_Active)
 	{
 		return true;
@@ -3491,15 +3636,91 @@ bool OpenALSoundRenderer::ApplyChannelEFX (OpenALChannel *channel)
 		FailEFXEnvironment ();
 		return false;
 	}
+	waterFilterApplied = ApplyWaterFilter (channel);
+	if (!waterFilterApplied)
+	{
+		if (!ClearWaterFilter (channel) || !EnsureEFXSourceDry (channel->Source))
+		{
+			RetireEFXSource (channel);
+			return false;
+		}
+	}
+	if (waterFilterApplied && WaterFilterActive && !channel->NoPause && Capabilities.EFXFilterUsable)
+	{
+		filter = (int)EFXFilter;
+	}
 	if (Capabilities.EFXApplied && LastAttemptedEnvironment != NULL &&
 		LastAttemptedEnvironment != DefaultEnvironments[0] && !channel->NoReverb)
 	{
-		if (!SetEFXSourceSend (channel->Source, (ALint)EFXSlot, 0, 0))
+		if (!SetEFXSourceSend (channel->Source, (ALint)EFXSlot, 0, filter))
 		{
 			FailEFXEnvironment ();
-			if (!ResetEFXSource (channel->Source)) RetireEFXSource (channel);
+			if (channel->Owner == NULL && !EnsureEFXSourceDry (channel->Source)) RetireEFXSource (channel);
 			return false;
 		}
+	}
+	return true;
+}
+
+static bool WaterFilterGain (int outputRate, float requestedCutoff, float *gain)
+{
+	float sampleRate = (float)outputRate;
+	float cutoff = std::min (requestedCutoff, .49f * sampleRate);
+	float reference = std::min (5000.f, .49f * sampleRate);
+	float ratio;
+	float t;
+	float rawGain;
+	if (sampleRate <= 0.f || cutoff <= 0.f || reference <= 0.f)
+	{
+		return false;
+	}
+	ratio = tanf (3.14159265358979323846f * cutoff / sampleRate) / tanf (3.14159265358979323846f * reference / sampleRate);
+	t = ratio * ratio * ratio * ratio;
+	rawGain = sqrtf (2.f * t / (1.f + sqrtf (1.f + 8.f * t * t)));
+	if (reference < 5000.f && rawGain < .001f)
+	{
+		return false;
+	}
+	if (gain != NULL)
+	{
+		*gain = std::max (.001f, std::min (1.f, rawGain));
+	}
+	return true;
+}
+
+bool OpenALSoundRenderer::ApplyWaterFilter (OpenALChannel *channel)
+{
+	OpenALEFXFunctions &efx = Capabilities.EFX;
+	if (channel == NULL || !Capabilities.EFXFilterUsable || EFXFilter == 0)
+	{
+		return true;
+	}
+	alGetError ();
+	if (!WaterFilterActive || channel->NoPause)
+	{
+		return ClearWaterFilter (channel);
+	}
+	alGetError ();
+	efx.Filterf (EFXFilter, AL_LOWPASS_GAIN, 1.f);
+	efx.Filterf (EFXFilter, AL_LOWPASS_GAINHF, WaterFilterGainHF);
+	if (alGetError () != AL_NO_ERROR)
+	{
+		RecordEFXFailure (OALEFXFAIL_DirectFilter);
+		return false;
+	}
+	alGetError ();
+	alSourcei (channel->Source, AL_DIRECT_FILTER, (ALint)EFXFilter);
+#ifdef OAL_LIFECYCLE_TEST
+	LastDirectFilterSource = channel->Source;
+	LastDirectFilter = (int)EFXFilter;
+	LastDirectFilterError = alGetError ();
+	if (LastDirectFilterError != AL_NO_ERROR)
+#else
+	if (alGetError () != AL_NO_ERROR)
+#endif
+	{
+		RecordEFXFailure (OALEFXFAIL_DirectFilter);
+		return false;
 	}
 	return true;
 }
@@ -3524,7 +3745,7 @@ void OpenALSoundRenderer::DrainEFXEnvironmentFailure ()
 	for (size_t index = 0; index < ActiveChannels.size (); ++index)
 	{
 		OpenALChannel *channel = ActiveChannels[index];
-		if (channel != NULL && channel->FinalizeState == OALFINAL_Active && !ResetEFXSource (channel->Source))
+		if (channel != NULL && channel->FinalizeState == OALFINAL_Active && !EnsureEFXSourceDry (channel->Source))
 		{
 			RetireEFXSource (channel);
 		}
@@ -3587,6 +3808,71 @@ void OpenALSoundRenderer::UpdateEFXEnvironment (SoundListener *listener)
 	}
 }
 
+void OpenALSoundRenderer::UpdateActiveWaterChannels (bool pitchChanged, bool wasPitchActive)
+{
+	for (size_t index = 0; index < ActiveChannels.size (); ++index)
+	{
+		OpenALChannel *channel = ActiveChannels[index];
+		if (pitchChanged)
+		{
+			float basePitch = channel->Pitch / (wasPitchActive && !channel->NoPause ? 0.7937005f : 1.f);
+			float effectivePitch = GetEffectivePitch (basePitch, channel->NoPause);
+			CachePosition (channel);
+			RebaseLogicalPosition (const_cast<LogicalPosition *> (FindLogicalPosition (channel->Owner)), channel->CachedPosition, effectivePitch);
+			channel->Pitch = effectivePitch;
+			alSourcef (channel->Source, AL_PITCH, effectivePitch);
+		}
+		ApplyChannelEFX (channel);
+	}
+}
+
+void OpenALSoundRenderer::UpdateVirtualWaterChannels (bool wasPitchActive)
+{
+	for (size_t index = 0; index < LogicalPositions.size (); ++index)
+	{
+		LogicalPosition *logicalPosition = &LogicalPositions[index];
+		if (logicalPosition->Owner != NULL && logicalPosition->Owner->SysChannel == NULL)
+		{
+			unsigned int position = 0;
+			float basePitch = logicalPosition->Pitch / (wasPitchActive && !logicalPosition->NoPause ? 0.7937005f : 1.f);
+			if (ResolveEvictedPosition (logicalPosition->Owner, &position))
+			{
+				RebaseLogicalPosition (logicalPosition, position, GetEffectivePitch (basePitch, logicalPosition->NoPause));
+			}
+		}
+	}
+}
+
+void OpenALSoundRenderer::UpdateWaterState (SoundListener *listener)
+{
+	const ReverbContainer *environment;
+	bool pitchActive;
+	bool filterActive;
+	bool filterChanged;
+	bool wasPitchActive;
+	float filterGainHF = 0.f;
+	if (listener == NULL || !listener->valid)
+	{
+		return;
+	}
+	environment = ForcedEnvironment != NULL ? ForcedEnvironment :
+		(listener->Environment != NULL ? listener->Environment : DefaultEnvironments[0]);
+	pitchActive = (listener->underwater && snd_waterlp != 0) || (environment != NULL && environment->SoftwareWater);
+	filterActive = pitchActive && WaterFilterGain (OutputRate, snd_waterlp, &filterGainHF);
+	filterChanged = filterActive != WaterFilterActive || (filterActive && filterGainHF != WaterFilterGainHF);
+	if (pitchActive == WaterPitchActive && !filterChanged)
+	{
+		return;
+	}
+	AdvanceClocks ();
+	wasPitchActive = WaterPitchActive;
+	WaterPitchActive = pitchActive;
+	WaterFilterActive = filterActive;
+	WaterFilterGainHF = filterActive ? filterGainHF : 0.f;
+	UpdateActiveWaterChannels (pitchActive != wasPitchActive, wasPitchActive);
+	if (pitchActive != wasPitchActive) UpdateVirtualWaterChannels (wasPitchActive);
+}
+
 void OpenALSoundRenderer::UpdateListener (SoundListener *listener)
 {
 	ALfloat orientation[6];
@@ -3605,6 +3891,7 @@ void OpenALSoundRenderer::UpdateListener (SoundListener *listener)
 	alListener3f (AL_POSITION, position.X, position.Y, position.Z);
 	alListener3f (AL_VELOCITY, 0.f, 0.f, 0.f);
 	alListenerfv (AL_ORIENTATION, orientation);
+	UpdateWaterState (listener);
 	UpdateEFXEnvironment (listener);
 }
 
@@ -3628,7 +3915,7 @@ void OpenALSoundRenderer::UpdateSounds ()
 		}
 		if (state == AL_STOPPED)
 		{
-			FinalizeChannel (channel, OALEND_Natural);
+			FinalizeChannel (channel, channel->Looping ? OALEND_BackendError : OALEND_Natural);
 			continue;
 		}
 		++index;
@@ -3684,10 +3971,17 @@ void OpenALSoundRenderer::PrintStatus ()
 		Printf ("EFX sends: %d\n", efxStatus.SendCount);
 	}
 	Printf ("EFX room rolloff: reverb parameter only; source-distance attenuation is not applied.\n");
+	PrintWaterStatus ();
 	Printf ("AL_EXT_SOURCE_RADIUS: %s, applied: %s\n", Capabilities.RadiusAdvertised ? "advertised" : "absent",
 		Capabilities.RadiusApplied ? "yes" : "no");
 	Printf ("Doppler: applied: %s (factor remains 0)\n", Capabilities.DopplerApplied ? "yes" : "no");
 	Printf ("SFX sources: " TEXTCOLOR_GREEN "%d allocated / %d requested / %d free / %d active\n", AllocatedSources, RequestedSources, AllocatedSources - (int)ActiveChannels.size (), (int)ActiveChannels.size ());
+}
+
+void OpenALSoundRenderer::PrintWaterStatus () const
+{
+	Printf ("Water pitch: %s, low-pass: %s, legacy water reverb: not implemented (snd_waterreverb %s).\n",
+		WaterPitchActive ? "active" : "off", WaterFilterActive ? "active" : "off", snd_waterreverb ? "on" : "off");
 }
 
 void OpenALSoundRenderer::PrintDriversList ()

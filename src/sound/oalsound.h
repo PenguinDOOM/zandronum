@@ -460,6 +460,7 @@ public:
 	void StopChannel (FISoundChannel *chan);
 	void ChannelVolume (FISoundChannel *chan, float volume);
 	void MarkStartTime (FISoundChannel *chan);
+	void MarkVirtualStart (FISoundChannel *chan, SoundHandle sound, int pitch, int flags);
 	unsigned int GetPosition (FISoundChannel *chan);
 	bool ResolveEvictedPosition (FISoundChannel *chan, unsigned int *position);
 	float GetAudibility (FISoundChannel *chan);
@@ -518,6 +519,7 @@ private:
 	bool FinalizePendingStopForReuse ();
 	void RemoveActiveChannel (OpenALChannel *channel);
 	void FinalizeChannel (OpenALChannel *channel, OpenALEndReason reason);
+	bool ResolveChannelPosition (OpenALChannel *channel, unsigned int *position) const;
 	unsigned int CachePosition (OpenALChannel *channel);
 	void ApplyChannelGain (OpenALChannel *channel);
 	float CalculateRolloffGain (FRolloffInfo &rolloff, float distanceScale, SoundListener *listener, const FVector3 &position, float *distance) const;
@@ -526,6 +528,13 @@ private:
 	bool IsSourceReserved (unsigned int source) const;
 	void AdvanceClocks ();
 	bool PrepareRestart (OpenALSound *sound, float pitch, bool looping, bool noPause, FISoundChannel *reuseChan, int flags, RestartState *restart) const;
+	float GetEffectivePitch (float basePitch, bool noPause) const;
+	void RebaseLogicalPosition (LogicalPosition *logicalPosition, unsigned int position, float pitch);
+	void UpdateActiveWaterChannels (bool pitchChanged, bool wasPitchActive);
+	void UpdateVirtualWaterChannels (bool wasPitchActive);
+	void UpdateWaterState (SoundListener *listener);
+	bool ApplyWaterFilter (OpenALChannel *channel);
+	void PrintWaterStatus () const;
 	OpenALChannel *CreateChannel (unsigned int source, OpenALSound *sound, float volume, float pitch, int priority, int flags);
 	unsigned int AcquireSource (int priority, float effectiveGain);
 	bool ApplyRestartPosition (OpenALChannel *channel, const RestartState &restart);
@@ -541,6 +550,7 @@ private:
 	bool ApplyEFXEnvironment (const ReverbContainer *environment);
 	bool SetEFXSourceSend (unsigned int source, int slot, int send, int filter);
 	bool EnsureEFXSourceDry (unsigned int source);
+	bool ClearWaterFilter (OpenALChannel *channel);
 	bool ResetEFXSourceProperty (unsigned int source, OALenum property, int value, bool floating, OpenALEFXFailure failure);
 	bool ResetEFXSource (unsigned int source);
 	bool ApplyChannelEFX (OpenALChannel *channel);
@@ -557,6 +567,7 @@ private:
 #ifdef OAL_LIFECYCLE_TEST
 	void InjectStartFailureForTest ();
 	void InjectStartSetupFailureForTest ();
+	void InjectPositionQueryFailureForTest ();
 	void InjectEFXSourceFailureForTest (OpenALEFXFailure failure = OALEFXFAIL_WetSend, bool persistent = false, unsigned int source = 0);
 	void ClearEFXSourceFailureForTest ();
 	bool InjectEFXSourceFailure (unsigned int source, OpenALEFXFailure failure);
@@ -593,6 +604,9 @@ private:
 	EInactiveState InactiveState;
 	bool SyncPaused;
 	bool PendingStartNoPause;
+	bool WaterPitchActive;
+	bool WaterFilterActive;
+	float WaterFilterGainHF;
 	bool EFXEnvironmentInitialized;
 	bool EFXFailureDraining;
 	const ReverbContainer *LastAttemptedEnvironment;
@@ -605,6 +619,7 @@ private:
 #ifdef OAL_LIFECYCLE_TEST
 	bool FailNextStart;
 	bool FailNextStartSetup;
+	bool FailNextPositionQuery;
 	OpenALEFXFailure FailNextEFXSourceAssign;
 	bool PersistentEFXSourceFailure;
 	unsigned int FailEFXSourceAssignSource;
@@ -616,6 +631,9 @@ private:
 	int LastEFXFilter;
 	int LastEFXSourceError;
 	int LastEFXSourceFailureError;
+	unsigned int LastDirectFilterSource;
+	int LastDirectFilter;
+	int LastDirectFilterError;
 	std::vector<OpenALEFXSourceAssignment> EFXSourceAssignments;
 #endif
 };

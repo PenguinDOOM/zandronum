@@ -1,12 +1,13 @@
-# Native OpenAL Soft: Phase 2B-2
+# Native OpenAL Soft: Phase 2B-3 Current State
 
 ## Scope
 
 This document describes the implemented 2B-1 shared environment state and
-numeric adapter together with the 2B-2 OpenAL EFX environment routing. The
-existing FMOD backend, `snd_backend` selection, fallback behavior, music
-selection, CVAR defaults, compatibility behavior, `AL_NONE` distance model,
-and manual rolloff remain unchanged.
+numeric adapter, 2B-2 OpenAL EFX environment routing, and 2B-3 underwater
+pitch/low-pass and virtual-position behavior. The existing FMOD backend,
+`snd_backend` selection, fallback behavior, music selection, CVAR defaults,
+compatibility behavior, `AL_NONE` distance model, and manual rolloff remain
+unchanged.
 
 2B-1 owns one EFX effect, one auxiliary slot, and the filter capability for the
 current OpenAL context. It requests one auxiliary send and records the actual
@@ -17,8 +18,88 @@ operation; a failed optional path does not stop ordinary OpenAL playback.
 Resource cleanup is tracked for partial allocation failures and remains within
 the owning context.
 
-2B-2 adds source send routing on top of those resources. Water pitch/low-pass,
-virtual-position callbacks, source radius, and Doppler remain later work.
+2B-2 adds source send routing on top of those resources. 2B-3 adds the
+water-pitch/low-pass approximation and the initial virtual-start position
+registration. Source radius and Doppler remain later work.
+
+This is the current 2B-3 implementation state, not a Phase 2 completion
+claim. The requested/assigned documentation model was Luna; actual model use
+is unconfirmed.
+
+## 2B-3 Underwater Implementation
+
+The water state is active when
+
+`listener.underwater && snd_waterlp != 0` **or** `SoftwareWater`.
+
+For a pausable SFX source, the effective pitch is computed from its base pitch
+without cumulative multiplication:
+
+$$p_{effective}=p_{base}\times0.7937005$$
+
+when water is active, and `$p_{effective}=p_{base}$` otherwise. `SNDF_NOPAUSE`
+sources are excluded from both the water pitch and direct low-pass. Music and
+encoded/software music remain dry and excluded. `SNDF_NOREVERB` only suppresses
+the environmental send; it does not suppress water pitch or the direct
+low-pass. With `SoftwareWater`, pitch remains active even when `snd_waterlp`
+is zero, while the low-pass is bypassed. `snd_waterreverb` is a no-op in this
+backend: the old wet graph, Q=2 behavior, wet-tail EQ, and direct/wet mix are
+deferred.
+
+The base pitch is retained and water-state changes rebase live and virtual
+positions before applying the new effective pitch. Position resolution keeps
+the cached loop position when an OpenAL query is invalid, reports natural
+non-loop termination at `Frames` before finalization, and preserves the
+pre-stop offset for an explicit stop. Pool eviction rebases the logical
+position to the actual cached offset before the source is retired. A virtual
+ended frame count is kept distinct from an invalid position, so an invalid
+query cannot resurrect a source at an unrelated position. `MarkVirtualStart`
+receives the already loaded sound handle, pitch, and flags from `s_sound.cpp`;
+OpenAL registers the initial logical position, sample rate, loop bounds,
+effective pitch, pause class, and a non-zero owner token. Water changes rebase
+both active and virtual positions while preserving the derived pitch. These
+are the tested lifecycle boundaries, not an exhaustive guarantee for every
+future resolver case.
+
+The low-pass approximation uses the fixed 5000 Hz shelf reference and the
+Nyquist-safe cutoff:
+
+$$f_0=\min(5000,0.49F_s),\qquad f_c=\min(\mathit{snd\_waterlp},0.49F_s)$$
+
+$$r=\frac{\tan(\pi f_c/F_s)}{\tan(\pi f_0/F_s)},\quad
+t=r^4,\quad
+g=\sqrt{\frac{2t}{1+\sqrt{1+8t^2}}}$$
+
+The filter uses `AL_LOWPASS_GAIN=1` and
+`AL_LOWPASS_GAINHF=clamp(g, .001, 1)`. At low output rates, when the reduced
+reference cannot produce the clamped gain, the filter is bypassed. This is a
+clamped approximation, not a claim that the requested low cutoff is physically
+reached at every output rate.
+
+When the cutoff changes while water remains active, the derived positive
+`GainHF` is updated without rebasing source pitch. If the cutoff cannot produce
+the minimum useful gain at the output rate, the direct filter is bypassed while
+water pitch remains governed by its separate state.
+
+The product lifecycle readback at 44,100 Hz reported
+`WATER_FILTER_ACTUAL output_rate=44100 cutoff=250 gainhf=0.00229177088 gain=1`.
+The loopback probe used that product-readback `gainhf` as an explicit input; it
+did not recompute the coefficient. With a 2 second, 88,200-frame mono 16-bit
+sine, the first 44,100 frames were excluded and RMS was measured over the
+last 44,100 float32 loopback frames. The measured amplitude ratios were
+`0.7770715` at 225 Hz, `0.70710707` at 250 Hz, and `0.6370311` at 275 Hz.
+Thus the half-power frequency is bracketed by 225--275 Hz within the stated
+10% frequency criterion; the criterion is not an amplitude-error criterion.
+The raw reference and filtered files, full inputs, and provenance are retained
+under `completes/native-openal-soft-phase-2/2b-3/runtime-probe/raw/measurement-44100-product-readback-final/`.
+The measurement used an explicitly loaded DLL whose recorded SHA256 was
+`2C44AE1108904B708BDC370EF8703785912BFEE67BB4999ED8D25C28250628A9` and
+observed API string `1.1 ALSOFT`; this is historical measurement provenance,
+not a claim that the current runtime has the same DLL. An exact OpenAL Soft
+`1.25.1` or `1.25.2` runtime is unconfirmed. The loopback is OpenAL Soft DSP
+output, not playback through a physical device or a human listening test. The
+separate 8,000 Hz fixture output rate is a low-rate bypass decision, not a real
+8,000 Hz product measurement.
 
 ## Shared Environment State
 
@@ -84,11 +165,11 @@ most once per renderer/context.
 
 ## Deferred Boundaries
 
-The following are intentionally outside 2B-2:
+The following remain intentionally outside 2B-3:
 
-- `snd_waterlp` pitch/low-pass behavior, `SoftwareWater`, and virtual position
-  state (2B-3); and
-- source radius and Doppler behavior (2C/2D).
+- source radius and Doppler behavior (2C/2D); and
+- the legacy FMOD wet graph, Q=2 behavior, wet-tail filtering, and full FMOD
+  acoustic equivalence.
 
 No full acoustic equivalence with FMOD is claimed. In particular, the legacy
 water wet graph, Q=2 behavior, wet-tail filtering, listener velocity, and
@@ -130,7 +211,9 @@ cmake --build build-v143 --config Release --target zdoom openal_lifecycle_tests
 ctest --test-dir build-v143 -C Release --output-on-failure -R "^(openal_phase2_unit|openal_lifecycle)$"
 ```
 
-The focused CTest run recorded `2/2` tests passed. The device-free unit case
+The earlier focused CTest run recorded `2/2` tests passed as historical
+evidence. The latest terminal-fix lifecycle run recorded `1/1` test passed;
+the device-free unit case
 is `openal_phase2_unit`, which runs:
 
 ```powershell
@@ -157,8 +240,8 @@ passed and reported `EFX sends: 1`,
 The Release product/test build and focused CTest records are retained as
 validation evidence. Resource-owner fault-injection unit tests also passed.
 
-For 2B-2, the valid Release product and lifecycle-test build, focused CTest
-(`2/2`), and direct routing, continuing-source, and error-handling runs are
+For 2B-2, the valid Release product and lifecycle-test build, earlier focused
+CTest (`2/2`), and direct routing, continuing-source, and error-handling runs are
 retained and reused; they were not rerun for the manual resumption. These
 automated assertions cover valid-listener forced/listener/Off selection,
 modified/retry behavior, 2D `SNDF_NOREVERB`, a wet 3D source,
@@ -167,23 +250,59 @@ product setter and error observations described below. The current test file
 does not assert invalid-listener hold or a 3D `SNDF_NOREVERB` source; those
 remain code-level behavior, not claimed test coverage.
 
-The current full Cppcheck capture uses the review3-fix working-tree manifest
-`completes/native-openal-soft-phase-2/2b-2/cppcheck-input/review3-fix-working-tree-capture-88dcd6fcff83fd3ce5cd8d11e7c00cfdf7697874/manifest.json`
-for commit `88dcd6fcff83fd3ce5cd8d11e7c00cfdf7697874`. Today's parent
-verification matched the HEAD, all four working-tree hashes, and all four
-payload hashes. The completed full result is retained at
-`completes/native-openal-soft-phase-2/2b-2/cppcheck-full/run-20260921-032239-3a718c294ede40528a843c3d6811d1e4/final-result.json`:
-Cppcheck passed with exit code 0, `Raw=601078`, `Baseline=7503`, `New=0`, and
-`UnresolvedVendor=0`. The corresponding raw log ended with zero new
-diagnostics, `Cppcheck passed`, `END`, and `EXIT_CODE0`. The formal parent
-review3 Lizard result also passed with exit code 0 and
-`REAL_INDEX_UNCHANGED=True`. These are verified facts for the current review3
-input. Independent round 4 is approved/green, while the commit remains
-pending, so this document makes no overall Phase 2 completion claim. The
-earlier second-narrowrepair Cppcheck result
-and parent Lizard result are historical evidence only; the earlier B1 raw
-fixture and query evidence remains valid historical B1 evidence and is not
-recast as B2 routing evidence.
+The review1-lp full Cppcheck gate used the latest final working-tree manifest
+at
+`completes/native-openal-soft-phase-2/2b-3/review1-lp/review1-complete-final-working-tree-capture-7b1fcf1415953957c7cab69058479480928ab518/manifest.json`.
+The manifest verification script is
+`completes/native-openal-soft-phase-2/2b-3/review1-lp/verify-final-manifest.ps1`;
+it reported `MANIFEST_HASH_MATCH=True`, `FILE_COUNT=6`, and
+`CACHE_STABLE=True`. The latest Cppcheck result is retained at
+`completes/native-openal-soft-phase-2/2b-3/review1-lp/cppcheck-full-final/run-20260921-104454-1640a1c2e9a6454e8a03bc0cc2987dec/final-result.json`:
+it passed with exit code 0, `Raw=601078`, `Baseline=7503`, `New=0`, and
+`UnresolvedVendor=0`. The review1-lp Lizard result is
+`completes/native-openal-soft-phase-2/2b-3/review1-lp/lizard-final.raw.log`;
+it reports no new complexity regressions, `EXIT_CODE=0`, and
+`REAL_INDEX_UNCHANGED=True`. The parallel formal parent-review1 Lizard run is
+also recorded zero new findings with `REAL_INDEX_UNCHANGED=True`. These
+analysis gates apply to the captured working tree; they do not make the
+overall Phase 2 complete.
+
+The review1 Release product/test gate and focused CTest gate recorded the
+Release build as successful and `2/2` tests passed. The shared `NO_SOUND` and
+`SERVERONLY` results remain valid because the shared source is reported
+unchanged from the accepted baseline. These are 2B-3 validation results; they
+do not make the overall Phase 2 complete.
+
+The latest 2B-3 terminal-repair full Cppcheck input is the six-file working-tree
+capture at
+`completes/native-openal-soft-phase-2/2b-3/cppcheck-input/review2-terminal-working-tree-capture-7b1fcf1415953957c7cab69058479480928ab518/manifest.json`;
+the current six working-tree hashes match that manifest. The actual full
+result is retained at the root-side evidence path
+`2b3/review2-terminal/cppcheck-full/run-20260922-063359-643079dce90347f7a777043da085ba1d/final-result.json`:
+the live gate passed with exit code 0, `New=0`, and `UnresolvedVendor=0`.
+Its recorded full-result SHA256 is
+`FB9E7C6564F6C511C4285274E1B09958CF4007F011B18E6654C49872AB05CD9A`.
+The unexpected root-side `2b3/review2-terminal` raw logs and exit records,
+including the Phase 2 test-2 record, are preserved as excluded evidence and
+are not moved, edited, or added to the commit. The formal parent-review2
+Lizard record at
+`completes/native-openal-soft-phase-2/2b-3/parent-review2-lizard.log` passed
+with `EXIT_CODE=0` and `REAL_INDEX_UNCHANGED=True`.
+
+The repaired lifecycle boundary covers natural non-loop termination reporting
+at `Frames` before finalization and pool eviction rebasing to the cached
+offset; the natural callback path does not resurrect a source for one frame.
+The Release product/test build passed, and the latest terminal-fix
+`openal_lifecycle` run passed (`1/1`); the older terminal-fix CTest record that
+reported `2/2` is retained as historical evidence, not as the latest result.
+The separate test-2 CTest record reported `No tests were found!!!` and is
+excluded from pass evidence. An independent review3 is approved (`GREEN`);
+the commit remains pending, and the reviewer required no new test or product
+edit. These records update the terminal-repair provenance only. All shared/LP manual evidence remains
+retained, including normal-executable observations made before the terminal
+failure repair; it is not latest post-repair listening evidence. These records
+do not replace that retained evidence or make an overall Phase 2 completion
+claim.
 
 The earlier 2A-1 status record included `OpenAL Soft`, `1.1 ALSOFT`, HRTF
 status `enabled (1)`, EFX `advertised/callable`, sends `not-queried`, and
@@ -258,8 +377,7 @@ down were difficult to distinguish. It does not establish that all six
 directions are clear or require a correction for individual listening
 variation.
 
-Do not treat this baseline as evidence that EFX, radius, water processing, or
-Doppler is active. The final Release and
+Do not treat this baseline as evidence that radius or Doppler is active. The final Release and
 NO_SOUND/SERVERONLY records also have valid exit-code-0 results. Historical 2A-1
 analyzer and source-hash records remain historical phase evidence and are not
 presented as new 2A-2 measurements. Earlier automatic NO_SOUND and SERVERONLY
@@ -288,8 +406,11 @@ sources. A wet-send failure is checked immediately rather than swallowed. The
 failure path is non-reentrant: a persistent EFX environment-drain failure
 remains latched until reset or re-selection, while an active source that cannot
 be detached is stopped and retired after the finite backend-error cleanup path.
-A source that can be made dry remains active. History offsets after failure and
-persistent reset/detach behavior are covered by the lifecycle tests.
+A source that can be made dry remains active, and later active sources continue
+through the dry fallback. Direct water low-pass application is independent of
+reverb-send draining, so a reverb property failure does not remove an otherwise
+successful direct filter. The lifecycle tests cover these bounded recovery and
+retirement cases; they do not establish unrestricted acoustic equivalence.
 Re-editing or reselection is the recovery boundary.
 
 Normal 2D and 3D sources use the selected wet environment except when the
@@ -298,13 +419,13 @@ does not make a source dry; it remains wet-eligible. Music, encoded streams,
 callbacks, and software-generated music remain dry and have no EFX send or
 filter. New and reused sources and streams are explicitly reset to dry, with
 air absorption, automatic send/filter gain correction, and the direct filter
-reset to their dry defaults; the manual source gain is applied once. When the
-radius capability is advertised, source radius is capability-guardedly reset
-to zero; 2B-2 does not activate radius behavior. `RoomRolloffFactor` is
-retained as an EFX
+reset to their dry defaults; the manual source gain is applied once. Source
+radius remains reset to zero even when `AL_EXT_SOURCE_RADIUS` is advertised;
+radius behavior is not enabled. `RoomRolloffFactor` is retained as an EFX
 parameter, but it does not reproduce FMOD's distance attenuation in this
-`AL_NONE` plus manual-rolloff arrangement. No water processing, virtual-radius
-handling, or Doppler is enabled by 2B-2.
+`AL_NONE` plus manual-rolloff arrangement. Doppler remains disabled and its
+factor remains zero. These constraints are independent of the implemented
+water pitch/low-pass and virtual-position behavior.
 
 The routing tests observe product-side source setter calls and OpenAL error
 results, together with runtime lifecycle behavior. OpenAL Soft rejects the
@@ -329,17 +450,55 @@ pistol SFX audible. That is reusable normal FMOD-path evidence, not latest
 OpenAL executable listening evidence.
 
 The session ran as PID 33868. The requested `-logfile` did not create a file,
-so no new runtime backend-log claim is made. The custom-environment unload
-path was not manually exercised; the manual editor-close result is not
-claimed as map-change or custom-unload success. The document makes no
-acoustic-equivalence claim, and the existing limitation that API `1.1 ALSOFT`
-does not prove an OpenAL Soft `1.25.2` runtime remains in force.
+so that historical session has no new runtime backend-log claim. The later
+2B-3 resumed manual run used PID 4476 and the isolated executable
+`completes/native-openal-soft-phase-2/2b-3/runtime-new/zandronum.exe` with
+SHA256
+`93D922BD475EDCE29A561AE60D555FAE9B0730B185C5D2EF2F609B0C460D8C21`.
+Its launch record is
+`completes/native-openal-soft-phase-2/2b-3/runtime-new/launch-resume.json`,
+and the `+logfile` output exists at
+`completes/native-openal-soft-phase-2/2b-3/runtime-new/logs/water-manual-20260922-060739.log`.
+The runtime provenance records all 13 source/runtime assets and the IWAD as
+verified; the fresh private configuration selected OpenAL,
+`snd_waterlp=250`, and `snd_waterreverb=true`.
+
+The user confirmed that the OpenAL status was usable. With the Test in level
+editor's Builtin `DSP Water` selected, the forced `SoftwareWater` path produced
+lower pitch and audible low-pass muffling at `snd_waterlp=250`. With
+`snd_waterlp=0`, pitch remained lowered while the low-pass was bypassed; after
+restoring `250` and selecting `Off`, pitch returned to normal. This route
+demonstrates forced `SoftwareWater`, not physical underwater level-3 detection.
+The user also confirmed normal music and SFX in the tested states.
+
+The separate FMOD run confirmed lowered pitch and a normal restore to `Off`,
+but no muffling. This is expected for the selected FMOD SDK
+`FMOD_VERSION=0x00044464`: the current water path applies pitch, while the
+legacy water low-pass/reverb branch is unavailable for this SDK. This is a
+current FMOD implementation boundary, not a claim that FMOD generally lacks
+low-pass capability, and no FMOD muffling pass is claimed. FMOD pause/resume
+was also user-confirmed as normal, with music and SFX normal. These are user
+listening observations, not AI or instrumented acoustic measurements.
+
+The custom-environment unload path was not manually exercised; the manual
+editor-close result is not claimed as map-change or custom-unload success. The
+document makes no acoustic-equivalence claim, and the existing limitation that
+API `1.1 ALSOFT` does not prove an OpenAL Soft `1.25.2` runtime remains in
+force.
 
 ## Deferred Work
 
-Later units may add HRTF profile selection or live context reset, water
-processing, apply radius, or calibrate and enable source-only Doppler. The
+Later units may add HRTF profile selection or live context reset, apply radius,
+or calibrate and enable source-only Doppler. The
 existing `snd_reset` path recreates the renderer and is the current HRTF
 application boundary; live `alcResetDeviceSOFT` is not implemented. Full
 acoustic equivalence with FMOD, including the distance behavior of
 `RoomRolloffFactor`, is not claimed.
+
+The manual 2B-3 editor route used selecting `DSP Water` in Test in level. That
+route exercises `SoftwareWater`; it is not evidence of the built-in underwater
+listener flag or actual player submersion. The latest 2B-3 manual and
+provenance evidence is recorded above. B3 independent review round three is
+approved (`GREEN`), while the commit remains pending; no overall Phase 2
+completion claim is made, and no unverified pause console command is
+prescribed here.

@@ -214,6 +214,7 @@ public:
 	virtual void StopChannel (FISoundChannel *) = 0;
 	virtual void ChannelVolume (FISoundChannel *, float) = 0;
 	virtual void MarkStartTime (FISoundChannel *) = 0;
+	virtual void MarkVirtualStart (FISoundChannel *channel, SoundHandle, int, int) { MarkStartTime (channel); }
 	virtual unsigned int GetPosition (FISoundChannel *) = 0;
 	virtual bool ResolveEvictedPosition (FISoundChannel *, unsigned int *) { return false; }
 	virtual float GetAudibility (FISoundChannel *) = 0;

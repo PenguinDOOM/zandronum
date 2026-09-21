@@ -877,6 +877,16 @@ static void CalcPolyobjSoundOrg(const FPolyObj *poly, fixed_t *x, fixed_t *y, fi
 //
 //==========================================================================
 
+static int S_MakeStartFlags(int chanflags)
+{
+	int startflags = 0;
+	if (chanflags & CHAN_LOOP) startflags |= SNDF_LOOP;
+	if (chanflags & CHAN_AREA) startflags |= SNDF_AREA;
+	if (chanflags & (CHAN_UI|CHAN_NOPAUSE)) startflags |= SNDF_NOPAUSE;
+	if (chanflags & CHAN_UI) startflags |= SNDF_NOREVERB;
+	return startflags;
+}
+
 static FSoundChan *S_StartSound(AActor *actor, const sector_t *sec, const FPolyObj *poly,
 	const FVector3 *pt, int channel, FSoundID sound_id, float volume, float attenuation,
 	FRolloffInfo *forcedrolloff=NULL)
@@ -1138,11 +1148,7 @@ static FSoundChan *S_StartSound(AActor *actor, const sector_t *sec, const FPolyO
 	}
 	else 
 	{
-		int startflags = 0;
-		if (chanflags & CHAN_LOOP) startflags |= SNDF_LOOP;
-		if (chanflags & CHAN_AREA) startflags |= SNDF_AREA;
-		if (chanflags & (CHAN_UI|CHAN_NOPAUSE)) startflags |= SNDF_NOPAUSE;
-		if (chanflags & CHAN_UI) startflags |= SNDF_NOREVERB;
+		int startflags = S_MakeStartFlags(chanflags);
 
 		if (attenuation > 0)
 		{
@@ -1158,7 +1164,8 @@ static FSoundChan *S_StartSound(AActor *actor, const sector_t *sec, const FPolyO
 	if (chan == NULL && (chanflags & CHAN_LOOP))
 	{
 		chan = (FSoundChan*)S_GetChannel(NULL);
-		GSnd->MarkStartTime(chan);
+		int startflags = S_MakeStartFlags(chanflags);
+		GSnd->MarkVirtualStart(chan, sfx->data, pitch, startflags);
 		chanflags |= CHAN_EVICTED;
 	}
 	if (attenuation > 0)
