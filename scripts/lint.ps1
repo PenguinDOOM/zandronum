@@ -130,7 +130,9 @@ function Save-LintEvidenceState {
         [hashtable]$Contexts,
         [object[]]$VerifiedGeneratedBundle,
         [object]$CacheIdentity = $null,
-        [hashtable]$CachePaths = @{}
+        [hashtable]$CachePaths = @{},
+        [string]$HeadCommit = '',
+        [string]$BaseCommit = ''
     )
 
     if ($null -eq $Evidence) {
@@ -154,13 +156,15 @@ function Save-LintEvidenceState {
         Baseline = @($BaselineProjects | ForEach-Object { [PSCustomObject]@{ Target = $_.RelativeProject; TranslationUnits = @($_.Sources.Keys | Sort-Object) } })
         Contexts = $Contexts
         GeneratedBundle = $VerifiedGeneratedBundle
+        Revisions = [PSCustomObject]@{ Head = $HeadCommit; Baseline = $BaseCommit }
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Evidence.Root 'analysis-context.json') -NoNewline
 
     $cacheInputRoot = Join-Path $Evidence.Root 'cache-inputs'
     New-Item -ItemType Directory -Force -Path $cacheInputRoot | Out-Null
     if ($null -ne $CacheIdentity) {
         $CacheIdentity | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $cacheInputRoot 'identity.json') -NoNewline
-        foreach ($configuration in @($CacheIdentity.AnalysisContext.AnalyzerConfigurations)) {
+        $identities = if ($CacheIdentity -is [hashtable]) { @($CacheIdentity.Values) } else { @($CacheIdentity) }
+        foreach ($configuration in @($identities | ForEach-Object { $_.Context.AnalysisContext.AnalyzerConfigurations })) {
             $configurationPath = [string]$configuration.Path
             if (-not [string]::IsNullOrWhiteSpace($configurationPath) -and (Test-Path -LiteralPath $configurationPath -PathType Leaf)) {
                 $snapshotName = ('{0}-{1}' -f $configuration.SHA256, (Split-Path -Leaf $configurationPath))
@@ -1561,7 +1565,8 @@ function Invoke-CppcheckProject {
         [string]$TargetName,
         [string]$TranslationUnit,
         [int]$CppcheckJobs,
-        [object]$Evidence = $null
+        [object]$Evidence = $null,
+        [bool]$UseProjectConfiguration = $true
     )
 
     New-Item -ItemType Directory -Force -Path $CachePath | Out-Null
@@ -1569,7 +1574,6 @@ function Invoke-CppcheckProject {
     $template = '{file}' + "`t" + '{line}' + "`t" + '{column}' + "`t" + '{severity}' + "`t" + '{id}' + "`t" + '{message}'
     $arguments = @(
         "--project=$ProjectPath"
-        "--project-configuration=Release|x64"
         "--enable=warning,performance,portability"
         "--error-exitcode=1"
         "--cppcheck-build-dir=$CachePath"
@@ -1580,6 +1584,10 @@ function Invoke-CppcheckProject {
         "-j"
         "$CppcheckJobs"
     )
+
+    if ($UseProjectConfiguration) {
+        $arguments += '--project-configuration=Release|x64'
+    }
 
     $result = Invoke-LintChild -Path $CppcheckPath -Arguments $arguments -Label "cppcheck-$TargetName-$TranslationUnit" -Evidence $Evidence
     $output = $result.Output
@@ -1725,21 +1733,8 @@ if (-not (Test-Path -LiteralPath $cacheFile -PathType Leaf)) {
 }
 
 $toolsetSetting = Get-CMakeCacheSetting -CachePath $cacheFile -Name 'CMAKE_GENERATOR_TOOLSET'
-$analysisContext = Get-CppcheckAnalysisContext `
-    -BuildRoot $analysisBuildRoot `
-    -ProjectPaths @(Get-ChildItem -LiteralPath $analysisBuildRoot -Filter *.vcxproj -File -Recurse | ForEach-Object { $_.FullName }) `
-    -InputRootIdentities @($(if ($null -eq $inputManifestData) { 'regression-live-worktree' } else { 'regression-fixed-manifest-stage' })) `
-    -AnalyzerConfigurationPaths (@($PSCommandPath, (Join-Path $PSScriptRoot 'cppcheck-cache.ps1'), (Join-Path $PSScriptRoot 'cppcheck-vendor-dispositions.json')) + @(Get-CppcheckInstalledConfigurationPaths -AnalyzerPath $cppcheck.Source)) `
-    -AnalyzerOptions @('--project-configuration=Release|x64', '--enable=warning,performance,portability', '--error-exitcode=1', '--debug-analyzerinfo', '--template=tabular', '--quiet', "-j=$CppcheckJobs")
-$cacheIdentity = Get-CppcheckCacheIdentity `
-    -AnalyzerVersion $cppcheckVersion[0] `
-    -AnalyzerSHA256 $cppcheckSHA256 `
-    -InputMode $(if ($null -eq $inputManifestData) { 'normal' } else { 'input-manifest' }) `
-    -Toolset $(if ($toolsetSetting -and -not [string]::IsNullOrWhiteSpace($toolsetSetting.Value)) { $toolsetSetting.Value } else { 'v143' }) `
-    -RootIdentity $(if ($null -eq $inputManifestData) { 'regression-live-worktree' } else { 'regression-fixed-manifest-stage' }) `
-    -AnalysisContext $analysisContext
-Save-CppcheckCacheIdentity -CacheRoot $cppcheckCacheRoot -Namespace 'regression' -Identity $cacheIdentity
 $cachePaths = @{}
+$cacheIdentities = @{}
 
 $changedFiles = @()
 
@@ -1922,15 +1917,38 @@ try {
     }
 
     Write-Host "Cppcheck context and full translation-unit equality: confirmed for $($analysisProjects.Count) target(s)."
-    Save-LintEvidenceState -Evidence $evidence -AnalysisBuildRoot $analysisBuildRoot -BaselineBuildRoot $baselineBuildRoot -TempRoot $tempRoot -AnalysisProjects $analysisProjects -BaselineProjects $baselineProjects -Contexts $vendorDispositionContexts -VerifiedGeneratedBundle $verifiedGeneratedBundle -CacheIdentity $cacheIdentity.Context -CachePaths $cachePaths
+    Save-LintEvidenceState -Evidence $evidence -AnalysisBuildRoot $analysisBuildRoot -BaselineBuildRoot $baselineBuildRoot -TempRoot $tempRoot -AnalysisProjects $analysisProjects -BaselineProjects $baselineProjects -Contexts $vendorDispositionContexts -VerifiedGeneratedBundle $verifiedGeneratedBundle -CacheIdentity $cacheIdentities -CachePaths $cachePaths -HeadCommit $headCommit -BaseCommit $baseCommit
     Write-Host "Running isolated Cppcheck analysis for $($analysisProjects.Count) target(s):"
 
     foreach ($project in $analysisProjects) {
         $targetName = $project.RelativeProject
+        $analysisProjectContext = Get-CppcheckVendorDispositionContext `
+            -ProjectPath $project.ProjectPath `
+            -TargetName $targetName `
+            -AnalyzerVersion $cppcheckVersion[0]
+        $headContext = Get-CppcheckRegressionAnalysisContext `
+            -BuildRoot $analysisBuildRoot `
+            -RepositoryRoot $analysisRepositoryRoot `
+            -ProjectPath $project.ProjectPath `
+            -InputRootIdentities @($(if ($null -eq $inputManifestData) { 'regression-live-worktree' } else { 'regression-fixed-manifest-stage' })) `
+            -AnalyzerConfigurationPaths (Get-CppcheckInstalledConfigurationPaths -AnalyzerPath $cppcheck.Source) `
+            -AnalyzerOptions @('--project-configuration=Release|x64', '--enable=warning,performance,portability')
+        $headIdentity = Get-CppcheckCacheIdentity `
+            -AnalyzerVersion $cppcheckVersion[0] `
+            -AnalyzerSHA256 $cppcheckSHA256 `
+            -InputMode $(if ($null -eq $inputManifestData) { 'normal' } else { 'input-manifest' }) `
+            -Configuration $analysisProjectContext.Configuration `
+            -Compiler $analysisProjectContext.Compiler `
+            -Toolset $analysisProjectContext.Toolset `
+            -Abi $analysisProjectContext.Abi `
+            -RootIdentity $(if ($null -eq $inputManifestData) { 'regression-live-worktree' } else { 'regression-fixed-manifest-stage' }) `
+            -AnalysisContext $headContext
+        $cacheIdentities["head/$targetName"] = $headIdentity
+        Save-CppcheckCacheIdentity -CacheRoot $cppcheckCacheRoot -Namespace 'regression' -Identity $headIdentity
         Write-Host "  $targetName"
 
         foreach ($translationUnit in $project.Files) {
-            $headCache = Get-CppcheckCacheLeaf -CacheRoot $cppcheckCacheRoot -Namespace 'regression' -Identity $cacheIdentity -Role 'head' -TargetName ($targetName + '|project:' + (Get-FileHash -LiteralPath $project.ProjectPath -Algorithm SHA256).Hash) -TranslationUnit $translationUnit
+            $headCache = Get-CppcheckCacheLeaf -CacheRoot $cppcheckCacheRoot -Namespace 'regression' -Identity $headIdentity -Role 'head' -TargetName $targetName -TranslationUnit $translationUnit
             $cachePaths["head/$targetName/$translationUnit"] = $headCache
             [void]$headDiagnostics.AddRange(@(Invoke-CppcheckProject `
                 -CppcheckPath $cppcheck.Source `
@@ -1947,8 +1965,31 @@ try {
         $baselineProject = $baselineProjectsByTarget[$targetName]
 
         if ($baselineProject) {
+            $baselineProjectContext = Get-CppcheckVendorDispositionContext `
+                -ProjectPath $baselineProject.ProjectPath `
+                -TargetName $targetName `
+                -AnalyzerVersion $cppcheckVersion[0]
+            $baselineCacheContext = Get-CppcheckRegressionAnalysisContext `
+                -BuildRoot $baselineBuildRoot `
+                -RepositoryRoot $baselineRoot `
+                -ProjectPath $baselineProject.ProjectPath `
+                -InputRootIdentities @($(if ($null -eq $inputManifestData) { 'regression-live-worktree' } else { 'regression-fixed-manifest-stage' })) `
+                -AnalyzerConfigurationPaths (Get-CppcheckInstalledConfigurationPaths -AnalyzerPath $cppcheck.Source) `
+                -AnalyzerOptions @('--project-configuration=Release|x64', '--enable=warning,performance,portability')
+            $baselineIdentity = Get-CppcheckCacheIdentity `
+                -AnalyzerVersion $cppcheckVersion[0] `
+                -AnalyzerSHA256 $cppcheckSHA256 `
+                -InputMode $(if ($null -eq $inputManifestData) { 'normal' } else { 'input-manifest' }) `
+                -Configuration $baselineProjectContext.Configuration `
+                -Compiler $baselineProjectContext.Compiler `
+                -Toolset $baselineProjectContext.Toolset `
+                -Abi $baselineProjectContext.Abi `
+                -RootIdentity $(if ($null -eq $inputManifestData) { 'regression-live-worktree' } else { 'regression-fixed-manifest-stage' }) `
+                -AnalysisContext $baselineCacheContext
+            $cacheIdentities["baseline/$targetName"] = $baselineIdentity
+            Save-CppcheckCacheIdentity -CacheRoot $cppcheckCacheRoot -Namespace 'regression' -Identity $baselineIdentity
             foreach ($translationUnit in @($baselineProject.Sources.Keys | Sort-Object)) {
-                $baselineCache = Get-CppcheckCacheLeaf -CacheRoot $cppcheckCacheRoot -Namespace 'regression' -Identity $cacheIdentity -Role (Join-Path 'baseline' $baseCommit) -TargetName ($targetName + '|project:' + (Get-FileHash -LiteralPath $baselineProject.ProjectPath -Algorithm SHA256).Hash) -TranslationUnit $translationUnit
+                $baselineCache = Get-CppcheckCacheLeaf -CacheRoot $cppcheckCacheRoot -Namespace 'regression' -Identity $baselineIdentity -Role 'baseline' -TargetName $targetName -TranslationUnit $translationUnit
                 $cachePaths["baseline/$baseCommit/$targetName/$translationUnit"] = $baselineCache
                 [void]$baselineDiagnostics.AddRange(@(Invoke-CppcheckProject `
                     -CppcheckPath $cppcheck.Source `
@@ -2015,7 +2056,7 @@ try {
     Write-Host "Cppcheck passed: no new diagnostic fingerprints."
     $finalization = Complete-LintFinalization `
         -SaveEvidenceAction {
-            Save-LintEvidenceState -Evidence $evidence -AnalysisBuildRoot $analysisBuildRoot -BaselineBuildRoot $baselineBuildRoot -TempRoot $tempRoot -AnalysisProjects $analysisProjects -BaselineProjects $baselineProjects -Contexts $vendorDispositionContexts -VerifiedGeneratedBundle $verifiedGeneratedBundle -CacheIdentity $cacheIdentity.Context -CachePaths $cachePaths
+            Save-LintEvidenceState -Evidence $evidence -AnalysisBuildRoot $analysisBuildRoot -BaselineBuildRoot $baselineBuildRoot -TempRoot $tempRoot -AnalysisProjects $analysisProjects -BaselineProjects $baselineProjects -Contexts $vendorDispositionContexts -VerifiedGeneratedBundle $verifiedGeneratedBundle -CacheIdentity $cacheIdentities -CachePaths $cachePaths -HeadCommit $headCommit -BaseCommit $baseCommit
         } `
         -CleanupAction {
             Complete-LintTemporaryCleanup -BaselineWorktreeCreated:$baselineWorktreeCreated -BaselineRoot $baselineRoot -TempRoot $tempRoot -CppcheckCacheRoot $cppcheckCacheRoot -StageName $(if ($null -eq $inputManifestData) { 'regression-normal' } else { 'regression-manifest' })

@@ -183,6 +183,48 @@ function Assert-FinalizationSuccessCleanupOnce {
     }
 }
 
+function Assert-LintEvidenceStateSnapshotsCacheConfigurations {
+    param([string]$FixtureRoot)
+
+    $sourceBuildRoot = Join-Path $FixtureRoot 'evidence-source-build'
+    $baselineBuildRoot = Join-Path $FixtureRoot 'evidence-baseline-build'
+    $evidenceRoot = Join-Path $FixtureRoot 'evidence-state'
+    $configurationPath = Join-Path $FixtureRoot 'evidence-std.cfg'
+    foreach ($buildRoot in @($sourceBuildRoot, $baselineBuildRoot)) {
+        New-Item -ItemType Directory -Force -Path $buildRoot | Out-Null
+        Set-Content -LiteralPath (Join-Path $buildRoot 'CMakeCache.txt') -Value 'fixture-cache' -NoNewline
+        Set-Content -LiteralPath (Join-Path $buildRoot 'fixture.vcxproj') -Value '<Project />' -NoNewline
+    }
+    Set-Content -LiteralPath $configurationPath -Value 'fixture configuration' -NoNewline
+    New-Item -ItemType Directory -Force -Path $evidenceRoot | Out-Null
+    @{ ScriptPath = 'lint.ps1'; ScriptSHA256 = 'script'; PolicyPath = 'policy.json'; PolicySHA256 = 'policy'; AnalyzerPath = 'cppcheck.exe'; AnalyzerSHA256 = 'analyzer'; AnalyzerVersion = 'Cppcheck fixture' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidenceRoot 'tool-provenance.json') -NoNewline
+
+    $cacheIdentity = [PSCustomObject]@{
+        Key = 'fixture-key'
+        Context = [PSCustomObject]@{
+            AnalysisContext = [PSCustomObject]@{
+                AnalyzerConfigurations = @([PSCustomObject]@{
+                    Path = $configurationPath
+                    SHA256 = (Get-FileHash -LiteralPath $configurationPath -Algorithm SHA256).Hash
+                })
+            }
+        }
+    }
+    $evidence = [PSCustomObject]@{ Root = $evidenceRoot }
+    Complete-LintFinalization `
+        -SaveEvidenceAction {
+            Save-LintEvidenceState -Evidence $evidence -AnalysisBuildRoot $sourceBuildRoot -BaselineBuildRoot $baselineBuildRoot -TempRoot $FixtureRoot -AnalysisProjects @() -BaselineProjects @() -Contexts @{} -VerifiedGeneratedBundle @() -CacheIdentity @{ 'head/fixture.vcxproj' = $cacheIdentity } -CachePaths @{} -HeadCommit 'head' -BaseCommit 'base'
+        } `
+        -CleanupAction {} `
+        -SaveResultAction { param($status, $exitCode, $errorMessage) Save-LintEvidenceResult -Evidence $evidence -Status $status -ExitCode $exitCode -Error $errorMessage } | Out-Null
+
+    $snapshotPath = Join-Path $evidenceRoot ('cache-inputs\{0}-evidence-std.cfg' -f $cacheIdentity.Context.AnalysisContext.AnalyzerConfigurations[0].SHA256)
+    $cacheContext = Get-Content -LiteralPath (Join-Path $evidenceRoot 'cache-context.json') -Raw | ConvertFrom-Json
+    if ((-not (Test-Path -LiteralPath $snapshotPath -PathType Leaf)) -or ($cacheContext.Identity.'head/fixture.vcxproj'.Key -ne 'fixture-key')) {
+        throw 'Lint evidence state did not snapshot analyzer configurations from cache identity contexts.'
+    }
+}
+
 function Assert-LintOuterFinalizationIntegration {
     $lintScript = Join-Path $PSScriptRoot 'lint.ps1'
     $tokens = $null
@@ -249,6 +291,97 @@ function Assert-ManifestDoesNotReconfigureBaseline {
     }
 }
 
+function Get-CppcheckCommandEvidence {
+    param([string]$EvidenceRoot)
+
+    $commandRoot = Join-Path $EvidenceRoot 'commands'
+    $rawPath = (Get-ChildItem -LiteralPath $commandRoot -Filter '*.raw.txt' | Sort-Object Name | Select-Object -Last 1).FullName
+    $invocationPath = (Get-ChildItem -LiteralPath $commandRoot -Filter '*.invocation.json' | Sort-Object Name | Select-Object -Last 1).FullName
+    return [PSCustomObject]@{
+        RawDiagnostics = @(Get-Content -LiteralPath $rawPath | Where-Object { $_ -match "`t\d+`t\d+`t" })
+        ExitCode = (Get-Content -LiteralPath $invocationPath -Raw | ConvertFrom-Json).ExitCode
+        RawOutput = Get-Content -LiteralPath $rawPath -Raw
+    }
+}
+
+function Assert-EqualCppcheckRunResult {
+    param(
+        [object[]]$ExpectedDiagnostics,
+        [object]$ExpectedEvidence,
+        [object[]]$ActualDiagnostics,
+        [object]$ActualEvidence,
+        [string]$Description
+    )
+
+    if (($ExpectedEvidence.ExitCode -ne $ActualEvidence.ExitCode) -or
+        (($ExpectedEvidence.RawDiagnostics -join "`n") -ne ($ActualEvidence.RawDiagnostics -join "`n")) -or
+        ((@($ExpectedDiagnostics | ConvertTo-Json -Compress -Depth 8) -join "`n") -ne (@($ActualDiagnostics | ConvertTo-Json -Compress -Depth 8) -join "`n"))) {
+        throw "Cppcheck $Description did not preserve raw diagnostic fields, multiplicity, or child exit code."
+    }
+}
+
+function Assert-NativeCppcheckCacheInvalidation {
+    param(
+        [string]$FixtureRoot,
+        [string]$CacheRoot
+    )
+
+    $cppcheck = Get-Command cppcheck -ErrorAction Stop
+    $buildRoot = Join-Path $FixtureRoot 'native-cache/build'
+    $sourceRoot = Join-Path $buildRoot 'src'
+    $sourcePath = Join-Path $sourceRoot 'sample.cpp'
+    $headerPath = Join-Path $sourceRoot 'sample.h'
+    $projectPath = Join-Path $buildRoot 'compile_commands.json'
+    $translationUnit = 'sample.cpp'
+    $evidenceRoot = Join-Path $FixtureRoot 'native-cache/evidence'
+    New-Item -ItemType Directory -Force -Path (Join-Path $evidenceRoot 'commands') | Out-Null
+    New-Item -ItemType Directory -Force -Path $sourceRoot | Out-Null
+    New-Item -ItemType Directory -Force -Path $buildRoot | Out-Null
+    Set-Content -LiteralPath (Join-Path $buildRoot 'CMakeCache.txt') -Value 'CMAKE_GENERATOR_TOOLSET:INTERNAL=v143' -NoNewline
+    Set-Content -LiteralPath $headerPath -Value '#define SAMPLE_OFFSET 0' -NoNewline
+    Set-Content -LiteralPath $sourcePath -Value ('#include "sample.h"' + "`n" + 'int main() { int value; return value + SAMPLE_OFFSET; }') -NoNewline
+    @(@{ directory = $sourceRoot; command = ('cl.exe /I"' + $sourceRoot + '" /c sample.cpp'); file = $sourcePath }) | ConvertTo-Json -Compress -AsArray | Set-Content -LiteralPath $projectPath -NoNewline
+
+    $identity = Get-CppcheckCacheIdentity -AnalyzerVersion (& $cppcheck.Source --version) -AnalyzerSHA256 (Get-FileHash -LiteralPath $cppcheck.Source -Algorithm SHA256).Hash -InputMode 'normal' -Toolset 'v143' -RootIdentity 'native-cache-fixture' -AnalysisContext (Get-CppcheckRegressionAnalysisContext -BuildRoot $buildRoot -RepositoryRoot $buildRoot -ProjectPath $projectPath -InputRootIdentities @('native-cache-fixture') -AnalyzerConfigurationPaths (Get-CppcheckInstalledConfigurationPaths -AnalyzerPath $cppcheck.Source) -AnalyzerOptions @('--project-configuration=Release|x64', '--enable=warning,performance,portability'))
+    $cachePath = Get-CppcheckCacheLeaf -CacheRoot $CacheRoot -Namespace 'regression' -Identity $identity -Role 'head' -TargetName 'compile_commands.json' -TranslationUnit $translationUnit
+    $freshCachePath = Get-CppcheckCacheLeaf -CacheRoot (Join-Path $FixtureRoot 'native-cache/fresh-cache') -Namespace 'regression' -Identity $identity -Role 'head' -TargetName 'compile_commands.json' -TranslationUnit $translationUnit
+    $evidence = [PSCustomObject]@{ Root = $evidenceRoot; Counter = 0 }
+    $global:generatedBundlePaths = @()
+    $global:utf8 = New-Object System.Text.UTF8Encoding $false
+
+    $cold = @(Invoke-CppcheckProject -CppcheckPath $cppcheck.Source -ProjectPath $projectPath -CachePath $cachePath -RepositoryRoot $buildRoot -BuildRoot $buildRoot -TargetName 'compile_commands.json' -TranslationUnit $translationUnit -CppcheckJobs 1 -Evidence $evidence -UseProjectConfiguration:$false)
+    $coldEvidence = Get-CppcheckCommandEvidence -EvidenceRoot $evidenceRoot
+    $warm = @(Invoke-CppcheckProject -CppcheckPath $cppcheck.Source -ProjectPath $projectPath -CachePath $cachePath -RepositoryRoot $buildRoot -BuildRoot $buildRoot -TargetName 'compile_commands.json' -TranslationUnit $translationUnit -CppcheckJobs 1 -Evidence $evidence -UseProjectConfiguration:$false)
+    $warmEvidence = Get-CppcheckCommandEvidence -EvidenceRoot $evidenceRoot
+    Assert-EqualCppcheckRunResult -ExpectedDiagnostics $cold -ExpectedEvidence $coldEvidence -ActualDiagnostics $warm -ActualEvidence $warmEvidence -Description 'fixture cold/warm route'
+
+    Set-Content -LiteralPath $sourcePath -Value ('#include "sample.h"' + "`n" + 'int main() { int value; return value + SAMPLE_OFFSET + 1; }') -NoNewline
+    $sourceChanged = @(Invoke-CppcheckProject -CppcheckPath $cppcheck.Source -ProjectPath $projectPath -CachePath $cachePath -RepositoryRoot $buildRoot -BuildRoot $buildRoot -TargetName 'compile_commands.json' -TranslationUnit $translationUnit -CppcheckJobs 1 -Evidence $evidence -UseProjectConfiguration:$false)
+    $sourceChangedEvidence = Get-CppcheckCommandEvidence -EvidenceRoot $evidenceRoot
+    if ($sourceChangedEvidence.RawOutput -match 'skipping analysis - loaded [0-9]+ cached finding\(s\)') { throw 'Native Cppcheck cache did not invalidate the edited source within its retained leaf.' }
+    $sourceFresh = @(Invoke-CppcheckProject -CppcheckPath $cppcheck.Source -ProjectPath $projectPath -CachePath $freshCachePath -RepositoryRoot $buildRoot -BuildRoot $buildRoot -TargetName 'compile_commands.json' -TranslationUnit $translationUnit -CppcheckJobs 1 -Evidence $evidence -UseProjectConfiguration:$false)
+    Assert-EqualCppcheckRunResult -ExpectedDiagnostics $sourceFresh -ExpectedEvidence (Get-CppcheckCommandEvidence -EvidenceRoot $evidenceRoot) -ActualDiagnostics $sourceChanged -ActualEvidence $sourceChangedEvidence -Description 'source invalidation against fresh cache'
+
+    Set-Content -LiteralPath $headerPath -Value '#define SAMPLE_OFFSET 2' -NoNewline
+    $headerChanged = @(Invoke-CppcheckProject -CppcheckPath $cppcheck.Source -ProjectPath $projectPath -CachePath $cachePath -RepositoryRoot $buildRoot -BuildRoot $buildRoot -TargetName 'compile_commands.json' -TranslationUnit $translationUnit -CppcheckJobs 1 -Evidence $evidence -UseProjectConfiguration:$false)
+    $headerChangedEvidence = Get-CppcheckCommandEvidence -EvidenceRoot $evidenceRoot
+    if ($headerChangedEvidence.RawOutput -match 'skipping analysis - loaded [0-9]+ cached finding\(s\)') { throw 'Native Cppcheck cache did not invalidate the edited header within its retained leaf.' }
+    $headerFresh = @(Invoke-CppcheckProject -CppcheckPath $cppcheck.Source -ProjectPath $projectPath -CachePath $freshCachePath -RepositoryRoot $buildRoot -BuildRoot $buildRoot -TargetName 'compile_commands.json' -TranslationUnit $translationUnit -CppcheckJobs 1 -Evidence $evidence -UseProjectConfiguration:$false)
+    Assert-EqualCppcheckRunResult -ExpectedDiagnostics $headerFresh -ExpectedEvidence (Get-CppcheckCommandEvidence -EvidenceRoot $evidenceRoot) -ActualDiagnostics $headerChanged -ActualEvidence $headerChangedEvidence -Description 'header invalidation against fresh cache'
+}
+
+function Save-NativeCppcheckCacheEvidence {
+    param([string]$FixtureRoot)
+
+    $repositoryRoot = Split-Path -Parent $PSScriptRoot
+    $evidenceRoot = Join-Path $repositoryRoot 'completes/lint-cache-key-reuse'
+    $runRoot = Join-Path $evidenceRoot ('native-cache-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $runRoot | Out-Null
+    Copy-Item -LiteralPath (Join-Path $FixtureRoot 'native-cache/evidence') -Destination (Join-Path $runRoot 'isolated-fixture') -Recurse
+    Copy-Item -LiteralPath (Join-Path $FixtureRoot 'real-project-evidence') -Destination (Join-Path $runRoot 'generated-project') -Recurse
+    Copy-Item -LiteralPath (Join-Path $FixtureRoot 'native-cache/build/compile_commands.json') -Destination (Join-Path $runRoot 'compile_commands.json')
+}
+
 function Assert-RealCppcheckProjectCacheRoute {
     param(
         [string]$FixtureRoot,
@@ -266,23 +399,173 @@ function Assert-RealCppcheckProjectCacheRoute {
     }
     New-Item -ItemType Directory -Force -Path (Join-Path $evidenceRoot 'commands') | Out-Null
 
-    $analysisContext = Get-CppcheckAnalysisContext -BuildRoot $buildRoot -ProjectPaths @($projectPath) -InputRootIdentities @('regression-live-worktree') -AnalyzerConfigurationPaths @((Join-Path $PSScriptRoot 'lint.ps1'), (Join-Path $PSScriptRoot 'cppcheck-cache.ps1'), (Join-Path $PSScriptRoot 'cppcheck-vendor-dispositions.json')) -AnalyzerOptions @('--project-configuration=Release|x64', '--enable=warning,performance,portability', '--error-exitcode=1', '--debug-analyzerinfo', '--template=tabular', '--quiet', '-j=1')
+    $analysisContext = Get-CppcheckRegressionAnalysisContext -BuildRoot $buildRoot -RepositoryRoot $repositoryRoot -ProjectPath $projectPath -InputRootIdentities @('regression-live-worktree') -AnalyzerConfigurationPaths (Get-CppcheckInstalledConfigurationPaths -AnalyzerPath $cppcheck.Source) -AnalyzerOptions @('--project-configuration=Release|x64', '--enable=warning,performance,portability')
     $identity = Get-CppcheckCacheIdentity -AnalyzerVersion (& $cppcheck.Source --version) -AnalyzerSHA256 (Get-FileHash -LiteralPath $cppcheck.Source -Algorithm SHA256).Hash -InputMode 'normal' -Toolset 'v143' -RootIdentity 'regression-live-worktree' -AnalysisContext $analysisContext
-    $cachePath = Get-CppcheckCacheLeaf -CacheRoot $CacheRoot -Namespace 'regression' -Identity $identity -Role 'head' -TargetName ('probe.vcxproj|project:' + (Get-FileHash -LiteralPath $projectPath -Algorithm SHA256).Hash) -TranslationUnit $translationUnit
+    $cachePath = Get-CppcheckCacheLeaf -CacheRoot $CacheRoot -Namespace 'regression' -Identity $identity -Role 'head' -TargetName 'src/zdoom.vcxproj' -TranslationUnit $translationUnit
     $evidence = [PSCustomObject]@{ Root = $evidenceRoot; Counter = 0 }
     $global:generatedBundlePaths = @()
     $global:utf8 = New-Object System.Text.UTF8Encoding $false
 
     $cold = @(Invoke-CppcheckProject -CppcheckPath $cppcheck.Source -ProjectPath $projectPath -CachePath $cachePath -RepositoryRoot $repositoryRoot -BuildRoot $buildRoot -TargetName 'src/zdoom.vcxproj' -TranslationUnit $translationUnit -CppcheckJobs 1 -Evidence $evidence)
-    $warm = @(Invoke-CppcheckProject -CppcheckPath $cppcheck.Source -ProjectPath $projectPath -CachePath $cachePath -RepositoryRoot $repositoryRoot -BuildRoot $buildRoot -TargetName 'src/zdoom.vcxproj' -TranslationUnit $translationUnit -CppcheckJobs 1 -Evidence $evidence)
+    $coldEvidence = Get-CppcheckCommandEvidence -EvidenceRoot $evidenceRoot
+    $warm = @(Invoke-CppcheckProject -CppcheckPath $cppcheck.Source -ProjectPath $projectPath -CachePath $cachePath -RepositoryRoot $repositoryRoot -BuildRoot $buildRoot -TargetName 'src/zdoom.vcxproj' -TranslationUnit $translationUnit -CppcheckJobs 2 -Evidence $evidence)
+    $warmEvidence = Get-CppcheckCommandEvidence -EvidenceRoot $evidenceRoot
 
-    if ((@($cold | ForEach-Object Fingerprint) -join '|') -ne (@($warm | ForEach-Object Fingerprint) -join '|')) {
-        throw 'Real Cppcheck project route did not preserve diagnostic fingerprints.'
+    Assert-EqualCppcheckRunResult -ExpectedDiagnostics $cold -ExpectedEvidence $coldEvidence -ActualDiagnostics $warm -ActualEvidence $warmEvidence -Description 'cold/warm route'
+
+    if ($warmEvidence.RawOutput -notmatch 'skipping analysis - loaded [0-9]+ cached finding\(s\)') {
+        throw 'Real Cppcheck project route did not report a native warm-cache hit.'
+    }
+}
+
+function Assert-ProductionRegressionCacheLeafExcludesGateControls {
+    param(
+        [string]$FixtureRoot,
+        [string]$CacheRoot
+    )
+
+    $lintScript = Join-Path $PSScriptRoot 'lint.ps1'
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($lintScript, [ref]$tokens, [ref]$errors)
+    if ($errors.Count -ne 0) { throw "Could not parse lint.ps1: $($errors[0].Message)" }
+
+    $productionNodes = @{}
+    foreach ($name in @('headContext', 'headIdentity', 'headCache', 'baselineCacheContext', 'baselineIdentity', 'baselineCache')) {
+        $matches = @($ast.FindAll({
+                    param($node)
+                    ($node -is [System.Management.Automation.Language.AssignmentStatementAst])
+                }, $true) | Where-Object { $_.Left -is [System.Management.Automation.Language.VariableExpressionAst] } )
+        $matches = @($matches | Where-Object { $_.Left.VariablePath.UserPath -eq $name })
+        if ($matches.Count -ne 1) { throw "lint.ps1 does not retain exactly one production assignment for '$name'." }
+        $productionNodes[$name] = [scriptblock]::Create($matches[0].Extent.Text)
     }
 
-    $warmRaw = Get-Content -LiteralPath (Get-ChildItem -LiteralPath (Join-Path $evidenceRoot 'commands') -Filter '*.raw.txt' | Sort-Object Name | Select-Object -Last 1).FullName -Raw
-    if ($warmRaw -notmatch 'skipping analysis - loaded [0-9]+ cached finding\(s\)') {
-        throw 'Real Cppcheck project route did not report a native warm-cache hit.'
+    $scenarioRoot = Join-Path $FixtureRoot 'excluded-key-inputs'
+    $buildRoot = Join-Path $scenarioRoot 'build'
+    $projectPath = Join-Path $buildRoot 'fixture.vcxproj'
+    $configurationPath = Join-Path $scenarioRoot 'std.cfg'
+    $analyzerPath = Join-Path $scenarioRoot 'cppcheck.exe'
+    $scriptPath = Join-Path $scenarioRoot 'lint-script.ps1'
+    $policyPath = Join-Path $scenarioRoot 'vendor-policy.json'
+    New-Item -ItemType Directory -Force -Path $buildRoot | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $scenarioRoot 'cfg') | Out-Null
+    Set-Content -LiteralPath (Join-Path $buildRoot 'CMakeCache.txt') -Value 'CMAKE_GENERATOR_TOOLSET:INTERNAL=v143' -NoNewline
+    Set-Content -LiteralPath $projectPath -Value '<Project><PropertyGroup><PlatformToolset>v143</PlatformToolset></PropertyGroup></Project>' -NoNewline
+    Set-Content -LiteralPath $configurationPath -Value 'fixture configuration' -NoNewline
+    Set-Content -LiteralPath $analyzerPath -Value 'fixture analyzer' -NoNewline
+    Set-Content -LiteralPath (Join-Path $scenarioRoot 'cfg\std.cfg') -Value 'fixture standard library' -NoNewline
+    $baselineScriptContent = 'Write-Host baseline-script'
+    $baselinePolicyContent = '{"SchemaVersion":1,"Dispositions":[]}'
+    Set-Content -LiteralPath $scriptPath -Value $baselineScriptContent -NoNewline
+    Set-Content -LiteralPath $policyPath -Value $baselinePolicyContent -NoNewline
+
+    $newScenario = {
+        param(
+            [string]$BaselineRevision,
+            [int]$Jobs,
+            [string]$DisplayTemplate,
+            [int]$ErrorExitCode
+        )
+
+        [PSCustomObject]@{
+            InvocationAndEvidenceInputs = [PSCustomObject]@{
+                ScriptPath = $scriptPath
+                ScriptSHA256 = (Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256).Hash
+                PolicyPath = $policyPath
+                PolicySHA256 = (Get-FileHash -LiteralPath $policyPath -Algorithm SHA256).Hash
+                CppcheckJobs = $Jobs
+                DisplayTemplate = $DisplayTemplate
+                ErrorExitCode = $ErrorExitCode
+                BaselineRevision = $BaselineRevision
+            }
+        }
+    }
+    $getLeaves = {
+        param([object]$Scenario)
+
+        $analysisBuildRoot = $buildRoot
+        $baselineBuildRoot = $buildRoot
+        $cppcheckCacheRoot = $CacheRoot
+        $analysisRepositoryRoot = $scenarioRoot
+        $baselineRoot = $scenarioRoot
+        $project = [PSCustomObject]@{ ProjectPath = $projectPath }
+        $baselineProject = [PSCustomObject]@{ ProjectPath = $projectPath }
+        $analysisProjectContext = [PSCustomObject]@{ Configuration = 'Release|x64'; Compiler = 'MSVC'; Toolset = 'v143'; Abi = 'x64' }
+        $baselineProjectContext = [PSCustomObject]@{ Configuration = 'Release|x64'; Compiler = 'MSVC'; Toolset = 'v143'; Abi = 'x64' }
+        $targetName = 'fixture.vcxproj'
+        $translationUnit = 'fixture.cpp'
+        $cppcheck = [PSCustomObject]@{ Source = $analyzerPath }
+        $cppcheckVersion = @('Cppcheck fixture')
+        $cppcheckSHA256 = ('a' * 64)
+        $inputManifestData = $null
+        $CppcheckJobs = $Scenario.InvocationAndEvidenceInputs.CppcheckJobs
+        $baseCommit = $Scenario.InvocationAndEvidenceInputs.BaselineRevision
+        $vendorDispositionPolicy = $Scenario.InvocationAndEvidenceInputs.PolicyPath
+        $scriptContent = Get-Content -LiteralPath $Scenario.InvocationAndEvidenceInputs.ScriptPath -Raw
+        $policyContent = Get-Content -LiteralPath $vendorDispositionPolicy -Raw
+
+        . $productionNodes.headContext
+        . $productionNodes.headIdentity
+        . $productionNodes.headCache
+        . $productionNodes.baselineCacheContext
+        . $productionNodes.baselineIdentity
+        . $productionNodes.baselineCache
+        [PSCustomObject]@{ Head = $headCache; Baseline = $baselineCache; HeadIdentity = $headIdentity; BaselineIdentity = $baselineIdentity }
+    }
+
+    $baselineRevisionOne = '1111111111111111111111111111111111111111'
+    $baselineRevisionTwo = '2222222222222222222222222222222222222222'
+    $baselineScenario = & $newScenario $baselineRevisionOne 1 'tabular' 1
+    $baselineLeaves = & $getLeaves $baselineScenario
+    $excludedFactorMutations = @(
+        [PSCustomObject]@{ Name = 'script file content'; Apply = { Set-Content -LiteralPath $scriptPath -Value 'Write-Host changed-script' -NoNewline }; Create = { & $newScenario $baselineRevisionOne 1 'tabular' 1 } },
+        [PSCustomObject]@{ Name = 'policy file content'; Apply = { Set-Content -LiteralPath $policyPath -Value '{"SchemaVersion":1,"Dispositions":[{"Reason":"changed"}]}' -NoNewline }; Create = { & $newScenario $baselineRevisionOne 1 'tabular' 1 } },
+        [PSCustomObject]@{ Name = 'job count'; Apply = {}; Create = { & $newScenario $baselineRevisionOne 2 'tabular' 1 } },
+        [PSCustomObject]@{ Name = 'display and exit controls'; Apply = {}; Create = { & $newScenario $baselineRevisionOne 1 'verbose-tabular' 9 } },
+        [PSCustomObject]@{ Name = 'baseline revision'; Apply = {}; Create = { & $newScenario $baselineRevisionTwo 1 'tabular' 1 } }
+    )
+    foreach ($mutation in $excludedFactorMutations) {
+        Set-Content -LiteralPath $scriptPath -Value $baselineScriptContent -NoNewline
+        Set-Content -LiteralPath $policyPath -Value $baselinePolicyContent -NoNewline
+        & $mutation.Apply
+        $changedScenario = & $mutation.Create
+        $changedLeaves = & $getLeaves $changedScenario
+        if (($changedLeaves.Head -ne $baselineLeaves.Head) -or ($changedLeaves.Baseline -ne $baselineLeaves.Baseline)) {
+            throw "Production regression cache leaves changed for excluded factor '$($mutation.Name)'."
+        }
+        if (($changedScenario.InvocationAndEvidenceInputs | ConvertTo-Json -Compress) -eq ($baselineScenario.InvocationAndEvidenceInputs | ConvertTo-Json -Compress)) {
+            throw "Excluded-factor scenario '$($mutation.Name)' did not vary a full invocation or evidence input."
+        }
+        if (($mutation.Name -eq 'baseline revision') -and ($changedScenario.InvocationAndEvidenceInputs.BaselineRevision -eq $baselineScenario.InvocationAndEvidenceInputs.BaselineRevision)) {
+            throw 'Baseline revision scenario did not vary its recorded provenance input.'
+        }
+        if (($mutation.Name -eq 'script file content') -and ($changedScenario.InvocationAndEvidenceInputs.ScriptSHA256 -eq $baselineScenario.InvocationAndEvidenceInputs.ScriptSHA256)) {
+            throw 'Script scenario did not vary its actual file-content hash.'
+        }
+        if (($mutation.Name -eq 'policy file content') -and ($changedScenario.InvocationAndEvidenceInputs.PolicySHA256 -eq $baselineScenario.InvocationAndEvidenceInputs.PolicySHA256)) {
+            throw 'Policy scenario did not vary its actual file-content hash.'
+        }
+    }
+
+    $negativeHeadCache = [scriptblock]::Create(($productionNodes.headCache.ToString() -replace "-Role 'head'", '-Role $baseCommit'))
+    $baseCommit = $baselineRevisionTwo
+    $analysisBuildRoot = $buildRoot
+    $cppcheckCacheRoot = $CacheRoot
+    $analysisRepositoryRoot = $scenarioRoot
+    $project = [PSCustomObject]@{ ProjectPath = $projectPath }
+    $analysisProjectContext = [PSCustomObject]@{ Configuration = 'Release|x64'; Compiler = 'MSVC'; Toolset = 'v143'; Abi = 'x64' }
+    $targetName = 'fixture.vcxproj'
+    $translationUnit = 'fixture.cpp'
+    $cppcheck = [PSCustomObject]@{ Source = $analyzerPath }
+    $cppcheckVersion = @('Cppcheck fixture')
+    $cppcheckSHA256 = ('a' * 64)
+    $inputManifestData = $null
+    . $productionNodes.headContext
+    . $productionNodes.headIdentity
+    . $negativeHeadCache
+    if ($headCache -eq $baselineLeaves.Head) {
+        throw 'Production-node negative control did not detect base commit reintroduction into the cache leaf role.'
     }
 }
 
@@ -295,11 +578,13 @@ Import-LintFunction -Name 'Resolve-CppcheckBaselineTarget'
 Import-LintFunction -Name 'ConvertTo-ProductionCppcheckVendorDispositionContext'
 Import-LintFunction -Name 'Get-RequiredManifestProperty'
 Import-LintFunction -Name 'ConvertTo-SafeRelativePath'
+Import-LintFunction -Name 'Get-PathRelativeToRoot'
 Import-LintFunction -Name 'Get-ByteSHA256'
 Import-LintFunction -Name 'Convert-LFBytesToCRLFBytes'
 Import-LintFunction -Name 'Resolve-ApiRootRepresentation'
 Import-LintFunction -Name 'Get-ManifestApiRoots'
 Import-LintFunction -Name 'Assert-ApiRootBlobIdentity'
+Import-LintFunction -Name 'Save-LintEvidenceState'
 Import-LintFunction -Name 'Save-LintEvidenceResult'
 Import-LintFunction -Name 'Complete-LintFinalization'
 Import-LintFunction -Name 'Invoke-LintChild'
@@ -313,33 +598,55 @@ try {
     $contextProjectPath = Join-Path $contextBuildRoot 'fixture.vcxproj'
     $contextConfigurationPath = Join-Path $fixtureRoot 'cppcheck.cfg'
     New-Item -ItemType Directory -Force -Path $contextBuildRoot | Out-Null
-    Set-Content -LiteralPath (Join-Path $contextBuildRoot 'CMakeCache.txt') -Value @('CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022', 'CMAKE_GENERATOR_PLATFORM:INTERNAL=x64', 'CMAKE_GENERATOR_TOOLSET:INTERNAL=v143') -NoNewline
-    Set-Content -LiteralPath $contextProjectPath -Value '<Project><PropertyGroup><ProjectGuid>{A}</ProjectGuid><PlatformToolset>v143</PlatformToolset></PropertyGroup></Project>' -NoNewline
+    Set-Content -LiteralPath (Join-Path $contextBuildRoot 'CMakeCache.txt') -Value @('CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022', 'CMAKE_GENERATOR_PLATFORM:INTERNAL=x64', 'CMAKE_GENERATOR_TOOLSET:INTERNAL=v143', ('Zandronum_BINARY_DIR:STATIC={0}' -f $contextBuildRoot.Replace('\', '/'))) -NoNewline
+    Set-Content -LiteralPath $contextProjectPath -Value '<Project><PropertyGroup><ProjectGuid>{A}</ProjectGuid><PlatformToolset>v143</PlatformToolset></PropertyGroup><ProjectReference><Project>{A}</Project></ProjectReference></Project>' -NoNewline
     Set-Content -LiteralPath $contextConfigurationPath -Value 'fixture-one' -NoNewline
     $contextOne = Get-CppcheckAnalysisContext -BuildRoot $contextBuildRoot -ProjectPaths @($contextProjectPath) -InputRootIdentities @('fixture-root') -AnalyzerConfigurationPaths @($contextConfigurationPath) -AnalyzerOptions @('--enable=warning')
     $contextIdentityOne = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -RootIdentity 'fixture-root' -AnalysisContext $contextOne
-    Set-Content -LiteralPath $contextProjectPath -Value '<Project><PropertyGroup><ProjectGuid>{B}</ProjectGuid><PlatformToolset>v142</PlatformToolset></PropertyGroup></Project>' -NoNewline
+    Set-Content -LiteralPath (Join-Path $contextBuildRoot 'CMakeCache.txt') -Value @('CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022', 'CMAKE_GENERATOR_PLATFORM:INTERNAL=x64', 'CMAKE_GENERATOR_TOOLSET:INTERNAL=v143', ('Zandronum_BINARY_DIR:STATIC={0}' -f $contextBuildRoot)) -NoNewline
+    Set-Content -LiteralPath $contextProjectPath -Value '<Project><PropertyGroup><ProjectGuid>{B}</ProjectGuid><PlatformToolset>v143</PlatformToolset></PropertyGroup><ProjectReference><Project>{B}</Project></ProjectReference></Project>' -NoNewline
     $contextTwo = Get-CppcheckAnalysisContext -BuildRoot $contextBuildRoot -ProjectPaths @($contextProjectPath) -InputRootIdentities @('fixture-root') -AnalyzerConfigurationPaths @($contextConfigurationPath) -AnalyzerOptions @('--enable=warning')
     $contextIdentityTwo = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -RootIdentity 'fixture-root' -AnalysisContext $contextTwo
-    Set-Content -LiteralPath $contextConfigurationPath -Value 'fixture-two' -NoNewline
+    Set-Content -LiteralPath $contextProjectPath -Value '<Project><PropertyGroup><ProjectGuid>{B}</ProjectGuid><PlatformToolset>v142</PlatformToolset></PropertyGroup><ProjectReference><Project>{B}</Project></ProjectReference></Project>' -NoNewline
     $contextThree = Get-CppcheckAnalysisContext -BuildRoot $contextBuildRoot -ProjectPaths @($contextProjectPath) -InputRootIdentities @('fixture-root') -AnalyzerConfigurationPaths @($contextConfigurationPath) -AnalyzerOptions @('--enable=warning')
     $contextIdentityThree = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -RootIdentity 'fixture-root' -AnalysisContext $contextThree
-    if (($contextIdentityOne.Key -eq $contextIdentityTwo.Key) -or ($contextIdentityTwo.Key -eq $contextIdentityThree.Key)) { throw 'Cppcheck cache identity did not separate generated project or analyzer configuration changes.' }
+    Set-Content -LiteralPath $contextConfigurationPath -Value 'fixture-two' -NoNewline
+    $contextFour = Get-CppcheckAnalysisContext -BuildRoot $contextBuildRoot -ProjectPaths @($contextProjectPath) -InputRootIdentities @('fixture-root') -AnalyzerConfigurationPaths @($contextConfigurationPath) -AnalyzerOptions @('--enable=warning')
+    $contextIdentityFour = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -RootIdentity 'fixture-root' -AnalysisContext $contextFour
+    if (($contextIdentityOne.Key -eq $contextIdentityTwo.Key) -or ($contextIdentityTwo.Key -eq $contextIdentityThree.Key) -or ($contextIdentityThree.Key -eq $contextIdentityFour.Key)) { throw 'Cppcheck cache identity did not separate generated project or analyzer configuration changes.' }
+    Set-Content -LiteralPath (Join-Path $contextBuildRoot 'CMakeCache.txt') -Value @('CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022', 'CMAKE_GENERATOR_PLATFORM:INTERNAL=x64', 'CMAKE_GENERATOR_TOOLSET:INTERNAL=v143', ('Zandronum_BINARY_DIR:STATIC={0}' -f $contextBuildRoot.Replace('\', '/'))) -NoNewline
+    Set-Content -LiteralPath $contextProjectPath -Value '<Project><PropertyGroup><ProjectGuid>{A}</ProjectGuid><PlatformToolset>v143</PlatformToolset></PropertyGroup><ProjectReference><Project>{A}</Project></ProjectReference></Project>' -NoNewline
+    $regressionContextOne = Get-CppcheckRegressionAnalysisContext -BuildRoot $contextBuildRoot -RepositoryRoot $fixtureRoot -ProjectPath $contextProjectPath -InputRootIdentities @('fixture-root') -AnalyzerConfigurationPaths @($contextConfigurationPath) -AnalyzerOptions @('--enable=warning')
+    $regressionIdentityOne = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -RootIdentity 'fixture-root' -AnalysisContext $regressionContextOne
+    $unrelatedProjectPath = Join-Path $contextBuildRoot 'unrelated.vcxproj'
+    Set-Content -LiteralPath $unrelatedProjectPath -Value '<Project><PropertyGroup><ProjectGuid>{unrelated}</ProjectGuid></PropertyGroup></Project>' -NoNewline
+    Set-Content -LiteralPath (Join-Path $contextBuildRoot 'CMakeCache.txt') -Value @('CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022', 'CMAKE_GENERATOR_PLATFORM:INTERNAL=x64', 'CMAKE_GENERATOR_TOOLSET:INTERNAL=v143', ('Zandronum_BINARY_DIR:STATIC={0}' -f $contextBuildRoot)) -NoNewline
+    Set-Content -LiteralPath $contextProjectPath -Value '<Project><PropertyGroup><ProjectGuid>{B}</ProjectGuid><PlatformToolset>v143</PlatformToolset></PropertyGroup><ProjectReference><Project>{B}</Project></ProjectReference></Project>' -NoNewline
+    $regressionContextTwo = Get-CppcheckRegressionAnalysisContext -BuildRoot $contextBuildRoot -RepositoryRoot $fixtureRoot -ProjectPath $contextProjectPath -InputRootIdentities @('fixture-root') -AnalyzerConfigurationPaths @($contextConfigurationPath) -AnalyzerOptions @('--enable=warning')
+    $regressionIdentityTwo = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -RootIdentity 'fixture-root' -AnalysisContext $regressionContextTwo
+    Set-Content -LiteralPath $contextProjectPath -Value '<Project><PropertyGroup><ProjectGuid>{B}</ProjectGuid><PlatformToolset>v142</PlatformToolset></PropertyGroup><ProjectReference><Project>{B}</Project></ProjectReference></Project>' -NoNewline
+    $regressionContextThree = Get-CppcheckRegressionAnalysisContext -BuildRoot $contextBuildRoot -RepositoryRoot $fixtureRoot -ProjectPath $contextProjectPath -InputRootIdentities @('fixture-root') -AnalyzerConfigurationPaths @($contextConfigurationPath) -AnalyzerOptions @('--enable=warning')
+    $regressionIdentityThree = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -RootIdentity 'fixture-root' -AnalysisContext $regressionContextThree
+    if (($regressionContextOne.RegressionKeyVersion -ne 1) -or ($regressionIdentityOne.Key -ne $regressionIdentityTwo.Key) -or ($regressionIdentityTwo.Key -eq $regressionIdentityThree.Key)) { throw 'Regression cache key did not normalize generated GUIDs or separate target configuration changes.' }
     $cppcheck = Get-Command cppcheck -ErrorAction Stop
     $installedConfigurationPaths = @(Get-CppcheckInstalledConfigurationPaths -AnalyzerPath $cppcheck.Source)
     if (($installedConfigurationPaths.Count -ne 1) -or ((Split-Path -Leaf $installedConfigurationPaths[0]) -ne 'std.cfg')) { throw 'Cppcheck automatic standard-library configuration was not resolved.' }
     foreach ($failureKind in @('evidence', 'cleanup', 'evidence-save')) { Assert-FinalizationFailureProcess -FixtureRoot $fixtureRoot -FailureKind $failureKind }
     Assert-FinalizationSuccessCleanupOnce
+    Assert-LintEvidenceStateSnapshotsCacheConfigurations -FixtureRoot $fixtureRoot
     Assert-LintOuterFinalizationIntegration
     $normalIdentity = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -RootIdentity 'C:\fixture\source'
     $manifestIdentity = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'input-manifest' -RootIdentity 'fixed-regression-manifest-stage'
     $differentToolsetIdentity = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -Toolset 'v142' -RootIdentity 'C:\fixture\source'
     if (($normalIdentity.Key -eq $manifestIdentity.Key) -or ($normalIdentity.Key -eq $differentToolsetIdentity.Key)) { throw 'Cppcheck cache identity did not separate input mode or toolset.' }
     $headCache = Get-CppcheckCacheLeaf -CacheRoot $cacheFixtureRoot -Namespace 'regression' -Identity $normalIdentity -Role 'head' -TargetName 'src/zdoom.vcxproj' -TranslationUnit 'src/example.cpp'
-    $baseOneCache = Get-CppcheckCacheLeaf -CacheRoot $cacheFixtureRoot -Namespace 'regression' -Identity $normalIdentity -Role (Join-Path 'baseline' ('1' * 40)) -TargetName 'src/zdoom.vcxproj' -TranslationUnit 'src/example.cpp'
-    $baseTwoCache = Get-CppcheckCacheLeaf -CacheRoot $cacheFixtureRoot -Namespace 'regression' -Identity $normalIdentity -Role (Join-Path 'baseline' ('2' * 40)) -TargetName 'src/zdoom.vcxproj' -TranslationUnit 'src/example.cpp'
-    if (($headCache -eq $baseOneCache) -or ($baseOneCache -eq $baseTwoCache)) { throw 'Cppcheck cache paths did not separate head and complete baseline SHA namespaces.' }
+    $baseOneCache = Get-CppcheckCacheLeaf -CacheRoot $cacheFixtureRoot -Namespace 'regression' -Identity $normalIdentity -Role 'baseline' -TargetName 'src/zdoom.vcxproj' -TranslationUnit 'src/example.cpp'
+    $baseTwoCache = Get-CppcheckCacheLeaf -CacheRoot $cacheFixtureRoot -Namespace 'regression' -Identity $normalIdentity -Role 'baseline' -TargetName 'src/zdoom.vcxproj' -TranslationUnit 'src/example.cpp'
+    if (($headCache -eq $baseOneCache) -or ($baseOneCache -ne $baseTwoCache)) { throw 'Cppcheck cache paths did not retain fixed baseline and separate head roles.' }
+    Assert-NativeCppcheckCacheInvalidation -FixtureRoot $fixtureRoot -CacheRoot $cacheFixtureRoot
     Assert-RealCppcheckProjectCacheRoute -FixtureRoot $fixtureRoot -CacheRoot $cacheFixtureRoot
+    Assert-ProductionRegressionCacheLeafExcludesGateControls -FixtureRoot $fixtureRoot -CacheRoot $cacheFixtureRoot
+    Save-NativeCppcheckCacheEvidence -FixtureRoot $fixtureRoot
     $cacheLock = Enter-CppcheckCacheLock -CacheRoot $cacheFixtureRoot -Name 'fixture'
     try {
         Assert-ExpectedException -Expected 'already running' -Action { Enter-CppcheckCacheLock -CacheRoot $cacheFixtureRoot -Name 'fixture' | Out-Null }

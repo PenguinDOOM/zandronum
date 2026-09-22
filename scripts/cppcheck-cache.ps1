@@ -99,6 +99,62 @@ function Get-CppcheckAnalysisContext {
     }
 }
 
+function Get-CppcheckRegressionAnalysisContext {
+    param(
+        [string]$BuildRoot,
+        [string]$RepositoryRoot,
+        [string]$ProjectPath,
+        [string[]]$InputRootIdentities,
+        [string[]]$AnalyzerConfigurationPaths = @(),
+        [string[]]$AnalyzerOptions = @()
+    )
+
+    $fullBuildRoot = [System.IO.Path]::GetFullPath($BuildRoot).TrimEnd('\', '/')
+    $fullRepositoryRoot = [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\', '/')
+    $forwardSlashBuildRoot = $fullBuildRoot.Replace('\', '/')
+    $forwardSlashRepositoryRoot = $fullRepositoryRoot.Replace('\', '/')
+    $cachePath = Join-Path $fullBuildRoot 'CMakeCache.txt'
+    if (-not (Test-Path -LiteralPath $cachePath -PathType Leaf)) {
+        throw "Cppcheck regression analysis context requires '$cachePath'."
+    }
+
+    $normalizedCache = @(
+        Get-Content -LiteralPath $cachePath | Where-Object {
+            ($_ -notmatch '^(CMAKE_CACHEFILE_DIR|CMAKE_HOME_DIRECTORY|CMAKE_FILES_DIRECTORY|CMAKE_SUPPRESS_REGENERATION):') -and
+            ($_ -notmatch '^//') -and ($_ -notmatch '^#')
+        } | ForEach-Object {
+            $_.Replace($fullBuildRoot, '<build-root>').Replace($forwardSlashBuildRoot, '<build-root>').Replace($fullRepositoryRoot, '<repository-root>').Replace($forwardSlashRepositoryRoot, '<repository-root>')
+        } | Sort-Object
+    ) -join "`n"
+    $fullProjectPath = [System.IO.Path]::GetFullPath($ProjectPath)
+    $normalizedProject = (Get-Content -LiteralPath $fullProjectPath -Raw).
+        Replace($fullBuildRoot, '<build-root>').Replace($forwardSlashBuildRoot, '<build-root>').Replace($fullRepositoryRoot, '<repository-root>').Replace($forwardSlashRepositoryRoot, '<repository-root>') -replace '<ProjectGuid>[^<]+</ProjectGuid>', '<ProjectGuid><normalized></ProjectGuid>' -replace '<Project>\{[^<]+\}</Project>', '<Project>{normalized}</Project>' -replace 'Project="\{[^}]+\}"', 'Project="{normalized}"'
+    $configurationHashes = @(
+        $AnalyzerConfigurationPaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique | ForEach-Object {
+            $configurationPath = [System.IO.Path]::GetFullPath($_)
+            if (-not (Test-Path -LiteralPath $configurationPath -PathType Leaf)) {
+                throw "Cppcheck analyzer configuration '$configurationPath' does not exist."
+            }
+            [PSCustomObject]@{
+                Path = $configurationPath
+                SHA256 = (Get-FileHash -LiteralPath $configurationPath -Algorithm SHA256).Hash
+            }
+        }
+    )
+
+    return [PSCustomObject]@{
+        RegressionKeyVersion = 1
+        BuildCacheSHA256 = Get-CppcheckCacheHash -Value $normalizedCache
+        TargetProject = [PSCustomObject]@{
+            Project = $fullProjectPath.Substring($fullBuildRoot.Length).Replace('\', '/')
+            SHA256 = Get-CppcheckCacheHash -Value $normalizedProject
+        }
+        InputRoots = @($InputRootIdentities | Sort-Object -Unique)
+        AnalyzerConfigurations = $configurationHashes
+        AnalyzerOptions = @($AnalyzerOptions | Sort-Object -Unique)
+    }
+}
+
 function Get-CppcheckInstalledConfigurationPaths {
     param([string]$AnalyzerPath)
 
