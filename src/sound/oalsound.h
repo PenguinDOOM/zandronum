@@ -334,6 +334,7 @@ public:
 	bool NoReverb;
 	bool Is3D;
 	bool IsArea;
+	bool HeadRelative;
 	bool WasPlayingBeforePause;
 	unsigned int PauseReasons;
 	FRolloffInfo Rolloff;
@@ -523,7 +524,7 @@ private:
 	unsigned int CachePosition (OpenALChannel *channel);
 	void ApplyChannelGain (OpenALChannel *channel);
 	float CalculateRolloffGain (FRolloffInfo &rolloff, float distanceScale, SoundListener *listener, const FVector3 &position, float *distance) const;
-	void ApplySpatialState (OpenALChannel *channel, SoundListener *listener, const FVector3 &position, const FVector3 &velocity);
+	bool ApplySpatialState (OpenALChannel *channel, SoundListener *listener, const FVector3 &position, const FVector3 &velocity);
 	void DestroySound (OpenALSound *sound);
 	bool IsSourceReserved (unsigned int source) const;
 	void AdvanceClocks ();
@@ -546,12 +547,13 @@ private:
 	bool GetLogicalPosition (FISoundChannel *owner, unsigned int *position) const;
 	void InitializePauseState (OpenALChannel *channel);
 	void ApplyChannelPauseState (OpenALChannel *channel);
+	bool ApplyChannelRadius (OpenALChannel *channel, bool headRelative, bool updateStatus);
 	void ReleaseEFXResources ();
 	bool ApplyEFXEnvironment (const ReverbContainer *environment);
 	bool SetEFXSourceSend (unsigned int source, int slot, int send, int filter);
 	bool EnsureEFXSourceDry (unsigned int source);
 	bool ClearWaterFilter (OpenALChannel *channel);
-	bool ResetEFXSourceProperty (unsigned int source, OALenum property, int value, bool floating, OpenALEFXFailure failure);
+	bool ResetEFXSourceProperty (unsigned int source, OALenum property, int value, bool floating, OpenALEFXFailure failure, bool spatialRadius = false);
 	bool ResetEFXSource (unsigned int source);
 	bool ApplyChannelEFX (OpenALChannel *channel);
 	bool ApplyEFXEnvironmentToChannels ();
@@ -568,9 +570,13 @@ private:
 	void InjectStartFailureForTest ();
 	void InjectStartSetupFailureForTest ();
 	void InjectPositionQueryFailureForTest ();
+	void InjectSpatialStateFailureForTest ();
+	void InjectSpatialRadiusFailureForTest (bool persistent = false);
+	void ClearSpatialRadiusFailureForTest ();
 	void InjectEFXSourceFailureForTest (OpenALEFXFailure failure = OALEFXFAIL_WetSend, bool persistent = false, unsigned int source = 0);
 	void ClearEFXSourceFailureForTest ();
 	bool InjectEFXSourceFailure (unsigned int source, OpenALEFXFailure failure);
+	bool InjectSpatialRadiusFailure ();
 #endif
 
 	void *Device;
@@ -620,6 +626,11 @@ private:
 	bool FailNextStart;
 	bool FailNextStartSetup;
 	bool FailNextPositionQuery;
+	bool FailNextSpatialState;
+	bool FailNextSpatialRadius;
+	bool PersistentSpatialRadiusFailure;
+	unsigned int SpatialRadiusFailureCalls;
+	bool SpatialRadiusFailureCallLimitExceeded;
 	OpenALEFXFailure FailNextEFXSourceAssign;
 	bool PersistentEFXSourceFailure;
 	unsigned int FailEFXSourceAssignSource;

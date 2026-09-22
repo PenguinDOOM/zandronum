@@ -1497,6 +1497,13 @@ namespace
 			Check (renderer.LastEFXSource == stream->Source && renderer.LastEFXSlot == 0 && renderer.LastEFXSend == 0 &&
 				renderer.LastEFXFilter == 0 && renderer.LastEFXSourceError == AL_NO_ERROR,
 				"phase2 EFX routing keeps music streams dry");
+			if (renderer.Capabilities.RadiusAdvertised)
+			{
+				ALfloat radius = -1.f;
+				alGetSourcef (stream->Source, AL_SOURCE_RADIUS, &radius);
+				Check (alGetError () == AL_NO_ERROR && NearlyEqual (radius, 0.f),
+					"phase2 EFX routing resets advertised source radius for music streams");
+			}
 			delete stream;
 		}
 	}
@@ -1717,6 +1724,33 @@ namespace
 		listener.Environment = &environment;
 		renderer.UpdateListener (&listener);
 		Check (renderer.LastAppliedEnvironment == &environment, "phase2 EFX routing applies a selected environment");
+		if (renderer.Capabilities.RadiusAdvertised)
+		{
+			FISoundChannel *area = renderer.StartSound3D (sound, &listener, .5f, &rolloff, 1.f, 128, 0,
+				FVector3 (64.f, 0.f, 0.f), FVector3 (), 0, SNDF_LOOP | SNDF_AREA | SNDF_NOREVERB, NULL);
+			OpenALChannel *areaChannel = area == NULL ? NULL : (OpenALChannel *)area->SysChannel;
+			ALuint source = areaChannel == NULL ? 0 : areaChannel->Source;
+			ALfloat radius = -1.f;
+			if (areaChannel != NULL) alGetSourcef (source, AL_SOURCE_RADIUS, &radius);
+			Check (areaChannel != NULL && alGetError () == AL_NO_ERROR && NearlyEqual (radius, 32.f),
+				"phase2 EFX radius fixture starts an outside no-reverb area source");
+			environment.Modified = true;
+			listener.underwater = true;
+			renderer.UpdateListener (&listener);
+			if (areaChannel != NULL) alGetSourcef (source, AL_SOURCE_RADIUS, &radius);
+			Check (areaChannel != NULL && alGetError () == AL_NO_ERROR && NearlyEqual (radius, 32.f),
+				"phase2 EFX environment and water reapplication preserves outside area radius");
+			listener.underwater = false;
+			StopAndDrain (renderer, area);
+			ReleaseOwner (area);
+			FISoundChannel *reused = renderer.StartSound (sound, .5f, 128, 0, SNDF_LOOP, NULL);
+			if (reused != NULL) alGetSourcef (((OpenALChannel *)reused->SysChannel)->Source, AL_SOURCE_RADIUS, &radius);
+			Check (reused != NULL && alGetError () == AL_NO_ERROR && NearlyEqual (radius, 0.f),
+				"phase2 EFX reset clears radius when reusing a source");
+			StopAndDrain (renderer, reused);
+			ReleaseOwner (reused);
+			renderer.UpdateListener (&listener);
+		}
 		TestEFXEnvironmentSelectionAndContinuing2D (renderer, sound, listener, environment);
 		TestEFXSourceRoutingEligibility (renderer, sound, listener, rolloff);
 		TestEFXFailureRecoveryAndStreamRouting (renderer, sound, listener, environment);
@@ -2284,6 +2318,194 @@ namespace
 		ReleaseOwner (blocker);
 		ReleaseOwner (incoming);
 		renderer.SetSfxVolume (1.f);
+	}
+
+	void TestAreaRadiusBoundary (OpenALSoundRenderer &renderer, SoundListener &listener, FISoundChannel *channel)
+	{
+		const float distances[] = { 0.f, 16.f, 31.9f, 32.f, 32.1f, 64.f };
+		const float distanceScales[] = { .5f, 1.f, 2.f };
+		OpenALChannel *openalChannel = (OpenALChannel *)channel->SysChannel;
+		for (size_t scaleIndex = 0; scaleIndex < sizeof (distanceScales) / sizeof (distanceScales[0]); ++scaleIndex)
+		{
+			openalChannel->DistanceScale = distanceScales[scaleIndex];
+			for (size_t distanceIndex = 0; distanceIndex < sizeof (distances) / sizeof (distances[0]); ++distanceIndex)
+			{
+				float distance = distances[distanceIndex];
+				float expectedGain = .8f * std::max (0.f, 1.f - distance * distanceScales[scaleIndex] / 100.f);
+				FVector3 testPosition (listener.position.X + distance, listener.position.Y, listener.position.Z);
+				ALfloat values[3];
+				ALfloat gain;
+				ALint relative;
+				renderer.UpdateSoundParams3D (&listener, channel, true, testPosition, FVector3 ());
+				alGetSourcei (openalChannel->Source, AL_SOURCE_RELATIVE, &relative);
+				alGetSourcefv (openalChannel->Source, AL_POSITION, values);
+				alGetSourcef (openalChannel->Source, AL_GAIN, &gain);
+				Check (alGetError () == AL_NO_ERROR && relative == (distance <= 32.f ? AL_TRUE : AL_FALSE) && NearlyEqual (gain, expectedGain),
+					"area radius boundary preserves relative placement and manual gain for every distance scale");
+				CheckVector (values, distance <= 32.f ? 0.f : testPosition.X, distance <= 32.f ? 0.f : testPosition.Y,
+					distance <= 32.f ? 0.f : -testPosition.Z, "area radius boundary preserves Phase 1 position placement");
+				if (renderer.Capabilities.RadiusAdvertised)
+				{
+					ALfloat radius = -1.f;
+					alGetSourcef (openalChannel->Source, AL_SOURCE_RADIUS, &radius);
+					Check (alGetError () == AL_NO_ERROR && NearlyEqual (radius, distance <= 32.f ? 0.f : 32.f),
+						"area radius boundary applies radius only outside 32 world units");
+				}
+			}
+		}
+	}
+
+	void TestPointRadiusBoundary (OpenALSoundRenderer &renderer, SoundListener &listener, FISoundChannel *channel)
+	{
+		const float distances[] = { 0.f, 16.f, 31.9f, 32.f, 32.1f, 64.f };
+		const float distanceScales[] = { .5f, 1.f, 2.f };
+		OpenALChannel *openalChannel = (OpenALChannel *)channel->SysChannel;
+		for (size_t scaleIndex = 0; scaleIndex < sizeof (distanceScales) / sizeof (distanceScales[0]); ++scaleIndex)
+		{
+			openalChannel->DistanceScale = distanceScales[scaleIndex];
+			for (size_t distanceIndex = 0; distanceIndex < sizeof (distances) / sizeof (distances[0]); ++distanceIndex)
+			{
+				float distance = distances[distanceIndex];
+				float expectedGain = .8f * std::max (0.f, 1.f - distance * distanceScales[scaleIndex] / 100.f);
+				FVector3 testPosition (listener.position.X + distance, listener.position.Y, listener.position.Z);
+				ALfloat values[3];
+				ALfloat gain;
+				ALint relative;
+				renderer.UpdateSoundParams3D (&listener, channel, false, testPosition, FVector3 ());
+				alGetSourcei (openalChannel->Source, AL_SOURCE_RELATIVE, &relative);
+				alGetSourcefv (openalChannel->Source, AL_POSITION, values);
+				alGetSourcef (openalChannel->Source, AL_GAIN, &gain);
+				Check (alGetError () == AL_NO_ERROR && relative == (distance == 0.f ? AL_TRUE : AL_FALSE) && NearlyEqual (gain, expectedGain),
+					"point source radius boundary preserves relative placement and manual gain for every distance scale");
+				CheckVector (values, distance == 0.f ? 0.f : testPosition.X, distance == 0.f ? 0.f : testPosition.Y,
+					distance == 0.f ? 0.f : -testPosition.Z, "point source radius boundary preserves world position placement");
+				if (renderer.Capabilities.RadiusAdvertised)
+				{
+					ALfloat radius = -1.f;
+					alGetSourcef (openalChannel->Source, AL_SOURCE_RADIUS, &radius);
+					Check (alGetError () == AL_NO_ERROR && NearlyEqual (radius, 0.f), "point source radius remains zero");
+				}
+			}
+		}
+	}
+
+	void TestRadiusFailureAnd2DReuse (OpenALSoundRenderer &renderer, SoundListener &listener, FISoundChannel *channel, SoundHandle stereoSound)
+	{
+		OpenALChannel *openalChannel = (OpenALChannel *)channel->SysChannel;
+		ALuint releasedSource = openalChannel->Source;
+		if (renderer.Capabilities.RadiusAdvertised)
+		{
+			ALfloat values[3];
+			ALfloat radius = -1.f;
+			ALint relative;
+			renderer.UpdateSoundParams3D (&listener, channel, true, FVector3 (74.f, 20.f, 30.f), FVector3 ());
+			renderer.InjectEFXSourceFailureForTest (OALEFXFAIL_SourceRadius);
+			renderer.UpdateSoundParams3D (&listener, channel, true, FVector3 (75.f, 20.f, 30.f), FVector3 ());
+			alGetSourcei (releasedSource, AL_SOURCE_RELATIVE, &relative);
+			alGetSourcefv (releasedSource, AL_POSITION, values);
+			alGetSourcef (releasedSource, AL_SOURCE_RADIUS, &radius);
+			Check (!renderer.Capabilities.RadiusApplied && renderer.EFXFailure == OALEFXFAIL_SourceRadius && relative == AL_FALSE &&
+				alGetError () == AL_NO_ERROR && NearlyEqual (radius, 0.f), "rejected area radius falls back to zero without changing spatial placement");
+			CheckVector (values, 75.f, 20.f, -30.f, "rejected area radius keeps the area source positional");
+		}
+		StopAndDrain (renderer, channel);
+		ReleaseOwner (channel);
+		if (renderer.Capabilities.RadiusAdvertised)
+		{
+			FISoundChannel *twoD = renderer.StartSound (stereoSound, .8f, 128, 0, SNDF_LOOP, NULL);
+			ALfloat radius = -1.f;
+			ALuint reusedSource = twoD != NULL ? ((OpenALChannel *)twoD->SysChannel)->Source : 0;
+			if (twoD != NULL)
+			{
+				alGetSourcef (reusedSource, AL_SOURCE_RADIUS, &radius);
+			}
+			Check (twoD != NULL && reusedSource == releasedSource && alGetError () == AL_NO_ERROR && NearlyEqual (radius, 0.f),
+				"2D source reuse resets source radius to zero");
+			StopAndDrain (renderer, twoD);
+			ReleaseOwner (twoD);
+		}
+	}
+
+	void TestSpatialRadiusFailures (OpenALSoundRenderer &renderer, SoundHandle sound)
+	{
+		SoundListener listener;
+		FRolloffInfo rolloff = MakeLinearRolloff (0.f, 100.f);
+		size_t eventCount = Events.size ();
+		listener.valid = true;
+		listener.position = FVector3 (10.f, 20.f, 30.f);
+		renderer.InjectSpatialStateFailureForTest ();
+		Check (renderer.StartSound3D (sound, &listener, .8f, &rolloff, 1.f, 128, 0, FVector3 (74.f, 20.f, 30.f), FVector3 (),
+			0, SNDF_LOOP | SNDF_AREA, NULL) == NULL && renderer.ActiveChannels.empty () && Events.size () == eventCount,
+			"spatial boundary failure does not publish or end an unstarted 3D source");
+		if (!renderer.Capabilities.RadiusAdvertised)
+		{
+			return;
+		}
+		renderer.InjectSpatialRadiusFailureForTest (true);
+		Check (renderer.StartSound3D (sound, &listener, .8f, &rolloff, 1.f, 128, 0, FVector3 (74.f, 20.f, 30.f), FVector3 (),
+			0, SNDF_LOOP | SNDF_AREA, NULL) == NULL && !renderer.Capabilities.RadiusApplied &&
+			renderer.SpatialRadiusFailureCalls == 2 && !renderer.SpatialRadiusFailureCallLimitExceeded,
+			"initial area radius failure includes the zero fallback and does not publish a source");
+		renderer.ClearSpatialRadiusFailureForTest ();
+		FISoundChannel *channel = renderer.StartSound3D (sound, &listener, .8f, &rolloff, 1.f, 128, 0,
+			FVector3 (74.f, 20.f, 30.f), FVector3 (), 0, SNDF_LOOP | SNDF_AREA, NULL);
+		OpenALChannel *openalChannel = channel == NULL ? NULL : (OpenALChannel *)channel->SysChannel;
+		ALfloat radius = -1.f;
+		Check (channel != NULL, "continued area radius failure fixture starts an actual source");
+		if (channel == NULL)
+		{
+			return;
+		}
+		renderer.InjectSpatialRadiusFailureForTest (true);
+		renderer.UpdateSoundParams3D (&listener, channel, true, FVector3 (20.f, 20.f, 30.f), FVector3 ());
+		alGetSourcef (openalChannel->Source, AL_SOURCE_RADIUS, &radius);
+		renderer.ClearSpatialRadiusFailureForTest ();
+		renderer.UpdateSounds ();
+		renderer.UpdateSounds ();
+		Check (alGetError () == AL_NO_ERROR && NearlyEqual (radius, 0.f) && renderer.SpatialRadiusFailureCalls == 1 &&
+			Events.size () == eventCount + 1 && IsExpectedEvent (eventCount, OALEND_BackendError) && renderer.ActiveChannels.empty (),
+			"continued zero-radius failure retires once after updating the real source state");
+		ReleaseOwner (channel);
+	}
+
+	void TestRadiusCapabilityAbsent (OpenALSoundRenderer &renderer, SoundListener &listener, FISoundChannel *channel)
+	{
+		OpenALChannel *openalChannel = (OpenALChannel *)channel->SysChannel;
+		ALfloat values[3];
+		ALfloat gain;
+		bool advertised = renderer.Capabilities.RadiusAdvertised;
+				openalChannel->DistanceScale = 1.f;
+		renderer.Capabilities.RadiusAdvertised = false;
+		renderer.UpdateSoundParams3D (&listener, channel, true, FVector3 (74.f, 20.f, 30.f), FVector3 ());
+		alGetSourcefv (openalChannel->Source, AL_POSITION, values);
+		alGetSourcef (openalChannel->Source, AL_GAIN, &gain);
+		renderer.Capabilities.RadiusAdvertised = advertised;
+				Check (alGetError () == AL_NO_ERROR && NearlyEqual (gain, .288f) && NearlyEqual (values[0], 74.f) &&
+			NearlyEqual (values[1], 20.f) && NearlyEqual (values[2], -30.f) && !renderer.Capabilities.RadiusApplied,
+			"absent radius capability skips radius operations while preserving 3D position and gain");
+	}
+
+	void TestRadiusBoundaries (OpenALSoundRenderer &renderer, SoundHandle stereoSound)
+	{
+		SoundListener listener;
+		FRolloffInfo rolloff = MakeLinearRolloff (0.f, 100.f);
+		listener.position = FVector3 (10.f, 20.f, 30.f);
+		listener.valid = true;
+		FISoundChannel *channel = renderer.StartSound3D (stereoSound, &listener, .8f, &rolloff, 1.f, 128, 0,
+			FVector3 (74.f, 20.f, 30.f), FVector3 (), 0, SNDF_LOOP | SNDF_AREA, NULL);
+		Check (channel != NULL, "radius boundary fixture starts on an OpenAL source");
+		if (channel != NULL)
+		{
+			TestAreaRadiusBoundary (renderer, listener, channel);
+			TestPointRadiusBoundary (renderer, listener, channel);
+			TestRadiusCapabilityAbsent (renderer, listener, channel);
+			TestRadiusFailureAnd2DReuse (renderer, listener, channel, stereoSound);
+		}
+		else
+		{
+			ReleaseOwner (channel);
+		}
+		TestSpatialRadiusFailures (renderer, stereoSound);
 	}
 
 	void Test3DState (OpenALSoundRenderer &renderer, SoundHandle stereoSound)
@@ -3492,6 +3714,7 @@ static int RunDefaultRendererTests (OpenALSoundRenderer &renderer, std::vector<B
 	TestEvictedOwnerReuseAfterFailedStart (renderer, longSound);
 	TestFailedStartDoesNotPublish (renderer, longSound);
 	Test3DState (renderer, stereoSound);
+	TestRadiusBoundaries (renderer, stereoSound);
 	TestPhase2EFXRouting (renderer, longSound);
 	TestWaterPitchAndInitialVirtual (renderer, longSound);
 	TestTerminalVirtualOneShot (renderer, longSound);

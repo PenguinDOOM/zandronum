@@ -1171,7 +1171,7 @@ OpenALSound::OpenALSound ()
 OpenALChannel::OpenALChannel ()
 	: Source (0), Sound (NULL), Owner (NULL), Gain (0.f), Pitch (1.f), Priority (0),
 	  RolloffGain (1.f), EffectiveGain (0.f), Distance (0.f), DistanceScale (1.f),
-	  CachedPosition (0), LogicalStartFrame (0), AllocationSerial (0), Looping (false), NoPause (false), NoReverb (false), Is3D (false), IsArea (false),
+		  CachedPosition (0), LogicalStartFrame (0), AllocationSerial (0), Looping (false), NoPause (false), NoReverb (false), Is3D (false), IsArea (false), HeadRelative (false),
 	  WasPlayingBeforePause (false), PauseReasons (0), Rolloff (), EndReason (OALEND_None),
 	  FinalizeState (OALFINAL_Active)
 {
@@ -2010,7 +2010,7 @@ OpenALSoundRenderer::OpenALSoundRenderer ()
 	  SyncPaused (false), PendingStartNoPause (false), WaterPitchActive (false), WaterFilterActive (false), WaterFilterGainHF (0.f), EFXEnvironmentInitialized (false), EFXFailureDraining (false),
 	  LastAttemptedEnvironment (NULL), LastAppliedEnvironment (NULL), EFXFailure (OALEFXFAIL_None), EFXUsesEAX (false), InvalidReverbPanWarned (false)
 #ifdef OAL_LIFECYCLE_TEST
-	  , FailNextStart (false), FailNextStartSetup (false), FailNextPositionQuery (false), FailNextEFXSourceAssign (OALEFXFAIL_None), PersistentEFXSourceFailure (false),
+	, FailNextStart (false), FailNextStartSetup (false), FailNextPositionQuery (false), FailNextSpatialState (false), FailNextSpatialRadius (false), PersistentSpatialRadiusFailure (false), SpatialRadiusFailureCalls (0), SpatialRadiusFailureCallLimitExceeded (false), FailNextEFXSourceAssign (OALEFXFAIL_None), PersistentEFXSourceFailure (false),
 	  FailEFXSourceAssignSource (0), EFXSourceFailureCalls (0), EFXSourceFailureCallLimitExceeded (false), LastEFXSource (0), LastEFXSlot (0),
 	  LastEFXSend (0), LastEFXFilter (0), LastEFXSourceError (AL_NO_ERROR), LastEFXSourceFailureError (AL_NO_ERROR),
 	  LastDirectFilterSource (0), LastDirectFilter (0), LastDirectFilterError (AL_NO_ERROR)
@@ -2819,6 +2819,45 @@ void OpenALSoundRenderer::InjectPositionQueryFailureForTest ()
 	FailNextPositionQuery = true;
 }
 
+void OpenALSoundRenderer::InjectSpatialStateFailureForTest ()
+{
+	FailNextSpatialState = true;
+}
+
+void OpenALSoundRenderer::InjectSpatialRadiusFailureForTest (bool persistent)
+{
+	FailNextSpatialRadius = true;
+	PersistentSpatialRadiusFailure = persistent;
+	SpatialRadiusFailureCalls = 0;
+	SpatialRadiusFailureCallLimitExceeded = false;
+}
+
+void OpenALSoundRenderer::ClearSpatialRadiusFailureForTest ()
+{
+	FailNextSpatialRadius = false;
+	PersistentSpatialRadiusFailure = false;
+}
+
+bool OpenALSoundRenderer::InjectSpatialRadiusFailure ()
+{
+	if (!FailNextSpatialRadius)
+	{
+		return false;
+	}
+	++SpatialRadiusFailureCalls;
+	if (PersistentSpatialRadiusFailure && SpatialRadiusFailureCalls > 32)
+	{
+		SpatialRadiusFailureCallLimitExceeded = true;
+		ClearSpatialRadiusFailureForTest ();
+		return false;
+	}
+	if (!PersistentSpatialRadiusFailure)
+	{
+		ClearSpatialRadiusFailureForTest ();
+	}
+	return true;
+}
+
 void OpenALSoundRenderer::InjectEFXSourceFailureForTest (OpenALEFXFailure failure, bool persistent, unsigned int source)
 {
 	FailNextEFXSourceAssign = failure;
@@ -3001,10 +3040,32 @@ float OpenALSoundRenderer::CalculateRolloffGain (FRolloffInfo &rolloff, float di
 	return S_GetRolloff (&rolloff, *distance * distanceScale, true);
 }
 
-void OpenALSoundRenderer::ApplySpatialState (OpenALChannel *channel, SoundListener *listener, const FVector3 &position, const FVector3 &velocity)
+bool OpenALSoundRenderer::ApplyChannelRadius (OpenALChannel *channel, bool headRelative, bool updateStatus)
+{
+	bool applied;
+	int radius;
+	if (!Capabilities.RadiusAdvertised)
+	{
+		if (updateStatus) Capabilities.RadiusApplied = false;
+		return true;
+	}
+	radius = channel->IsArea && !headRelative ? 32 : 0;
+	applied = ResetEFXSourceProperty (channel->Source, AL_SOURCE_RADIUS, radius, true, OALEFXFAIL_SourceRadius, updateStatus);
+	if (updateStatus) Capabilities.RadiusApplied = applied;
+	if (!applied && radius != 0)
+	{
+				return ResetEFXSourceProperty (channel->Source, AL_SOURCE_RADIUS, 0, true, OALEFXFAIL_SourceRadius, updateStatus);
+	}
+	return applied;
+}
+
+bool OpenALSoundRenderer::ApplySpatialState (OpenALChannel *channel, SoundListener *listener, const FVector3 &position, const FVector3 &velocity)
 {
 	float distance;
 	bool headRelative;
+	bool radiusSafe;
+	bool gainApplied;
+	bool spatialApplied;
 	FVector3 convertedPosition;
 	FVector3 convertedVelocity;
 
@@ -3013,6 +3074,7 @@ void OpenALSoundRenderer::ApplySpatialState (OpenALChannel *channel, SoundListen
 	// Center nearby area sounds as a bounded Phase 1A panning approximation.
 	headRelative = listener != NULL && listener->valid &&
 		(distance == 0.f || (channel->IsArea && distance <= 32.f));
+	channel->HeadRelative = headRelative;
 
 	if (headRelative)
 	{
@@ -3028,7 +3090,18 @@ void OpenALSoundRenderer::ApplySpatialState (OpenALChannel *channel, SoundListen
 		alSource3f (channel->Source, AL_POSITION, convertedPosition.X, convertedPosition.Y, convertedPosition.Z);
 		alSource3f (channel->Source, AL_VELOCITY, convertedVelocity.X, convertedVelocity.Y, convertedVelocity.Z);
 	}
+ #ifdef OAL_LIFECYCLE_TEST
+	if (FailNextSpatialState)
+	{
+		FailNextSpatialState = false;
+		alSource3f (0, AL_POSITION, 0.f, 0.f, 0.f);
+	}
+ #endif
+	spatialApplied = alGetError () == AL_NO_ERROR;
+	radiusSafe = ApplyChannelRadius (channel, headRelative, true);
 	ApplyChannelGain (channel);
+	gainApplied = alGetError () == AL_NO_ERROR;
+	return spatialApplied && radiusSafe && gainApplied;
 }
 
 void OpenALSoundRenderer::FinalizeChannel (OpenALChannel *channel, OpenALEndReason reason)
@@ -3198,7 +3271,6 @@ FISoundChannel *OpenALSoundRenderer::StartSound3D (SoundHandle sfx, SoundListene
 	alSourcei (source, AL_BUFFER, (ALint)(sound->BufferMono != 0 ? sound->BufferMono : sound->Buffer2D));
 	alSourcei (source, AL_LOOPING, channel->Looping ? AL_TRUE : AL_FALSE);
 	alSourcef (source, AL_PITCH, channel->Pitch);
-	ApplySpatialState (channel, listener, pos, vel);
 #ifdef OAL_LIFECYCLE_TEST
 	if (FailNextStartSetup)
 	{
@@ -3214,6 +3286,13 @@ FISoundChannel *OpenALSoundRenderer::StartSound3D (SoundHandle sfx, SoundListene
 		return NULL;
 	}
 	if (!ApplyChannelEFX (channel))
+	{
+		alSourceStop (source);
+		alSourcei (source, AL_BUFFER, 0);
+		delete channel;
+		return NULL;
+	}
+	if (!ApplySpatialState (channel, listener, pos, vel))
 	{
 		alSourceStop (source);
 		alSourcei (source, AL_BUFFER, 0);
@@ -3424,7 +3503,7 @@ void OpenALSoundRenderer::UpdateSoundParams3D (SoundListener *listener, FISoundC
 	if (channel != NULL && channel->FinalizeState == OALFINAL_Active && channel->Is3D)
 	{
 		channel->IsArea = areasound;
-		ApplySpatialState (channel, listener, pos, vel);
+		if (!ApplySpatialState (channel, listener, pos, vel)) RetireEFXSource (channel);
 	}
 }
 
@@ -3570,15 +3649,15 @@ bool OpenALSoundRenderer::ClearWaterFilter (OpenALChannel *channel)
 	return false;
 }
 
-bool OpenALSoundRenderer::ResetEFXSourceProperty (unsigned int source, OALenum property, int value, bool floating, OpenALEFXFailure failure)
+bool OpenALSoundRenderer::ResetEFXSourceProperty (unsigned int source, OALenum property, int value, bool floating, OpenALEFXFailure failure, bool spatialRadius)
 {
 	alGetError ();
-	if (floating) alSourcef (source, property, 0.f);
+	if (floating) alSourcef (source, property, (float)value);
 	else alSourcei (source, property, value);
 #ifdef OAL_LIFECYCLE_TEST
-	if (InjectEFXSourceFailure (source, failure))
+	if (InjectEFXSourceFailure (source, failure) || (spatialRadius && InjectSpatialRadiusFailure ()))
 	{
-		if (floating) alSourcef (0, property, 0.f);
+		if (floating) alSourcef (0, property, (float)value);
 		else alSourcei (0, property, value);
 	}
 #endif
@@ -3658,6 +3737,11 @@ bool OpenALSoundRenderer::ApplyChannelEFX (OpenALChannel *channel)
 			if (channel->Owner == NULL && !EnsureEFXSourceDry (channel->Source)) RetireEFXSource (channel);
 			return false;
 		}
+	}
+	if (!ApplyChannelRadius (channel, channel->HeadRelative, false))
+	{
+		RetireEFXSource (channel);
+		return false;
 	}
 	return true;
 }

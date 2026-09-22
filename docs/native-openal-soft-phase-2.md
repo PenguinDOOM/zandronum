@@ -1,10 +1,11 @@
-# Native OpenAL Soft: Phase 2B-3 Current State
+# Native OpenAL Soft: Phase 2C Current State
 
 ## Scope
 
 This document describes the implemented 2B-1 shared environment state and
-numeric adapter, 2B-2 OpenAL EFX environment routing, and 2B-3 underwater
-pitch/low-pass and virtual-position behavior. The existing FMOD backend,
+numeric adapter, 2B-2 OpenAL EFX environment routing, 2B-3 underwater
+pitch/low-pass and virtual-position behavior, and the approved 2C source-radius
+boundary. The existing FMOD backend,
 `snd_backend` selection, fallback behavior, music selection, CVAR defaults,
 compatibility behavior, `AL_NONE` distance model, and manual rolloff remain
 unchanged.
@@ -20,11 +21,10 @@ the owning context.
 
 2B-2 adds source send routing on top of those resources. 2B-3 adds the
 water-pitch/low-pass approximation and the initial virtual-start position
-registration. Source radius and Doppler remain later work.
+registration. 2C adds the bounded source-radius behavior described below;
+Doppler remains disabled.
 
-This is the current 2B-3 implementation state, not a Phase 2 completion
-claim. The requested/assigned documentation model was Luna; actual model use
-is unconfirmed.
+This is the current 2C implementation state, not a Phase 2 completion claim.
 
 ## 2B-3 Underwater Implementation
 
@@ -167,7 +167,7 @@ most once per renderer/context.
 
 The following remain intentionally outside 2B-3:
 
-- source radius and Doppler behavior (2C/2D); and
+- Doppler behavior (2D); and
 - the legacy FMOD wet graph, Q=2 behavior, wet-tail filtering, and full FMOD
   acoustic equivalence.
 
@@ -296,9 +296,10 @@ The Release product/test build passed, and the latest terminal-fix
 `openal_lifecycle` run passed (`1/1`); the older terminal-fix CTest record that
 reported `2/2` is retained as historical evidence, not as the latest result.
 The separate test-2 CTest record reported `No tests were found!!!` and is
-excluded from pass evidence. An independent review3 is approved (`GREEN`);
-the commit remains pending, and the reviewer required no new test or product
-edit. These records update the terminal-repair provenance only. All shared/LP manual evidence remains
+excluded from pass evidence. An independent review3 is approved (`GREEN`),
+and B3 is committed at `dc669bbb9758e463ecfce33793d8df03da11fd6e`; the
+reviewer required no new test or product edit. These records update the
+terminal-repair provenance only. All shared/LP manual evidence remains
 retained, including normal-executable observations made before the terminal
 failure repair; it is not latest post-repair listening evidence. These records
 do not replace that retained evidence or make an overall Phase 2 completion
@@ -320,6 +321,136 @@ passed, and the post-constructor Release test rebuild plus
 logs also recorded exit code 0. Earlier Debug tests are separate historical
 evidence. These checks establish build/lifecycle behavior, not human HRTF
 listening results.
+
+## 2C Source Radius
+
+When the radius extension is advertised, 2C applies radius `32` only to an
+`AREA` world source whose world distance is greater than `32`. At distances
+less than or equal to `32`, the area source remains head-relative with radius
+`0`, preserving the Phase 1 placement behavior. Point sources, 2D sources,
+and music use radius `0`. The threshold is in world units and is not scaled by
+`DistanceScale`. The position, rolloff calculation, and `AL_GAIN` path are
+unchanged. Spatial errors detected before the radius helper are preserved;
+radius handling does not discard them. A rejected radius setter follows the
+Phase 1 fallback to radius `0`, and source publication still requires a clean
+OpenAL error state. Reset paths restore radius `0` and the environment/water
+EFX reapplication then reapplies the requested spatial radius, so an EFX reset
+does not silently lose an active area radius.
+
+`RadiusApplied` means exactly whether the latest spatial application
+successfully set the requested radius. A rejected requested radius `32` that
+then falls back to a successfully set `0` remains false. A successful spatial
+application whose requested radius is `0` may set it to true. EFX reset,
+2D/music reset, and source reuse reset do not update this flag, and the flag is
+not per-source proof or proof that radius `32` is currently active. The
+position, gain, and radius computations remain intact; they are not replaced by
+the status flag.
+
+If a radius operation fails after a source is active, the finite backend-error
+path stops and retires that source. If a source start cannot complete cleanly,
+it is not published. A successful fallback to radius `0` is therefore not a
+broken-start publication and does not turn a failed requested spatial radius
+application into success. The lifecycle tests inspect `AL_SOURCE_RADIUS`
+directly and also check relative placement, position, and gain across
+distances `0`, `16`, `31.9`, `32`, `32.1`, and `64`, with `DistanceScale`
+values `0.5`, `1`, and `2`. They cover area, point, music/2D reset,
+rejected-radius fallback, source reuse, and the failure lifecycle. This is
+direct OpenAL readback, not human confirmation.
+
+The FMOD comparison boundary is deliberately narrower: FMOD uses its existing
+continuous `3DPanLevel` range `0..32`, while OpenAL applies the discrete 2C
+boundary above. No exact FMOD equivalence and no final RMS-constant claim are
+made. Doppler remains disabled; 2C adds no CVAR, inner-radius redesign, or gain
+compensation.
+
+The current 2C review1-fix working-tree capture is
+`completes/native-openal-soft-phase-2/2c/review1-fix/working-tree-capture-review1-fix-20260922-101500/manifest.json`.
+It contains exactly the three changed files `src/sound/oalsound.cpp`,
+`src/sound/oalsound.h`, and `tools/openal_renderer_lifecycle_tests.cpp`.
+The manifest records these verified working-tree SHA-256 values:
+
+- `src/sound/oalsound.cpp`:
+  `31795C8EFCE3D32EDE0C48CDEC8425E2D751C6D4B2528CCAD2CC2A8DCB7FB493`
+- `src/sound/oalsound.h`:
+  `D01345279231E70053B316DFE51114881A91CEE570D63E9ADD1D8486F5D98AEC`
+- `tools/openal_renderer_lifecycle_tests.cpp`:
+  `0141ED074CAA6129C8EA6B24F042C5A6694A327157A76336AFCA41796FACB5BA`
+
+The capture uses Release|x64, Visual Studio 17 2022, v143, with
+`BUILD_TESTING=ON`, `NO_SOUND=OFF`, and `DYN_FLUIDSYNTH=ON`; the CMake cache
+and both recorded project hashes were stable. The latest full Cppcheck result
+is retained at
+`completes/native-openal-soft-phase-2/2c/review1-fix/cppcheck-full/run-20260922-100836-4659b8c043bc4e7b8c01db4d73dc230d/final-result.json`.
+It passed with exit code `0` and the complete classification
+`Raw=601078`, `AcceptedVendor=214`, `Unaccepted=600864`, `Baseline=7503`,
+`Unchanged=7481`, `BaselineOnly=22`, `New=0`, and `UnresolvedVendor=0`.
+The recorded analyzer is Cppcheck `2.21.0`; the result is for the current
+three-file capture, not the historical `radius-split-final2` capture.
+
+The latest valid review1-fix broad Release build record is retained at
+`completes/native-openal-soft-phase-2/2c/review1-fix/build-release-review1-fix-final-20260922.raw.log`
+and ends with `EXIT_CODE=0`. The canonical lifecycle CTest record is retained
+at
+`completes/native-openal-soft-phase-2/2c/review1-fix/ctest-openal-lifecycle-review1-fix-canonical-20260922.raw.log`;
+it reports `1/1` passed and `EXIT_CODE=0`. The parent formal Lizard result is
+recorded separately in
+`completes/native-openal-soft-phase-2/2c/review1-fix/parent-final-lizard.raw.log`;
+it reports no new complexity regressions, `LIZARD_EXIT_CODE=0`, and
+`REAL_INDEX_UNCHANGED=True`. These checks establish the implemented code and
+direct test behavior, not human listening or acoustic equivalence.
+
+ROUND2 code and automated review is APPROVED. The Release build and canonical
+lifecycle CTest therefore establish the bounded implementation and automated
+behavior, but not the manual gate. During evidence recovery, an unrestricted
+targetless log-recovery build updated `build-v143/zandronum.pk3` (`updated715`)
+and copied it to the Release output. There was no pre-build hash, so restoration
+of the original bytes is unconfirmed. This deviation is recorded rather than
+described as a no-generated-change result. The generated PK3 remains outside
+the commit and is not used for listening; only the independently verified stock
+PK3 in the isolated old/new runtimes is used. The isolated stock PK3 hash is
+`163C181616F13B6B182F248E1D2617434E23412E77CB16FB77DF68A504105074`.
+
+The manual comparison used the fixture with SHA256
+`6B7323378003F3530A53B1AFE687283FC196EB89A8B5D9A5E12DB98FC255FF91` and the
+runtime provenance at
+`completes/native-openal-soft-phase-2/2c/runtime/provenance-isolated-runtimes.json`.
+The old executable hash was
+`93D922BD475EDCE29A561AE60D555FAE9B0730B185C5D2EF2F609B0C460D8C21`; the new
+executable hash was
+`62056E3957B3871404D1991E06F51620AE45E54F874A36800806FD3699F767EA`.
+Both used the same verified stock PK3 and OpenAL DLL
+`2C44AE1108904B708BDC370EF8703785912BFEE67BB4999ED8D25C28250628A9`; the
+provenance record contains the exact hashes for all assets.
+
+The old and new startup logs are
+`completes/native-openal-soft-phase-2/2c/runtime/isolated/old-b3/logs/old-off-startup.log`
+and
+`completes/native-openal-soft-phase-2/2c/runtime/isolated/new-2c/logs/new-off-startup.log`.
+Parent verification found HRTF inactive in OLD-OFF and active in OLD-ON and
+NEW-ON, with `SADIE_D02-48000`; NEW-ON also logged FMOD `4.44.64` during the
+FMOD comparison. These are runtime/status observations, not a claim of
+OpenAL Soft `1.25.2`.
+
+For the user listening results, OLD-OFF confirmed continuous sound and the
+31.9/32/32.1 boundary baseline; OLD-ON confirmed active HRTF. The user quit
+the old process and then launched the new one. NEW-OFF had no clear worsening
+against OLD-OFF for localization, volume, or clicks. NEW-ON was active and had
+no clear worsening against OLD-ON. NEW-NEAR confirmed left/right reversal at
+`warp 0,-64` and `0,64` and continuous near-boundary behavior. The FMOD
+`snd_backend fmod`, HRTF-off reset/status comparison found both MAP01 AREA and
+MAP02 point normal, with the same mono DSSAWIDL source, coordinates, and
+distance-16 check. These are human listening observations, not machine audio
+assertions; sector-source semantics, an RMS-constant claim, and a per-source
+32 global status claim were not tested. The F5/F6/F7 bindings and warp
+commands are logged, but not every key execution is logged.
+
+The current game PID `22748` remains running for the user; the old PID `46304`
+was quit by the user. The independent ROUND3 review is approved (`GREEN`);
+code hashes are unchanged, all required 2C manual results are accepted, the
+user-accepted PK3 past-incident exception remains accepted, and no findings
+were reported. The 2C commit remains pending, Phase 2 is not yet complete
+overall, and 2D has not started. Codacy local analysis remains unavailable on
+this Windows native path and no setup was performed.
 
 ## Manual Baseline Procedure
 
@@ -419,9 +550,19 @@ does not make a source dry; it remains wet-eligible. Music, encoded streams,
 callbacks, and software-generated music remain dry and have no EFX send or
 filter. New and reused sources and streams are explicitly reset to dry, with
 air absorption, automatic send/filter gain correction, and the direct filter
-reset to their dry defaults; the manual source gain is applied once. Source
-radius remains reset to zero even when `AL_EXT_SOURCE_RADIUS` is advertised;
-radius behavior is not enabled. `RoomRolloffFactor` is retained as an EFX
+reset to their dry defaults; the manual source gain is applied once. When
+`AL_EXT_SOURCE_RADIUS` is advertised, an area/world source uses an OpenAL
+source radius of `32` only after its world distance is greater than 32. At
+distances up to and including 32, it remains head-relative with radius `0`.
+Point sources, 2D sources, and music remain at radius `0`; point-source
+placement is unchanged. The radius decision uses world distance and does not
+multiply the 32-unit boundary by `DistanceScale`. Position, manual rolloff,
+and `AL_GAIN` remain unchanged. A rejected radius setter falls back to radius
+`0` through the Phase 1 failure path, but a successful fallback does not make
+the requested spatial application successful. `RadiusApplied` means exactly
+whether the latest spatial application successfully set its requested radius;
+EFX reset, 2D/music reset, and source reuse reset do not update it. It is not
+per-source proof that radius `32` is active. `RoomRolloffFactor` is retained as an EFX
 parameter, but it does not reproduce FMOD's distance attenuation in this
 `AL_NONE` plus manual-rolloff arrangement. Doppler remains disabled and its
 factor remains zero. These constraints are independent of the implemented
@@ -488,8 +629,8 @@ force.
 
 ## Deferred Work
 
-Later units may add HRTF profile selection or live context reset, apply radius,
-or calibrate and enable source-only Doppler. The
+Later units may add HRTF profile selection or live context reset, or calibrate
+and enable source-only Doppler. The
 existing `snd_reset` path recreates the renderer and is the current HRTF
 application boundary; live `alcResetDeviceSOFT` is not implemented. Full
 acoustic equivalence with FMOD, including the distance behavior of
@@ -499,6 +640,7 @@ The manual 2B-3 editor route used selecting `DSP Water` in Test in level. That
 route exercises `SoftwareWater`; it is not evidence of the built-in underwater
 listener flag or actual player submersion. The latest 2B-3 manual and
 provenance evidence is recorded above. B3 independent review round three is
-approved (`GREEN`), while the commit remains pending; no overall Phase 2
-completion claim is made, and no unverified pause console command is
+approved (`GREEN`), and B3 is committed at
+`dc669bbb9758e463ecfce33793d8df03da11fd6e`; no overall Phase 2 completion
+claim is made, and no unverified pause console command is
 prescribed here.
