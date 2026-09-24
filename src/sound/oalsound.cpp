@@ -498,6 +498,26 @@ namespace
 		}
 	}
 
+	const char *EFXReverbModeName (OpenALEFXReverbMode mode)
+	{
+		switch (mode)
+		{
+		case OALEFXREVERB_EAX: return "EAX";
+		case OALEFXREVERB_Standard: return "standard";
+		default: return "dry";
+		}
+	}
+
+	const char *EFXFilterStateName (OpenALEFXFilterState state)
+	{
+		switch (state)
+		{
+		case OALEFXFILTER_Available: return "available";
+		case OALEFXFILTER_Failed: return "failed";
+		default: return "absent";
+		}
+	}
+
 	struct OpenALContextState
 	{
 		ALCdevice *Device;
@@ -1160,6 +1180,22 @@ static FVector3 ToOpenALCoordinates (const FVector3 &vector)
 	converted.Y = vector.Y;
 	converted.Z = -vector.Z;
 	return converted;
+}
+
+static FVector3 BoundDopplerVelocity (const FVector3 &velocity)
+{
+	const double maxVelocityLength = 32956.8;
+	double velocityLength = sqrt ((double)velocity.X * velocity.X + (double)velocity.Y * velocity.Y + (double)velocity.Z * velocity.Z);
+	if (!isfinite (velocityLength))
+	{
+		return FVector3 ();
+	}
+	if (velocityLength > maxVelocityLength)
+	{
+		float scale = (float)(maxVelocityLength / velocityLength);
+		return FVector3 (velocity.X * scale, velocity.Y * scale, velocity.Z * scale);
+	}
+	return velocity;
 }
 
 OpenALSound::OpenALSound ()
@@ -2011,7 +2047,7 @@ OpenALSoundRenderer::OpenALSoundRenderer ()
 	  LastAttemptedEnvironment (NULL), LastAppliedEnvironment (NULL), EFXFailure (OALEFXFAIL_None), EFXUsesEAX (false), InvalidReverbPanWarned (false)
 #ifdef OAL_LIFECYCLE_TEST
 	, FailNextStart (false), FailNextStartSetup (false), FailNextPositionQuery (false), FailNextSpatialState (false), FailNextSpatialRadius (false), PersistentSpatialRadiusFailure (false), SpatialRadiusFailureCalls (0), SpatialRadiusFailureCallLimitExceeded (false), FailNextEFXSourceAssign (OALEFXFAIL_None), PersistentEFXSourceFailure (false),
-	  FailEFXSourceAssignSource (0), EFXSourceFailureCalls (0), EFXSourceFailureCallLimitExceeded (false), LastEFXSource (0), LastEFXSlot (0),
+	  FailEFXSourceAssignSource (0), EFXSourceFailureCalls (0), EFXSourceFailureCallLimitExceeded (false), FailNextDopplerConfiguration (false), LastEFXSource (0), LastEFXSlot (0),
 	  LastEFXSend (0), LastEFXFilter (0), LastEFXSourceError (AL_NO_ERROR), LastEFXSourceFailureError (AL_NO_ERROR),
 	  LastDirectFilterSource (0), LastDirectFilter (0), LastDirectFilterError (AL_NO_ERROR)
 #endif
@@ -2070,10 +2106,14 @@ bool OpenALSoundRenderer::Init ()
 	}
 
 	alDistanceModel (AL_NONE);
-	alDopplerFactor (0.f);
 	if (alGetError () != AL_NO_ERROR)
 	{
-		Printf (TEXTCOLOR_RED "OpenAL could not configure distance attenuation and Doppler. Falling back to FMOD.\n");
+		Printf (TEXTCOLOR_RED "OpenAL could not configure distance attenuation. Falling back to FMOD.\n");
+		return false;
+	}
+	if (!ConfigureDoppler ())
+	{
+		Printf (TEXTCOLOR_RED "OpenAL could not disable rejected Doppler settings. Falling back to FMOD.\n");
 		return false;
 	}
 
@@ -2824,6 +2864,11 @@ void OpenALSoundRenderer::InjectSpatialStateFailureForTest ()
 	FailNextSpatialState = true;
 }
 
+void OpenALSoundRenderer::InjectDopplerConfigurationFailureForTest ()
+{
+	FailNextDopplerConfiguration = true;
+}
+
 void OpenALSoundRenderer::InjectSpatialRadiusFailureForTest (bool persistent)
 {
 	FailNextSpatialRadius = true;
@@ -3085,7 +3130,7 @@ bool OpenALSoundRenderer::ApplySpatialState (OpenALChannel *channel, SoundListen
 	else
 	{
 		convertedPosition = ToOpenALCoordinates (position);
-		convertedVelocity = ToOpenALCoordinates (velocity);
+		convertedVelocity = ToOpenALCoordinates (BoundDopplerVelocity (velocity));
 		alSourcei (channel->Source, AL_SOURCE_RELATIVE, AL_FALSE);
 		alSource3f (channel->Source, AL_POSITION, convertedPosition.X, convertedPosition.Y, convertedPosition.Z);
 		alSource3f (channel->Source, AL_VELOCITY, convertedVelocity.X, convertedVelocity.Y, convertedVelocity.Z);
@@ -3102,6 +3147,31 @@ bool OpenALSoundRenderer::ApplySpatialState (OpenALChannel *channel, SoundListen
 	ApplyChannelGain (channel);
 	gainApplied = alGetError () == AL_NO_ERROR;
 	return spatialApplied && radiusSafe && gainApplied;
+}
+
+bool OpenALSoundRenderer::ConfigureDoppler ()
+{
+	ALfloat appliedFactor = 0.f;
+	Capabilities.DopplerRequested = true;
+	alGetError ();
+	alSpeedOfSound (32956.8f);
+	alDopplerFactor (.5f);
+#ifdef OAL_LIFECYCLE_TEST
+	if (FailNextDopplerConfiguration)
+	{
+		FailNextDopplerConfiguration = false;
+		alSourcef (0, AL_PITCH, 1.f);
+	}
+#endif
+	if (alGetError () == AL_NO_ERROR)
+	{
+		Capabilities.DopplerApplied = true;
+		return true;
+	}
+	alDopplerFactor (0.f);
+	alGetFloatv (AL_DOPPLER_FACTOR, &appliedFactor);
+	Capabilities.DopplerApplied = false;
+	return alGetError () == AL_NO_ERROR && appliedFactor == 0.f;
 }
 
 void OpenALSoundRenderer::FinalizeChannel (OpenALChannel *channel, OpenALEndReason reason)
@@ -3299,7 +3369,12 @@ FISoundChannel *OpenALSoundRenderer::StartSound3D (SoundHandle sfx, SoundListene
 		delete channel;
 		return NULL;
 	}
-	return PublishChannel (channel, reuseChan, restart);
+	FISoundChannel *owner = PublishChannel (channel, reuseChan, restart);
+	if (owner != NULL)
+	{
+		owner->Rolloff = channel->Rolloff;
+	}
+	return owner;
 }
 
 void OpenALSoundRenderer::StopChannel (FISoundChannel *owner)
@@ -4043,8 +4118,7 @@ void OpenALSoundRenderer::PrintStatus ()
 		Capabilities.HRTFSpecifier.GetChars ()[0] != '\0' ? Capabilities.HRTFSpecifier.GetChars () : "");
 	Printf ("ALC_EXT_EFX: %s, entrypoints: %s, reverb: %s, filter: %s, applied: %s, failure: %s\n",
 		Capabilities.EFXAdvertised ? "advertised" : "absent", Capabilities.EFXCallable ? "callable" : "missing",
-		efxStatus.ReverbMode == OALEFXREVERB_EAX ? "EAX" : (efxStatus.ReverbMode == OALEFXREVERB_Standard ? "standard" : "dry"),
-		efxStatus.FilterState == OALEFXFILTER_Available ? "available" : (efxStatus.FilterState == OALEFXFILTER_Failed ? "failed" : "absent"),
+		EFXReverbModeName (efxStatus.ReverbMode), EFXFilterStateName (efxStatus.FilterState),
 		efxStatus.Applied ? "yes" : "no", efxFailureName);
 	if (efxStatus.SendCount < 0)
 	{
@@ -4058,7 +4132,7 @@ void OpenALSoundRenderer::PrintStatus ()
 	PrintWaterStatus ();
 	Printf ("AL_EXT_SOURCE_RADIUS: %s, applied: %s\n", Capabilities.RadiusAdvertised ? "advertised" : "absent",
 		Capabilities.RadiusApplied ? "yes" : "no");
-	Printf ("Doppler: applied: %s (factor remains 0)\n", Capabilities.DopplerApplied ? "yes" : "no");
+	Printf ("Doppler: requested: %s, applied: %s\n", Capabilities.DopplerRequested ? "yes" : "no", Capabilities.DopplerApplied ? "yes" : "no");
 	Printf ("SFX sources: " TEXTCOLOR_GREEN "%d allocated / %d requested / %d free / %d active\n", AllocatedSources, RequestedSources, AllocatedSources - (int)ActiveChannels.size (), (int)ActiveChannels.size ());
 }
 
@@ -4113,8 +4187,7 @@ FString OpenALSoundRenderer::GatherStats ()
 		AllocatedSources, (int)ActiveChannels.size (), AllocatedSources - (int)ActiveChannels.size (), (int)ActiveStreams.size (),
 		Capabilities.HRTFAdvertised ? HRTFStatusName (Capabilities) : "absent", Capabilities.HRTFStatus,
 		Capabilities.EFXAdvertised ? "advertised" : "absent", Capabilities.EFXCallable ? "callable" : "missing",
-		efxStatus.ReverbMode == OALEFXREVERB_EAX ? "EAX" : (efxStatus.ReverbMode == OALEFXREVERB_Standard ? "standard" : "dry"),
-		efxStatus.FilterState == OALEFXFILTER_Available ? "available" : (efxStatus.FilterState == OALEFXFILTER_Failed ? "failed" : "absent"),
+		EFXReverbModeName (efxStatus.ReverbMode), EFXFilterStateName (efxStatus.FilterState),
 		efxStatus.Applied ? "yes" : "no", sends.GetChars (), Capabilities.RadiusAdvertised ? "advertised" : "absent");
 	return out;
 }
@@ -4150,7 +4223,7 @@ bool OpenALEFXFunctions::IsFilterCallable () const
 OpenALCapabilities::OpenALCapabilities ()
 	: HRTFAdvertised (false), HRTFActiveKnown (false), HRTFActive (false), HRTFStatusKnown (false), HRTFStatus (0), HRTFSpecifier (), EFXAdvertised (false), EFX (),
 	  EFXCallable (false), EFXFilterCallable (false), EFXFilterUsable (false), EFXUsable (false), EFXApplied (false), EFXSendCount (-1), RadiusAdvertised (false),
-	  RadiusApplied (false), DopplerApplied (false)
+	  RadiusApplied (false), DopplerRequested (false), DopplerApplied (false)
 {
 }
 

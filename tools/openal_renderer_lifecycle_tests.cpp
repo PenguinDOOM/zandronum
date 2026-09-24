@@ -2142,6 +2142,64 @@ namespace
 		renderer.UpdateListener (&listener);
 	}
 
+	void Test3DUnderwaterEvictionRestart (OpenALSoundRenderer &renderer)
+	{
+		std::vector<BYTE> samples = MakeSamples (8000);
+		SoundHandle sound = renderer.LoadSoundRaw (&samples[0], (int)samples.size (), 8000, 1, -16, 100, 500);
+		OpenALSound *openalSound = (OpenALSound *)sound.data;
+		SoundListener listener;
+		FRolloffInfo rolloff = MakeLinearRolloff (0.f, 100.f);
+		FVector3 position (48.f, 0.f, 0.f);
+		FVector3 velocity (3.f, 4.f, 5.f);
+		listener.valid = true;
+		listener.Environment = DefaultEnvironments[0];
+		listener.underwater = true;
+		renderer.UpdateListener (&listener);
+		FISoundChannel *owner = NULL;
+		FISoundChannel *started = renderer.StartSound3D (sound, &listener, .5f, &rolloff, 1.f, 192, 80, position, velocity, 0,
+			SNDF_LOOP, owner);
+		owner = started;
+		OpenALChannel *channel = started != NULL && started->SysChannel != NULL ? (OpenALChannel *)started->SysChannel : NULL;
+		ALfloat pitch = 0.f;
+		ALfloat actualVelocity[3] = { 0.f, 0.f, 0.f };
+		if (channel != NULL)
+		{
+			alSourcePause (channel->Source);
+			alSourcei (channel->Source, AL_SAMPLE_OFFSET, openalSound->LoopEnd - 50);
+			alSourcePlay (channel->Source);
+			alGetError ();
+			alGetSourcef (channel->Source, AL_PITCH, &pitch);
+			alGetSourcefv (channel->Source, AL_VELOCITY, actualVelocity);
+		}
+		fprintf (stderr, "THREED_WATER_SOURCE pitch=%.9g velocity=(%.9g,%.9g,%.9g)\n",
+			pitch, actualVelocity[0], actualVelocity[1], actualVelocity[2]);
+		Check (channel != NULL && NearlyEqual (pitch, 1.5f * .7937005f) && alGetError () == AL_NO_ERROR,
+			"3D water source applies its base pitch and water multiplier exactly once");
+		CheckVector (actualVelocity, 3.f, 4.f, -5.f, "3D water source preserves its nonzero OpenAL velocity");
+		unsigned int liveOffset = SourceOffset (owner);
+		FISoundChannel *evictor = renderer.StartSound (sound, .9f, 128, 81, SNDF_LOOP, NULL);
+		AdvanceTestClock (renderer, 100);
+		unsigned int expected = ExpectedLoopPosition (liveOffset + (unsigned int)(8000.f * 1.5f * .7937005f / 10.f),
+			openalSound->LoopStart, openalSound->LoopEnd);
+		unsigned int virtualOffset = renderer.GetPosition (owner);
+		Check (evictor != NULL && owner->SysChannel == NULL && abs ((int)virtualOffset - (int)expected) <= 4,
+			"evicted 3D water loop advances virtually with water pitch but without Doppler velocity");
+		StopAndDrain (renderer, evictor);
+		FISoundChannel *restarted = renderer.StartSound3D (sound, &listener, .5f, &rolloff, 1.f, 192, 80, position, velocity, 0,
+			SNDF_LOOP, owner);
+		unsigned int restoredOffset = SourceOffset (owner);
+		fprintf (stdout, "THREED_WATER_EVICTION pitch=%.9g velocity=(%.9g,%.9g,%.9g) live=%u virtual=%u expected=%u restored=%u\n",
+			pitch, actualVelocity[0], actualVelocity[1], actualVelocity[2], liveOffset, virtualOffset, expected, restoredOffset);
+		Check (restarted == owner && abs ((int)restoredOffset - (int)virtualOffset) <= 2,
+			"restarted 3D water loop owns the wrapped virtual cursor after eviction");
+		StopAndDrain (renderer, owner);
+		ReleaseOwner (owner);
+		ReleaseOwner (evictor);
+		renderer.UnloadSound (sound);
+		listener.underwater = false;
+		renderer.UpdateListener (&listener);
+	}
+
 	void TestRestartPositions (OpenALSoundRenderer &renderer, SoundHandle sound)
 	{
 		std::vector<BYTE> samples = MakeSamples (8000);
@@ -2472,7 +2530,7 @@ namespace
 	{
 		OpenALChannel *openalChannel = (OpenALChannel *)channel->SysChannel;
 		ALfloat values[3];
-		ALfloat gain;
+		ALfloat gain = 0.f;
 		bool advertised = renderer.Capabilities.RadiusAdvertised;
 				openalChannel->DistanceScale = 1.f;
 		renderer.Capabilities.RadiusAdvertised = false;
@@ -2508,6 +2566,51 @@ namespace
 		TestSpatialRadiusFailures (renderer, stereoSound);
 	}
 
+	void TestDopplerSourceState (OpenALSoundRenderer &renderer, SoundListener &listener, OpenALChannel *channel,
+		const FVector3 &sourcePosition)
+	{
+		ALfloat values[3];
+		ALfloat factor = 0.f;
+		ALfloat speed = 0.f;
+		ALfloat gain = 0.f;
+		alGetFloatv (AL_DOPPLER_FACTOR, &factor);
+		alGetFloatv (AL_SPEED_OF_SOUND, &speed);
+		Check (renderer.Capabilities.DopplerRequested && renderer.Capabilities.DopplerApplied &&
+			NearlyEqual (factor, .5f) && NearlyEqual (speed, 32956.8f),
+			"Doppler config applies the requested standard factor and speed");
+		renderer.UpdateSoundParams3D (&listener, channel->Owner, false, sourcePosition, FVector3 (-960.f, 0.f, 0.f));
+		alGetSourcefv (channel->Source, AL_VELOCITY, values);
+		CheckVector (values, -960.f, 0.f, 0.f, "Doppler approach keeps the world velocity direction");
+		renderer.UpdateSoundParams3D (&listener, channel->Owner, false, sourcePosition, FVector3 (960.f, 0.f, 0.f));
+		alGetSourcefv (channel->Source, AL_VELOCITY, values);
+		CheckVector (values, 960.f, 0.f, 0.f, "Doppler recession keeps the world velocity direction");
+		alGetSourcef (channel->Source, AL_GAIN, &gain);
+		renderer.UpdateSoundParams3D (&listener, channel->Owner, false, sourcePosition, FVector3 (100000.f, 0.f, 0.f));
+		alGetSourcefv (channel->Source, AL_VELOCITY, values);
+		Check (NearlyEqual (sqrtf (values[0] * values[0] + values[1] * values[1] + values[2] * values[2]), 32956.8f) &&
+			NearlyEqual (gain, channel->EffectiveGain), "Doppler clamps finite source velocity without changing manual gain");
+		renderer.UpdateSoundParams3D (&listener, channel->Owner, false, sourcePosition, FVector3 (std::numeric_limits<float>::infinity (), 1.f, 1.f));
+		alGetSourcefv (channel->Source, AL_VELOCITY, values);
+		CheckVector (values, 0.f, 0.f, 0.f, "Doppler clears non-finite source velocity");
+	}
+
+	void TestDopplerNonSpatialState (OpenALSoundRenderer &renderer, SoundHandle stereoSound)
+	{
+		ALfloat values[3];
+		FISoundChannel *twoD = renderer.StartSound (stereoSound, 0.8f, 128, 0, SNDF_LOOP, NULL);
+		OpenALChannel *twoDChannel = twoD == NULL ? NULL : (OpenALChannel *)twoD->SysChannel;
+		if (twoDChannel != NULL) alGetSourcefv (twoDChannel->Source, AL_VELOCITY, values);
+		Check (twoDChannel != NULL && alGetError () == AL_NO_ERROR && values[0] == 0.f && values[1] == 0.f && values[2] == 0.f,
+			"2D source reuse clears Doppler velocity");
+		StopAndDrain (renderer, twoD);
+		ReleaseOwner (twoD);
+		OpenALSoundStream *music = renderer.CreatePatternStreamForTest (16, 0, 0, 8);
+		if (music != NULL) alGetSourcefv (music->Source, AL_VELOCITY, values);
+		Check (music != NULL && alGetError () == AL_NO_ERROR && values[0] == 0.f && values[1] == 0.f && values[2] == 0.f,
+			"music source keeps zero Doppler velocity");
+		delete music;
+	}
+
 	void Test3DState (OpenALSoundRenderer &renderer, SoundHandle stereoSound)
 	{
 		SoundListener listener;
@@ -2517,7 +2620,7 @@ namespace
 		ALfloat values[6];
 		ALint relative;
 		ALint buffer;
-		ALfloat gain;
+		ALfloat gain = 0.f;
 		OpenALSound *sound = (OpenALSound *)stereoSound.data;
 		listener.position = FVector3 (10.f, 20.f, 30.f);
 		listener.velocity = FVector3 (4.f, 5.f, 6.f);
@@ -2545,6 +2648,7 @@ namespace
 			CheckVector (values, 50.f, 7.f, -9.f, "source position uses OpenAL handedness");
 			alGetSourcefv (openalChannel->Source, AL_VELOCITY, values);
 			CheckVector (values, 1.f, 2.f, -3.f, "source velocity uses OpenAL handedness");
+			TestDopplerSourceState (renderer, listener, openalChannel, sourcePosition);
 			alGetSourcef (openalChannel->Source, AL_GAIN, &gain);
 			Check (NearlyEqual (gain, 0.8f * (1.f - (sqrtf (2210.f) * 2.f) / 100.f)), "manual rolloff applies distance scale to AL gain");
 
@@ -2553,6 +2657,16 @@ namespace
 			alGetSourcefv (openalChannel->Source, AL_POSITION, values);
 			Check (relative == AL_TRUE, "listener-coincident source is head relative");
 			CheckVector (values, 0.f, 0.f, 0.f, "listener-coincident source uses relative origin");
+			alGetSourcefv (openalChannel->Source, AL_VELOCITY, values);
+			CheckVector (values, 0.f, 0.f, 0.f, "listener-coincident source clears Doppler velocity");
+			ALfloat factor = 0.f;
+			renderer.InjectDopplerConfigurationFailureForTest ();
+			alGetError ();
+			Check (renderer.ConfigureDoppler () && !renderer.Capabilities.DopplerApplied &&
+				(alGetFloatv (AL_DOPPLER_FACTOR, &factor), alGetError () == AL_NO_ERROR && factor == 0.f),
+				"Doppler rejection leaves a verified disabled factor");
+			Check (renderer.ConfigureDoppler () && renderer.Capabilities.DopplerApplied,
+				"Doppler configuration recovers after an injected rejection");
 
 			renderer.UpdateSoundParams3D (&listener, channel, true, FVector3 (42.f, 20.f, 30.f), FVector3 ());
 			alGetSourcei (openalChannel->Source, AL_SOURCE_RELATIVE, &relative);
@@ -2565,6 +2679,7 @@ namespace
 			StopAndDrain (renderer, channel);
 		}
 		ReleaseOwner (channel);
+		TestDopplerNonSpatialState (renderer, stereoSound);
 	}
 
 	void TestEviction (OpenALSoundRenderer &renderer, SoundHandle sound)
@@ -2803,6 +2918,77 @@ namespace
 		}
 	}
 
+	static void Test3DResetHandoff (std::vector<BYTE> &loopSamples)
+	{
+		FISoundChannel *loopOwner = NULL;
+		unsigned int savedPosition = 0;
+		ALfloat savedPitch = 0.f;
+		ALfloat savedGain = 0.f;
+		{
+			OpenALSoundRenderer oldRenderer;
+			SoundListener listener;
+			FRolloffInfo rolloff = MakeLinearRolloff (0.f, 100.f);
+			Check (oldRenderer.IsValid (), "old renderer initializes for 3D reset handoff");
+			if (!oldRenderer.IsValid ())
+			{
+				return;
+			}
+			listener.valid = true;
+			listener.underwater = true;
+			listener.Environment = DefaultEnvironments[0];
+			oldRenderer.UpdateListener (&listener);
+			SoundHandle loopSound = oldRenderer.LoadSoundRaw (&loopSamples[0], (int)loopSamples.size (), 8000, 1, -16, 100, 500);
+			loopOwner = oldRenderer.StartSound3D (loopSound, &listener, 0.8f, &rolloff, 1.f, 192, 80,
+				FVector3 (10.f, 0.f, 0.f), FVector3 (), 0, SNDF_LOOP, NULL);
+			if (loopOwner != NULL && loopOwner->SysChannel != NULL)
+			{
+				unsigned int source = ((OpenALChannel *)loopOwner->SysChannel)->Source;
+				alGetSourcef (source, AL_PITCH, &savedPitch);
+				alGetSourcef (source, AL_GAIN, &savedGain);
+				alSourcei (source, AL_SAMPLE_OFFSET, 321);
+				alGetError ();
+			}
+			savedPosition = oldRenderer.GetPosition (loopOwner);
+			oldRenderer.StopChannel (loopOwner);
+			Check (loopOwner != NULL && loopOwner->SysChannel != NULL && savedPosition == 321 &&
+				NearlyEqual (savedPitch, 1.5f * .7937005f) && NearlyEqual (savedGain, .72f),
+				"3D reset eviction records the live cursor, water pitch, and spatial gain before backend shutdown");
+			oldRenderer.UnloadSound (loopSound);
+		}
+		if (loopOwner != NULL)
+		{
+			OpenALSoundRenderer freshRenderer;
+			SoundListener listener;
+			Check (freshRenderer.IsValid (), "fresh renderer initializes for 3D reset restore");
+			if (freshRenderer.IsValid ())
+			{
+				listener.valid = true;
+				listener.underwater = true;
+				listener.Environment = DefaultEnvironments[0];
+				freshRenderer.UpdateListener (&listener);
+				SoundHandle loopSound = freshRenderer.LoadSoundRaw (&loopSamples[0], (int)loopSamples.size (), 8000, 1, -16, 100, 500);
+				loopOwner->StartTime.AsOne = savedPosition;
+				FISoundChannel *restored = freshRenderer.StartSound3D (loopSound, &listener, 0.8f, &loopOwner->Rolloff, 1.f, 192, 80,
+					FVector3 (10.f, 0.f, 0.f), FVector3 (), 0, SNDF_LOOP | SNDF_ABSTIME, loopOwner);
+				ALfloat restoredPitch = 0.f;
+				ALfloat restoredGain = 0.f;
+				if (restored != NULL && restored->SysChannel != NULL)
+				{
+					unsigned int source = ((OpenALChannel *)restored->SysChannel)->Source;
+					alGetSourcef (source, AL_PITCH, &restoredPitch);
+					alGetSourcef (source, AL_GAIN, &restoredGain);
+				}
+				Check (restored == loopOwner && loopOwner->SysChannel != NULL &&
+					abs ((int)SourceOffset (loopOwner) - (int)savedPosition) <= 2 && SourceState (loopOwner) == AL_PLAYING &&
+					NearlyEqual (restoredPitch, savedPitch) && NearlyEqual (restoredGain, savedGain),
+					"fresh renderer restores a 3D underwater loop with its cursor, pitch, gain, and playing source state");
+				StopAndDrain (freshRenderer, loopOwner);
+				freshRenderer.UnloadSound (loopSound);
+			}
+			ReleaseOwner (loopOwner);
+		}
+	}
+
 	void TestCrossRendererResetHandoff ()
 	{
 		std::vector<BYTE> loopSamples = MakeSamples (8000);
@@ -2812,6 +2998,7 @@ namespace
 			return;
 		}
 		TestDelayedOneShotHandoff (oneShotSamples);
+		Test3DResetHandoff (loopSamples);
 	}
 
 
@@ -3719,6 +3906,7 @@ static int RunDefaultRendererTests (OpenALSoundRenderer &renderer, std::vector<B
 	TestWaterPitchAndInitialVirtual (renderer, longSound);
 	TestTerminalVirtualOneShot (renderer, longSound);
 	TestEvictionAdoptsSourcePosition (renderer, longSound);
+	Test3DUnderwaterEvictionRestart (renderer);
 	TestStoppedSourcePositionResolution (renderer, longSound);
 	TestNaturalFinishPoolEviction (renderer, longSound);
 	TestInactiveMuteAndComplete (renderer, longSound);

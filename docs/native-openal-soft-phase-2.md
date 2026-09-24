@@ -1,11 +1,11 @@
-# Native OpenAL Soft: Phase 2C Current State
+# Native OpenAL Soft: Phase 2D-1 Current State
 
 ## Scope
 
 This document describes the implemented 2B-1 shared environment state and
 numeric adapter, 2B-2 OpenAL EFX environment routing, 2B-3 underwater
-pitch/low-pass and virtual-position behavior, and the approved 2C source-radius
-boundary. The existing FMOD backend,
+pitch/low-pass and virtual-position behavior, the approved 2C source-radius
+boundary, and the 2D-1 source-only Doppler implementation. The existing FMOD backend,
 `snd_backend` selection, fallback behavior, music selection, CVAR defaults,
 compatibility behavior, `AL_NONE` distance model, and manual rolloff remain
 unchanged.
@@ -21,10 +21,11 @@ the owning context.
 
 2B-2 adds source send routing on top of those resources. 2B-3 adds the
 water-pitch/low-pass approximation and the initial virtual-start position
-registration. 2C adds the bounded source-radius behavior described below;
-Doppler remains disabled.
+registration. 2C adds the bounded source-radius behavior described below.
+2D-1 adds the standard source-only Doppler behavior described below; FMOD is
+unchanged.
 
-This is the current 2C implementation state, not a Phase 2 completion claim.
+This is the current 2D-1 implementation state, not a Phase 2 completion claim.
 
 ## 2B-3 Underwater Implementation
 
@@ -163,13 +164,41 @@ extension or unavailable device is an early capability path, not a successful
 source-routing test. Non-finite reverb pan is converted to zero and warns at
 most once per renderer/context.
 
-## Deferred Boundaries
+## 2D-1 Source-Only Doppler
 
-The following remain intentionally outside 2B-3:
+For a finite, non-relative 3D source, the renderer configures the OpenAL
+context with `alSpeedOfSound(32956.8f)` and `alDopplerFactor(0.5f)`. The
+listener velocity is zero. The standard source-only ratio is therefore
 
-- Doppler behavior (2D); and
-- the legacy FMOD wet graph, Q=2 behavior, wet-tail filtering, and full FMOD
-  acoustic equivalence.
+$$R=\frac{32956.8}{32956.8-0.5v_{sr}}.$$
+
+The actor's existing world velocity is consumed once after the established
+`(X,Y,-Z)` coordinate transform. The implementation does not multiply by
+`TICRATE`, derive velocity from position differences, divide by 96 again, or
+change `DistanceScale` or manual rolloff. Non-finite velocity becomes zero;
+finite extreme velocity is direction-preservingly bounded so that
+`D*|v| <= 0.5c`. Relative sources, inner `AREA` sources, 2D sources, and
+music use zero velocity, including after source reuse.
+
+`AL_PITCH` remains the base pitch multiplied by the water factor only. Live
+source state uses the authoritative OpenAL offset before eviction, save, water
+changes, and restart; virtual sources advance with Doppler factor `1`. The
+tested water/3D lifecycle case `Test3DUnderwaterEvictionRestart` records
+`pitch=1.1905508` for velocity `(3,4,-5)` and verifies the live-to-virtual
+offset and restart handoff. The tested live values include offset `450`,
+virtual offset `202`, and restart offset `202`.
+
+If the optional Doppler settings are rejected, the renderer verifies factor
+zero and continues ordinary playback when that safe state is established. If
+the disabled state cannot be established, initialization does not claim
+success. No Doppler CVAR or FMOD matching adjustment is added.
+
+The legacy FMOD wet graph, Q=2 behavior, wet-tail filtering, and full FMOD
+acoustic equivalence remain outside this work. The historical 2D-0 FMOD
+comparison remains FAIL under the original FMOD-equivalence contract; approximately 2% high-
+speed divergence from FMOD is expected and is not an OpenAL standard-formula
+failure. The accepted loopback OpenAL formula result is the relevant new
+criterion.
 
 No full acoustic equivalence with FMOD is claimed. In particular, the legacy
 water wet graph, Q=2 behavior, wet-tail filtering, listener velocity, and
@@ -273,6 +302,41 @@ Release build as successful and `2/2` tests passed. The shared `NO_SOUND` and
 unchanged from the accepted baseline. These are 2B-3 validation results; they
 do not make the overall Phase 2 complete.
 
+## 2D-1 Verification Record
+
+The 2D-1 implementation is present in the OpenAL source path, while the final
+independent 2D-1 review is approved (GREEN). The latest final integration Cppcheck
+result is retained at
+`completes/native-openal-soft-phase-2/2d-1/final-integration/3d-water-lifecycle-20260925/cppcheck-full/run-20260925-022237-3df053f636394605bea362013427119a/final-result.json`.
+It passed with exit code `0`, `New=0`, and `UnresolvedVendor=0`.
+
+The current focused CTest evidence records `2/2` passed. The added moving
+underwater 3D lifecycle case is in the current test input with SHA256
+`04C88E9DE154E3082E17684FFB385963C8854E2DA06F78E5EB5915071807C91F`.
+The test exercises the live source, virtual Doppler-free progression during
+eviction, and restart handoff; it is not a full save-game or renderer-ABSTIME
+claim. The reset repair preserves the owner's rolloff through context
+replacement; manual dry reset and water reset observations were normal.
+
+D01 through D10 are recorded as manual PASS, including the independent D09
+prediction-correction observation. D09 has an approximately 110-second user
+observation with audible chainsaw continuity and no anomaly. The independent
+raw-log review found actor velocity `8.62236023` world units/second and a
+consecutive-position derivative of `20.0143432617`; the consumed actor
+velocity, not the correction-spanning position derivative, is the accepted
+source velocity. The original producer formula was not accepted as the basis
+for this result. D09 remains a bounded observation and does not prove that
+every correction came from a server pulse.
+
+The formal parent Lizard run checked the four phase C++ files in the isolated
+index and reported no new complexity regressions. Its raw log is retained at
+`completes/native-openal-soft-phase-2/2d-1/final-integration/3d-water-lifecycle-20260925/parent-final-lizard.raw.log`;
+it records `LIZARD_EXIT=0` and `REAL_INDEX_UNCHANGED=True`. Saved legacy PK3
+Release byte equality also remains unverified.
+The local runtime identity is `1.1 ALSOFT`; it is not an exact OpenAL Soft
+`1.25.2` claim. No stock-compatibility passing claim is made for 2E, which
+remains unapproved.
+
 The latest 2B-3 terminal-repair full Cppcheck input is the six-file working-tree
 capture at
 `completes/native-openal-soft-phase-2/2b-3/cppcheck-input/review2-terminal-working-tree-capture-7b1fcf1415953957c7cab69058479480928ab518/manifest.json`;
@@ -360,8 +424,8 @@ direct OpenAL readback, not human confirmation.
 The FMOD comparison boundary is deliberately narrower: FMOD uses its existing
 continuous `3DPanLevel` range `0..32`, while OpenAL applies the discrete 2C
 boundary above. No exact FMOD equivalence and no final RMS-constant claim are
-made. Doppler remains disabled; 2C adds no CVAR, inner-radius redesign, or gain
-compensation.
+made. 2C adds no CVAR, inner-radius redesign, or gain compensation; 2D-1
+source-only Doppler is documented separately above.
 
 The current 2C review1-fix working-tree capture is
 `completes/native-openal-soft-phase-2/2c/review1-fix/working-tree-capture-review1-fix-20260922-101500/manifest.json`.
@@ -448,8 +512,9 @@ The current game PID `22748` remains running for the user; the old PID `46304`
 was quit by the user. The independent ROUND3 review is approved (`GREEN`);
 code hashes are unchanged, all required 2C manual results are accepted, the
 user-accepted PK3 past-incident exception remains accepted, and no findings
-were reported. The 2C commit remains pending, Phase 2 is not yet complete
-overall, and 2D has not started. Codacy local analysis remains unavailable on
+were reported. The historical 2C checkpoint was committed as
+`ab7c308238146a59bf5329860a39c664dda22808`; Phase 2 is not yet complete
+overall, and the 2D-1 final review is approved (GREEN). Codacy local analysis remains unavailable on
 this Windows native path and no setup was performed.
 
 ## Manual Baseline Procedure
@@ -508,7 +573,7 @@ down were difficult to distinguish. It does not establish that all six
 directions are clear or require a correction for individual listening
 variation.
 
-Do not treat this baseline as evidence that radius or Doppler is active. The final Release and
+Do not treat this baseline as evidence that radius or 2D-1 Doppler is active. The final Release and
 NO_SOUND/SERVERONLY records also have valid exit-code-0 results. Historical 2A-1
 analyzer and source-hash records remain historical phase evidence and are not
 presented as new 2A-2 measurements. Earlier automatic NO_SOUND and SERVERONLY
@@ -564,8 +629,8 @@ whether the latest spatial application successfully set its requested radius;
 EFX reset, 2D/music reset, and source reuse reset do not update it. It is not
 per-source proof that radius `32` is active. `RoomRolloffFactor` is retained as an EFX
 parameter, but it does not reproduce FMOD's distance attenuation in this
-`AL_NONE` plus manual-rolloff arrangement. Doppler remains disabled and its
-factor remains zero. These constraints are independent of the implemented
+`AL_NONE` plus manual-rolloff arrangement. The 2D-1 standard Doppler settings
+are independent of the implemented
 water pitch/low-pass and virtual-position behavior.
 
 The routing tests observe product-side source setter calls and OpenAL error
@@ -629,8 +694,7 @@ force.
 
 ## Deferred Work
 
-Later units may add HRTF profile selection or live context reset, or calibrate
-and enable source-only Doppler. The
+Later units may add HRTF profile selection or live context reset. The
 existing `snd_reset` path recreates the renderer and is the current HRTF
 application boundary; live `alcResetDeviceSOFT` is not implemented. Full
 acoustic equivalence with FMOD, including the distance behavior of

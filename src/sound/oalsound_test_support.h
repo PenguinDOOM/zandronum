@@ -54,17 +54,28 @@ struct SoundHandle
 	void *data;
 };
 
+struct FRolloffInfo
+{
+	int RolloffType;
+	float MinDistance;
+	union { float MaxDistance; float RolloffFactor; };
+};
+
 struct FISoundChannel
 {
 	FISoundChannel ()
 		: SysChannel (NULL), StartTime (), Priority (0)
 	{
 		StartTime.AsOne = 0;
+		Rolloff.RolloffType = 0;
+		Rolloff.MinDistance = 0.f;
+		Rolloff.MaxDistance = 0.f;
 	}
 
 	void *SysChannel;
 	OALTestQwordUnion StartTime;
 	int Priority;
+	FRolloffInfo Rolloff;
 };
 
 class SoundStream
@@ -158,13 +169,6 @@ public:
 	bool underwater;
 	bool valid;
 	ReverbContainer *Environment;
-};
-
-struct FRolloffInfo
-{
-	int RolloffType;
-	float MinDistance;
-	union { float MaxDistance; float RolloffFactor; };
 };
 
 enum

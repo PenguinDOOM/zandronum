@@ -114,6 +114,7 @@ struct OpenALCapabilities
 	int EFXSendCount;
 	bool RadiusAdvertised;
 	bool RadiusApplied;
+	bool DopplerRequested;
 	bool DopplerApplied;
 
 	OpenALCapabilities ();
@@ -525,6 +526,7 @@ private:
 	void ApplyChannelGain (OpenALChannel *channel);
 	float CalculateRolloffGain (FRolloffInfo &rolloff, float distanceScale, SoundListener *listener, const FVector3 &position, float *distance) const;
 	bool ApplySpatialState (OpenALChannel *channel, SoundListener *listener, const FVector3 &position, const FVector3 &velocity);
+	bool ConfigureDoppler ();
 	void DestroySound (OpenALSound *sound);
 	bool IsSourceReserved (unsigned int source) const;
 	void AdvanceClocks ();
@@ -571,6 +573,7 @@ private:
 	void InjectStartSetupFailureForTest ();
 	void InjectPositionQueryFailureForTest ();
 	void InjectSpatialStateFailureForTest ();
+	void InjectDopplerConfigurationFailureForTest ();
 	void InjectSpatialRadiusFailureForTest (bool persistent = false);
 	void ClearSpatialRadiusFailureForTest ();
 	void InjectEFXSourceFailureForTest (OpenALEFXFailure failure = OALEFXFAIL_WetSend, bool persistent = false, unsigned int source = 0);
@@ -636,6 +639,7 @@ private:
 	unsigned int FailEFXSourceAssignSource;
 	unsigned int EFXSourceFailureCalls;
 	bool EFXSourceFailureCallLimitExceeded;
+	bool FailNextDopplerConfiguration;
 	unsigned int LastEFXSource;
 	int LastEFXSlot;
 	int LastEFXSend;
