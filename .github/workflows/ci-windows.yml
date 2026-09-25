@@ -20,6 +20,52 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Record vendor checkout bytes
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+                $coreAutocrlfOutput = git config --get core.autocrlf
+                $coreAutocrlfExitCode = $LASTEXITCODE
+                $coreAutocrlf = $null
+                $coreAutocrlfStatus = $null
+                if ($coreAutocrlfExitCode -eq 0) {
+                    $coreAutocrlf = $coreAutocrlfOutput.Trim()
+                    $coreAutocrlfStatus = 'configured'
+                } elseif ($coreAutocrlfExitCode -eq 1) {
+                    $coreAutocrlfStatus = 'unset'
+                    $global:LASTEXITCODE = 0
+                } else {
+                    throw "git config --get core.autocrlf failed with exit code $coreAutocrlfExitCode."
+                }
+        $paths = @(
+          'src/sound/thirdparty/miniaudio/miniaudio.h',
+          'src/sound/thirdparty/miniaudio/LICENSE',
+          'src/sound/thirdparty/stb/stb_vorbis.c',
+          'src/sound/thirdparty/stb/LICENSE'
+        )
+        $records = foreach ($path in $paths) {
+          $fullPath = Join-Path '${{ github.workspace }}' $path
+          $bytes = [IO.File]::ReadAllBytes($fullPath)
+          $crlf = 0
+          for ($index = 0; $index -lt $bytes.Length - 1; $index++) {
+            if ($bytes[$index] -eq 13 -and $bytes[$index + 1] -eq 10) { $crlf++ }
+          }
+          [ordered]@{
+            path = $path
+            raw_sha256 = (Get-FileHash -LiteralPath $fullPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            git_blob_oid = (git rev-parse "HEAD:$path").Trim()
+            raw_git_oid = (git hash-object --no-filters $fullPath).Trim()
+            crlf_count = $crlf
+            lf_count = ([Text.Encoding]::ASCII.GetString($bytes).Split("`n").Count - 1)
+            attributes = (git check-attr text eol -- $path).Trim()
+          }
+        }
+        [ordered]@{
+          core_autocrlf = $coreAutocrlf
+          core_autocrlf_status = $coreAutocrlfStatus
+          core_autocrlf_exit_code = $coreAutocrlfExitCode
+          files = @($records)
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath '${{ github.workspace }}\vendor-checkout-bytes.json' -Encoding utf8
     - name: Set reusable strings
       id: strings
       shell: bash
@@ -129,6 +175,10 @@ jobs:
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
+                $evidenceDirectory = Join-Path $env:RUNNER_TEMP 'ci-runtime-evidence'
+                New-Item -ItemType Directory -Force -Path $evidenceDirectory | Out-Null
+                $env:AUDIO_DECODER_PCM_DUMP_DIR = $evidenceDirectory
+                $env:ALSOFT_LOGLEVEL = '3'
         $openalRoot = '${{ github.workspace }}\openal-soft-install-${{ matrix.platform }}'
         $openalRuntime = Join-Path $openalRoot 'bin\OpenAL32.dll'
         if (!(Test-Path -LiteralPath $openalRuntime -PathType Leaf)) {
@@ -145,6 +195,78 @@ jobs:
         $env:PATH = "$(Split-Path -Parent $openalRuntime)$([IO.Path]::PathSeparator)$env:PATH"
         ctest --test-dir '${{ steps.strings.outputs.build-output-dir }}' -C '${{ matrix.build_type }}' --output-on-failure -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_phase2_unit|openal_lifecycle)$'
         exit $LASTEXITCODE
+
+    - name: Collect CI runtime evidence
+      if: always()
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $evidenceDirectory = Join-Path $env:RUNNER_TEMP 'ci-runtime-evidence'
+        New-Item -ItemType Directory -Force -Path $evidenceDirectory | Out-Null
+        $buildDirectory = '${{ steps.strings.outputs.build-output-dir }}'
+        function Get-FileRecord {
+            param([string]$Path)
+            if (!(Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+            return [ordered]@{
+                path = $Path
+                sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+        }
+        $decoderBinary = @()
+        $decoderProjects = @()
+        $decoderTlogs = @()
+        if (![string]::IsNullOrWhiteSpace($buildDirectory) -and (Test-Path -LiteralPath $buildDirectory -PathType Container)) {
+            $decoderBinary = @(Get-ChildItem -LiteralPath $buildDirectory -Recurse -File -Filter 'audio_decoder_tests.exe' -ErrorAction SilentlyContinue | Select-Object -First 1)
+            $decoderProjects = @(Get-ChildItem -LiteralPath $buildDirectory -Recurse -File -Filter 'audio_decoder_tests.vcxproj' -ErrorAction SilentlyContinue)
+            $decoderTlogs = @(Get-ChildItem -LiteralPath $buildDirectory -Recurse -File -Filter 'CL.command.1.tlog' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'audio_decoder_tests' })
+        }
+        $copiedProjects = @()
+        foreach ($project in $decoderProjects) {
+            $destination = Join-Path $evidenceDirectory ("decoder-" + $project.Directory.Name + '-' + $project.Name)
+            Copy-Item -LiteralPath $project.FullName -Destination $destination
+            $copiedProjects += Get-FileRecord $destination
+        }
+        $copiedTlogs = @()
+        foreach ($tlog in $decoderTlogs) {
+            $destination = Join-Path $evidenceDirectory ("decoder-" + $tlog.Directory.Name + '-' + $tlog.Name)
+            Copy-Item -LiteralPath $tlog.FullName -Destination $destination
+            $copiedTlogs += Get-FileRecord $destination
+        }
+        $fixtureRoot = Join-Path '${{ github.workspace }}' 'tools\testdata\audio'
+        $metadata = [ordered]@{
+            schema = 'phase2-ci-runtime-evidence-v1'
+            ci = [ordered]@{
+                run_sha = '${{ github.sha }}'
+                run = '${{ github.run_id }}'
+                run_attempt = '${{ github.run_attempt }}'
+                job = '${{ github.job }}'
+                platform = '${{ runner.os }}'
+                architecture = '${{ matrix.platform }}'
+                configuration = '${{ matrix.build_type }}'
+            }
+            compiler = [ordered]@{
+                cl_path = (Get-Command cl -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
+                toolset = $env:VCToolsVersion
+            }
+            files = [ordered]@{
+                decoder_binary = if ($decoderBinary.Count -eq 1) { Get-FileRecord $decoderBinary[0].FullName } else { $null }
+                float32_mono = Get-FileRecord (Join-Path $fixtureRoot 'float32_mono.wav')
+                mp3_mono = Get-FileRecord (Join-Path $fixtureRoot 'mp3_mono.mp3')
+                miniaudio_header = Get-FileRecord (Join-Path '${{ github.workspace }}' 'src\sound\thirdparty\miniaudio\miniaudio.h')
+            }
+            decoder_project = [ordered]@{
+                available = $copiedProjects.Count -gt 0
+                files = @($copiedProjects)
+                unavailable_reason = if ($copiedProjects.Count -eq 0) { 'No audio_decoder_tests.vcxproj was generated.' } else { $null }
+            }
+            decoder_compile_commands = [ordered]@{
+                available = $copiedTlogs.Count -gt 0
+                files = @($copiedTlogs)
+                unavailable_reason = if ($copiedTlogs.Count -eq 0) { 'No audio_decoder_tests CL.command.1.tlog was generated.' } else { $null }
+            }
+        }
+        $metadata | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $evidenceDirectory 'ci-runtime-metadata.json') -Encoding utf8
+        Copy-Item -LiteralPath '${{ github.workspace }}\vendor-checkout-bytes.json' -Destination (Join-Path $evidenceDirectory 'vendor-checkout-bytes.json') -ErrorAction SilentlyContinue
 
     - name: Create package
       shell: pwsh
@@ -305,7 +427,7 @@ jobs:
               }
           }
           $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $package 'phase1a-runtime-manifest.json') -Encoding utf8
-                    python scripts/phase1b_audio_gate.py package --package $package --source-root $PWD --sound-enabled
+          python scripts/phase1b_audio_gate.py package --package $package --source-root $PWD --sound-enabled
 
     - name: Upload artefacts
       uses: actions/upload-artifact@v4
@@ -317,6 +439,8 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        path: ${{ steps.strings.outputs.build-output-dir }}/Testing/Temporary/*.log
+        path: |
+          ${{ steps.strings.outputs.build-output-dir }}/Testing/Temporary/*.log
+          ${{ runner.temp }}/ci-runtime-evidence
         name: windows-${{ matrix.platform }}-${{ matrix.build_type }}-ctest-diagnostics
         if-no-files-found: warn

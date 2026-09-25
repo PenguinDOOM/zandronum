@@ -89,7 +89,14 @@ jobs:
         cmake "${cmake_args[@]}"
 
     - name: Build
-      run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config ${{ matrix.build_type }} -j $(nproc) && if [[ "${{ matrix.serveronly }}" == "" ]]; then python3 tools/testdata/audio/validate_phase1b_manifest.py --self-test && ctest --test-dir "${{ steps.strings.outputs.build-output-dir }}" -C "${{ matrix.build_type }}" --output-on-failure --verbose -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_phase2_unit|openal_lifecycle)$'; fi
+      shell: bash
+      run: |
+        set -euo pipefail
+        cmake --build "${{ steps.strings.outputs.build-output-dir }}" --config "${{ matrix.build_type }}" -j "$(nproc)"
+        if [[ "${{ matrix.serveronly }}" == "" ]]; then
+          python3 tools/testdata/audio/validate_phase1b_manifest.py --self-test
+          ALSOFT_LOGLEVEL=3 ctest --test-dir "${{ steps.strings.outputs.build-output-dir }}" -C "${{ matrix.build_type }}" --output-on-failure --verbose -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_phase2_unit|openal_lifecycle)$'
+        fi
 
     - name: Create package
       shell: bash

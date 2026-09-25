@@ -1,0 +1,4 @@
+src/sound/thirdparty/miniaudio/miniaudio.h text eol=lf
+src/sound/thirdparty/miniaudio/LICENSE text eol=lf
+src/sound/thirdparty/stb/stb_vorbis.c text eol=lf
+src/sound/thirdparty/stb/LICENSE text eol=lf

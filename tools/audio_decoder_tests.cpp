@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <limits>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <string>
 #include <vector>
@@ -831,6 +832,148 @@ namespace
 		return hash;
 	}
 
+	bool IsEvidenceFixture (const char *filename)
+	{
+		return strcmp (filename, "float32_mono.wav") == 0 || strcmp (filename, "mp3_mono.mp3") == 0;
+	}
+
+	std::string EvidencePath (const char *directory, const char *filename, const char *extension)
+	{
+		std::string path (directory);
+		if (!path.empty () && path[path.size () - 1] != '/' && path[path.size () - 1] != '\\')
+		{
+			path += '/';
+		}
+		return path + filename + extension;
+	}
+
+	bool WriteEvidenceFile (const std::string &path, const unsigned char *data, std::size_t bytes)
+	{
+		FILE *file = fopen (path.c_str (), "wb");
+		if (file == NULL)
+		{
+			return false;
+		}
+		if ((bytes != 0 && fwrite (data, 1, bytes, file) != bytes))
+		{
+			fclose (file);
+			remove (path.c_str ());
+			return false;
+		}
+		if (fclose (file) != 0)
+		{
+			remove (path.c_str ());
+			return false;
+		}
+		return true;
+	}
+
+	void AppendPCM16LE (const AudioDecodedPCM16 &decoded, std::vector<unsigned char> *bytes)
+	{
+		bytes->clear ();
+		bytes->reserve (decoded.Samples.size () * 2);
+		for (std::size_t index = 0; index < decoded.Samples.size (); ++index)
+		{
+			unsigned short sample = (unsigned short)decoded.Samples[index];
+			bytes->push_back ((unsigned char)sample);
+			bytes->push_back ((unsigned char)(sample >> 8));
+		}
+	}
+
+	std::string JSONEscape (const char *value)
+	{
+		static const char hex[] = "0123456789abcdef";
+		std::string escaped;
+		for (const unsigned char *character = (const unsigned char *)value; *character != 0; ++character)
+		{
+			if (*character == '"' || *character == '\\') escaped += '\\';
+			if (*character < 0x20)
+			{
+				escaped += "\\u00";
+				escaped += hex[*character >> 4];
+				escaped += hex[*character & 15];
+			}
+			else escaped += (char)*character;
+		}
+		return escaped;
+	}
+
+	const char *EvidenceFormatName (AudioFormat format)
+	{
+		return format == AUDIO_FORMAT_WAVE_FLOAT ? "wave-float" : format == AUDIO_FORMAT_MPEG ? "mpeg" : "unknown";
+	}
+
+	std::string EvidenceCompilerName ()
+	{
+		char name[96];
+#if defined(_MSC_FULL_VER)
+		snprintf (name, sizeof (name), "MSVC %d", _MSC_FULL_VER);
+#elif defined(_MSC_VER)
+		snprintf (name, sizeof (name), "MSVC %d", _MSC_VER);
+#elif defined(__VERSION__)
+		snprintf (name, sizeof (name), "%s", __VERSION__);
+#else
+		snprintf (name, sizeof (name), "unknown");
+#endif
+		return name;
+	}
+
+	const char *EvidenceArchitecture ()
+	{
+#if defined(_M_X64) || defined(__x86_64__)
+		return "x64";
+#elif defined(_M_IX86) || defined(__i386__)
+		return "x86";
+#elif defined(_M_ARM64) || defined(__aarch64__)
+		return "arm64";
+#else
+		return "unknown";
+#endif
+	}
+
+	std::string EvidenceMIx86Fp ()
+	{
+#if defined(_M_IX86_FP)
+		char value[16];
+		snprintf (value, sizeof (value), "%d", _M_IX86_FP);
+		return value;
+#else
+		return "unknown";
+#endif
+	}
+
+	std::string EvidenceMetadata (const char *filename, AudioFormat format, const AudioDecodedPCM16 &decoded, unsigned long long expectedHash, std::size_t byteCount)
+	{
+		char numbers[384];
+		unsigned long long frames = decoded.Channels == 0 ? 0 : (unsigned long long)(decoded.Samples.size () / decoded.Channels);
+		snprintf (numbers, sizeof (numbers), ",\"actualRate\":%u,\"channels\":%u,\"sampleCount\":%llu,\"frameCount\":%llu,\"byteCount\":%llu,\"actualHash\":\"%llu\",\"expectedHash\":\"%llu\",\"dataHashAlgorithm\":\"HashPCM16\",\"dataHashIncludesMetadata\":false,\"testTU\":{\"compiler\":\"%s\",\"architecture\":\"%s\",\"pointerWidth\":%u,\"mIx86Fp\":\"%s\",\"decoderCompileFlags\":\"not-decoder-compile-flags\"}}\n", decoded.SampleRate, decoded.Channels, (unsigned long long)decoded.Samples.size (), frames, (unsigned long long)byteCount, HashPCM16 (decoded), expectedHash, JSONEscape (EvidenceCompilerName ().c_str ()).c_str (), EvidenceArchitecture (), (unsigned int)(sizeof (void *) * CHAR_BIT), JSONEscape (EvidenceMIx86Fp ().c_str ()).c_str ()
+		);
+		return std::string ("{\"schema\":\"phase2-evidence-v1\",\"fixture\":\"") + JSONEscape (filename) + "\",\"format\":\"" + EvidenceFormatName (format) + "\"" + numbers;
+	}
+
+	void CollectFixtureEvidence (const char *filename, AudioFormat format, const AudioDecodedPCM16 &decoded, unsigned long long expectedHash)
+	{
+		const char *directory = getenv ("AUDIO_DECODER_PCM_DUMP_DIR");
+		std::vector<unsigned char> pcm;
+		std::string pcmPath;
+		std::string metadataPath;
+		std::string metadata;
+		if (directory == NULL || directory[0] == 0 || !IsEvidenceFixture (filename))
+		{
+			return;
+		}
+		AppendPCM16LE (decoded, &pcm);
+		pcmPath = EvidencePath (directory, filename, ".pcm16le");
+		metadataPath = EvidencePath (directory, filename, ".json");
+		metadata = EvidenceMetadata (filename, format, decoded, expectedHash, pcm.size ());
+		if (!WriteEvidenceFile (pcmPath, pcm.empty () ? NULL : &pcm[0], pcm.size ()) || !WriteEvidenceFile (metadataPath, (const unsigned char *)metadata.data (), metadata.size ()))
+		{
+			remove (pcmPath.c_str ());
+			remove (metadataPath.c_str ());
+			Check (false, "PCM evidence collection write failed");
+		}
+	}
+
 	void TestDecoderExactEOF (AudioDecoder *decoder, short *frames, std::size_t *framesRead, unsigned long long expectedFrames, const char *name)
 	{
 		AudioDecoderSeekStatus seekStatus = decoder->SeekFrame (expectedFrames);
@@ -1142,6 +1285,7 @@ namespace
 		{
 			return;
 		}
+		CollectFixtureEvidence (filename, expectedFormat, memoryPCM, expectedPCMHash);
 		TestFixtureFileParity (path.c_str (), expectedFormat, memoryPCM, name);
 		if (!TestFixtureSliceParity (bytes, expectedFormat, memoryPCM, name))
 		{
