@@ -50,9 +50,11 @@ jobs:
         & cmake --install $openalBuild --config '${{ matrix.build_type }}'
         $openalHeader = Join-Path $openalRoot 'include\AL\al.h'
         $openalLibrary = Join-Path $openalRoot 'lib\OpenAL32.lib'
+        $openalRuntime = Join-Path $openalRoot 'bin\OpenAL32.dll'
         if (!(Test-Path -LiteralPath $openalHeader -PathType Leaf) -or
-            !(Test-Path -LiteralPath $openalLibrary -PathType Leaf)) {
-            throw "Pinned OpenAL Soft install for ${{ matrix.platform }} must contain include\AL\al.h and lib\OpenAL32.lib."
+            !(Test-Path -LiteralPath $openalLibrary -PathType Leaf) -or
+            !(Test-Path -LiteralPath $openalRuntime -PathType Leaf)) {
+            throw "Pinned OpenAL Soft install for ${{ matrix.platform }} must contain include\AL\al.h, lib\OpenAL32.lib, and bin\OpenAL32.dll."
         }
         echo "OPENAL_INCLUDE_DIR=$openalRoot\include" >> $env:GITHUB_ENV
         echo "OPENAL_LIBRARY=$openalRoot\lib\OpenAL32.lib" >> $env:GITHUB_ENV
@@ -122,6 +124,25 @@ jobs:
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         python tools/testdata/audio/validate_phase1b_manifest.py --self-test
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    - name: Run audio tests
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $openalRoot = '${{ github.workspace }}\openal-soft-install-${{ matrix.platform }}'
+        $openalRuntime = Join-Path $openalRoot 'bin\OpenAL32.dll'
+        if (!(Test-Path -LiteralPath $openalRuntime -PathType Leaf)) {
+            throw "Pinned OpenAL Soft runtime is missing: $openalRuntime"
+        }
+        $resolvedOpenalCommit = (git -C '${{ github.workspace }}\openal-soft' rev-parse HEAD).Trim()
+        if ($resolvedOpenalCommit -cne $env:OPENAL_COMMIT) {
+            throw "Pinned OpenAL Soft source commit mismatch: expected $env:OPENAL_COMMIT, got $resolvedOpenalCommit"
+        }
+        $openalRuntimeHash = (Get-FileHash -LiteralPath $openalRuntime -Algorithm SHA256).Hash.ToLowerInvariant()
+        Write-Host "OpenAL runtime for CTest: $openalRuntime"
+        Write-Host "OpenAL source commit: $resolvedOpenalCommit"
+        Write-Host "OpenAL runtime SHA256: $openalRuntimeHash"
+        $env:PATH = "$(Split-Path -Parent $openalRuntime)$([IO.Path]::PathSeparator)$env:PATH"
         ctest --test-dir '${{ steps.strings.outputs.build-output-dir }}' -C '${{ matrix.build_type }}' --output-on-failure -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_phase2_unit|openal_lifecycle)$'
         exit $LASTEXITCODE
 
@@ -291,3 +312,11 @@ jobs:
       with:
         path: package
         name: ${{ matrix.platform }} ${{ matrix.build_type }}
+
+    - name: Upload CTest diagnostics
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        path: ${{ steps.strings.outputs.build-output-dir }}/Testing/Temporary/*.log
+        name: windows-${{ matrix.platform }}-${{ matrix.build_type }}-ctest-diagnostics
+        if-no-files-found: warn

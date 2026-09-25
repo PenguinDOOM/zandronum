@@ -89,7 +89,7 @@ jobs:
         cmake "${cmake_args[@]}"
 
     - name: Build
-      run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config ${{ matrix.build_type }} -j $(nproc) && if [[ "${{ matrix.serveronly }}" == "" ]]; then python3 tools/testdata/audio/validate_phase1b_manifest.py --self-test && ctest --test-dir "${{ steps.strings.outputs.build-output-dir }}" -C "${{ matrix.build_type }}" --output-on-failure -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_phase2_unit|openal_lifecycle)$'; fi
+      run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config ${{ matrix.build_type }} -j $(nproc) && if [[ "${{ matrix.serveronly }}" == "" ]]; then python3 tools/testdata/audio/validate_phase1b_manifest.py --self-test && ctest --test-dir "${{ steps.strings.outputs.build-output-dir }}" -C "${{ matrix.build_type }}" --output-on-failure --verbose -R '^(audio_decoder|openal_pcm|midi_device_selection|openal_phase2_unit|openal_lifecycle)$'; fi
 
     - name: Create package
       shell: bash
@@ -234,3 +234,11 @@ jobs:
       with:
         path: package
         name: ${{ matrix.os }} ${{ matrix.build_type }} ${{ matrix.serveronly }}
+
+    - name: Upload CTest diagnostics
+      if: always() && matrix.serveronly == ''
+      uses: actions/upload-artifact@v4
+      with:
+        path: ${{ steps.strings.outputs.build-output-dir }}/Testing/Temporary/*.log
+        name: linux-${{ matrix.os }}-${{ matrix.build_type }}-ctest-diagnostics
+        if-no-files-found: warn

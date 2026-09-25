@@ -3063,9 +3063,11 @@ static int RunPriorityRendererTests (std::vector<BYTE> &longSamples)
 	{
 		if (priorityRenderer.Device == NULL && priorityRenderer.Context == NULL)
 		{
+			fprintf (stderr, "OpenAL initialization log: %s\n", LastPrintf.c_str ());
 			fprintf (stderr, "SKIP: OpenAL device/context could not initialize\n");
 			return 77;
 		}
+		fprintf (stderr, "OpenAL initialization log: %s\n", LastPrintf.c_str ());
 		fprintf (stderr, "FAILED: OpenAL renderer could not initialize after context creation\n");
 		return 1;
 	}
@@ -3932,9 +3934,11 @@ static int RunRendererOperation (const char *operation, std::vector<BYTE> &longS
 	{
 		if (renderer.Device == NULL && renderer.Context == NULL)
 		{
+			fprintf (stderr, "OpenAL initialization log: %s\n", LastPrintf.c_str ());
 			fprintf (stderr, "SKIP: OpenAL device/context could not initialize\n");
 			return 77;
 		}
+		fprintf (stderr, "OpenAL initialization log: %s\n", LastPrintf.c_str ());
 		fprintf (stderr, "FAILED: OpenAL renderer could not initialize after context creation\n");
 		return 1;
 	}

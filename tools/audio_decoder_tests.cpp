@@ -30,6 +30,37 @@ namespace
 		}
 	}
 
+	std::string ComparisonName (const char *name, const char *comparison, unsigned long long actual, unsigned long long expected)
+	{
+		char text[256];
+		snprintf (text, sizeof (text), "%s: %s actual=%llu expected=%llu", name, comparison, actual, expected);
+		return text;
+	}
+
+	std::string PCMComparisonName (const char *name, const AudioDecodedPCM16 &expected, const AudioDecodedPCM16 &actual)
+	{
+		if (actual.SampleRate != expected.SampleRate) return ComparisonName (name, "PCM sample rate", actual.SampleRate, expected.SampleRate);
+		if (actual.Channels != expected.Channels) return ComparisonName (name, "PCM channel count", actual.Channels, expected.Channels);
+		if (actual.Samples.size () != expected.Samples.size ()) return ComparisonName (name, "PCM sample count", actual.Samples.size (), expected.Samples.size ());
+		for (std::size_t index = 0; index < actual.Samples.size (); ++index)
+		{
+			if (actual.Samples[index] != expected.Samples[index])
+			{
+				char text[256];
+				snprintf (text, sizeof (text), "%s: PCM sample index=%llu actual=%d expected=%d", name, (unsigned long long)index, (int)actual.Samples[index], (int)expected.Samples[index]);
+				return text;
+			}
+		}
+		return std::string (name) + ": PCM equality actual=equal expected=equal";
+	}
+
+	std::string PCMFrameComparisonName (const char *name, unsigned int index, short actual, short expected)
+	{
+		char text[256];
+		snprintf (text, sizeof (text), "%s: PCM sample index=%u actual=%d expected=%d", name, index, (int)actual, (int)expected);
+		return text;
+	}
+
 	void AppendLE16 (std::vector<unsigned char> &bytes, unsigned int value)
 	{
 		bytes.push_back ((unsigned char)value);
@@ -802,8 +833,132 @@ namespace
 
 	void TestDecoderExactEOF (AudioDecoder *decoder, short *frames, std::size_t *framesRead, unsigned long long expectedFrames, const char *name)
 	{
-		Check (decoder->SeekFrame (expectedFrames) == AUDIO_DECODER_SEEK_OK && decoder->TellFrame () == expectedFrames && decoder->ReadFrames (frames, 1, framesRead) == AUDIO_DECODER_EOF && *framesRead == 0, name);
-		Check (decoder->SeekFrame (expectedFrames + 1) == AUDIO_DECODER_SEEK_ERROR && decoder->TellFrame () == expectedFrames, name);
+		AudioDecoderSeekStatus seekStatus = decoder->SeekFrame (expectedFrames);
+		if (seekStatus != AUDIO_DECODER_SEEK_OK)
+		{
+			Check (false, ComparisonName (name, "EOF seek status", seekStatus, AUDIO_DECODER_SEEK_OK).c_str ());
+		}
+		else
+		{
+			unsigned long long actualFrame = decoder->TellFrame ();
+			if (actualFrame != expectedFrames)
+			{
+				Check (false, ComparisonName (name, "EOF seek frame", actualFrame, expectedFrames).c_str ());
+			}
+			else
+			{
+				AudioDecoderReadStatus readStatus = decoder->ReadFrames (frames, 1, framesRead);
+				if (readStatus != AUDIO_DECODER_EOF)
+				{
+					Check (false, ComparisonName (name, "EOF read status", readStatus, AUDIO_DECODER_EOF).c_str ());
+				}
+				else
+				{
+					Check (*framesRead == 0, ComparisonName (name, "EOF read frames", *framesRead, 0).c_str ());
+				}
+			}
+		}
+		seekStatus = decoder->SeekFrame (expectedFrames + 1);
+		if (seekStatus != AUDIO_DECODER_SEEK_ERROR)
+		{
+			Check (false, ComparisonName (name, "past-EOF seek status", seekStatus, AUDIO_DECODER_SEEK_ERROR).c_str ());
+		}
+		else
+		{
+			unsigned long long actualFrame = decoder->TellFrame ();
+			Check (actualFrame == expectedFrames, ComparisonName (name, "past-EOF seek frame", actualFrame, expectedFrames).c_str ());
+		}
+	}
+
+	bool TestDecoderStreamRead (AudioDecoder *decoder, short *first, short *frames, std::size_t *framesRead, std::size_t *totalFrames, bool *sawPartialRead, const char *name)
+	{
+		AudioDecoderReadStatus readStatus = decoder->ReadFrames (first, 1, framesRead);
+		if (readStatus != AUDIO_DECODER_DATA)
+		{
+			Check (false, ComparisonName (name, "first-frame read status", readStatus, AUDIO_DECODER_DATA).c_str ());
+			return false;
+		}
+		if (*framesRead != 1)
+		{
+			Check (false, ComparisonName (name, "first-frame read count", *framesRead, 1).c_str ());
+			return false;
+		}
+		for (;;)
+		{
+			AudioDecoderReadStatus status = decoder->ReadFrames (frames, 257, framesRead);
+			if (status == AUDIO_DECODER_EOF)
+			{
+				break;
+			}
+			if (status != AUDIO_DECODER_DATA)
+			{
+				Check (false, ComparisonName (name, "stream read status", status, AUDIO_DECODER_DATA).c_str ());
+				return false;
+			}
+			if (*framesRead == 0)
+			{
+				Check (false, ComparisonName (name, "stream read count", *framesRead, 1).c_str ());
+				return false;
+			}
+			if (*framesRead > 257)
+			{
+				Check (false, ComparisonName (name, "stream read maximum", *framesRead, 257).c_str ());
+				return false;
+			}
+			if (*totalFrames > 1000000)
+			{
+				Check (false, ComparisonName (name, "stream read frame limit", *totalFrames, 1000000).c_str ());
+				return false;
+			}
+			*sawPartialRead = *sawPartialRead || *framesRead < 257;
+			*totalFrames += *framesRead;
+		}
+		readStatus = decoder->ReadFrames (frames, 1, framesRead);
+		if (readStatus != AUDIO_DECODER_EOF)
+		{
+			Check (false, ComparisonName (name, "terminal read status", readStatus, AUDIO_DECODER_EOF).c_str ());
+			return false;
+		}
+		if (*framesRead != 0)
+		{
+			Check (false, ComparisonName (name, "terminal read count", *framesRead, 0).c_str ());
+			return false;
+		}
+		return true;
+	}
+
+	bool TestDecoderRewind (AudioDecoder *decoder, const short *first, short *repeated, std::size_t *framesRead, const char *name)
+	{
+		AudioDecoderSeekStatus seekStatus = decoder->SeekFrame (0);
+		if (seekStatus != AUDIO_DECODER_SEEK_OK)
+		{
+			Check (false, ComparisonName (name, "initial rewind seek status", seekStatus, AUDIO_DECODER_SEEK_OK).c_str ());
+			return false;
+		}
+		seekStatus = decoder->SeekFrame (0);
+		if (seekStatus != AUDIO_DECODER_SEEK_OK)
+		{
+			Check (false, ComparisonName (name, "repeated rewind seek status", seekStatus, AUDIO_DECODER_SEEK_OK).c_str ());
+			return false;
+		}
+		AudioDecoderReadStatus readStatus = decoder->ReadFrames (repeated, 1, framesRead);
+		if (readStatus != AUDIO_DECODER_DATA)
+		{
+			Check (false, ComparisonName (name, "seeked first-frame read status", readStatus, AUDIO_DECODER_DATA).c_str ());
+		}
+		else if (*framesRead != 1)
+		{
+			Check (false, ComparisonName (name, "seeked first-frame read count", *framesRead, 1).c_str ());
+		}
+		else if (repeated[0] != first[0])
+		{
+			Check (false, PCMFrameComparisonName (name, 0, repeated[0], first[0]).c_str ());
+		}
+		else
+		{
+			Check (repeated[1] == first[1], PCMFrameComparisonName (name, 1, repeated[1], first[1]).c_str ());
+		}
+		return true;
 	}
 
 	void TestDecoderReadAndSeek (const char *path, unsigned long long expectedFrames, const char *name)
@@ -816,81 +971,182 @@ namespace
 		short frames[514] = { 0 };
 		std::size_t framesRead = 0;
 		std::size_t totalFrames = 1;
-		bool failed = false;
 		bool sawPartialRead = false;
-		Check (source.Open (path) == AUDIO_SOURCE_OK, name);
-		probe = ProbeAudioFormat (source);
-		if (CreateAudioDecoder (source, probe, &decoder) != AUDIO_DECODE_OK || decoder == NULL)
+		AudioSourceStatus sourceStatus = source.Open (path);
+		if (sourceStatus != AUDIO_SOURCE_OK)
 		{
-			Check (false, name);
+			Check (false, ComparisonName (name, "decoder source open status", sourceStatus, AUDIO_SOURCE_OK).c_str ());
 			return;
 		}
-		Check (decoder->ReadFrames (first, 1, &framesRead) == AUDIO_DECODER_DATA && framesRead == 1, name);
-		for (;;)
+		probe = ProbeAudioFormat (source);
+		if (probe.Status != AUDIO_PROBE_RECOGNIZED)
 		{
-			AudioDecoderReadStatus status = decoder->ReadFrames (frames, 257, &framesRead);
-			if (status == AUDIO_DECODER_EOF)
-			{
-				break;
-			}
-			if (status != AUDIO_DECODER_DATA || framesRead == 0 || framesRead > 257 || totalFrames > 1000000)
-			{
-				failed = true;
-				break;
-			}
-			sawPartialRead = sawPartialRead || framesRead < 257;
-			totalFrames += framesRead;
+			Check (false, ComparisonName (name, "decoder probe status", probe.Status, AUDIO_PROBE_RECOGNIZED).c_str ());
+			return;
 		}
-		Check (!failed && decoder->ReadFrames (frames, 1, &framesRead) == AUDIO_DECODER_EOF && framesRead == 0, name);
-		Check (totalFrames == expectedFrames && sawPartialRead, name);
+		AudioDecodeStatus decodeStatus = CreateAudioDecoder (source, probe, &decoder);
+		if (decodeStatus != AUDIO_DECODE_OK)
+		{
+			Check (false, ComparisonName (name, "decoder create status", decodeStatus, AUDIO_DECODE_OK).c_str ());
+			return;
+		}
+		if (decoder == NULL)
+		{
+			Check (false, ComparisonName (name, "decoder create pointer", 0, 1).c_str ());
+			return;
+		}
+		if (!TestDecoderStreamRead (decoder, first, frames, &framesRead, &totalFrames, &sawPartialRead, name))
+		{
+			delete decoder;
+			return;
+		}
+		Check (totalFrames == expectedFrames, ComparisonName (name, "decoded frame count", totalFrames, expectedFrames).c_str ());
+		Check (sawPartialRead, ComparisonName (name, "partial final read observed", sawPartialRead ? 1 : 0, 1).c_str ());
 		TestDecoderExactEOF (decoder, frames, &framesRead, expectedFrames, name);
-		Check (decoder->SeekFrame (0) == AUDIO_DECODER_SEEK_OK && decoder->SeekFrame (0) == AUDIO_DECODER_SEEK_OK, name);
-		Check (decoder->ReadFrames (repeated, 1, &framesRead) == AUDIO_DECODER_DATA && framesRead == 1 && repeated[0] == first[0] && repeated[1] == first[1], name);
+		TestDecoderRewind (decoder, first, repeated, &framesRead, name);
 		delete decoder;
 	}
 
-	void TestFixtureParity (const char *filename, AudioFormat expectedFormat, unsigned int expectedRate, unsigned int expectedChannels, unsigned long long expectedFrames, unsigned long long expectedPCMHash, const char *name)
+	bool TestFixtureMemoryDecode (const std::vector<unsigned char> &bytes, AudioFormat expectedFormat, unsigned int expectedRate, unsigned int expectedChannels, unsigned long long expectedFrames, unsigned long long expectedPCMHash, const char *name, AudioDecodedPCM16 *memoryPCM)
 	{
-		std::string path = FixturePath (filename);
-		const char *slicePath = "audio_decoder_tests_fixture_slice.bin";
-		std::vector<unsigned char> bytes;
 		AudioMemorySource memory;
-		AudioFileSource file;
-		AudioFileSource slice;
-		AudioDecodedPCM16 memoryPCM;
-		AudioDecodedPCM16 filePCM;
-		AudioDecodedPCM16 slicePCM;
 		AudioProbeResult probe;
-		FILE *wrapper;
-		Check (ReadFileBytes (path.c_str (), &bytes) && !bytes.empty (), name);
-		if (bytes.empty ())
-		{
-			return;
-		}
 		memory.Assign (&bytes[0], bytes.size ());
 		probe = ProbeAudioFormat (memory);
-		Check (probe.Status == AUDIO_PROBE_RECOGNIZED && probe.Format == expectedFormat, name);
-		Check (DecodeAudioToPCM16 (memory, probe, &memoryPCM) == AUDIO_DECODE_OK, name);
-		Check (memoryPCM.SampleRate == expectedRate && memoryPCM.Channels == expectedChannels && memoryPCM.Samples.size () == expectedFrames * expectedChannels, name);
-		Check (HashPCM16 (memoryPCM) == expectedPCMHash, name);
-		Check (file.Open (path.c_str ()) == AUDIO_SOURCE_OK, name);
+		if (probe.Status != AUDIO_PROBE_RECOGNIZED)
+		{
+			Check (false, ComparisonName (name, "memory probe status", probe.Status, AUDIO_PROBE_RECOGNIZED).c_str ());
+			return false;
+		}
+		if (probe.Format != expectedFormat)
+		{
+			Check (false, ComparisonName (name, "memory probe format", probe.Format, expectedFormat).c_str ());
+			return false;
+		}
+		AudioDecodeStatus decodeStatus = DecodeAudioToPCM16 (memory, probe, memoryPCM);
+		if (decodeStatus != AUDIO_DECODE_OK)
+		{
+			Check (false, ComparisonName (name, "memory decode status", decodeStatus, AUDIO_DECODE_OK).c_str ());
+			return false;
+		}
+		Check (memoryPCM->SampleRate == expectedRate, ComparisonName (name, "memory PCM sample rate", memoryPCM->SampleRate, expectedRate).c_str ());
+		Check (memoryPCM->Channels == expectedChannels, ComparisonName (name, "memory PCM channel count", memoryPCM->Channels, expectedChannels).c_str ());
+		Check (memoryPCM->Samples.size () == expectedFrames * expectedChannels, ComparisonName (name, "memory PCM sample count", memoryPCM->Samples.size (), expectedFrames * expectedChannels).c_str ());
+		unsigned long long pcmHash = HashPCM16 (*memoryPCM);
+		Check (pcmHash == expectedPCMHash, ComparisonName (name, "PCM hash", pcmHash, expectedPCMHash).c_str ());
+		return true;
+	}
+
+	void TestFixtureFileParity (const char *path, AudioFormat expectedFormat, const AudioDecodedPCM16 &memoryPCM, const char *name)
+	{
+		AudioFileSource file;
+		AudioDecodedPCM16 filePCM;
+		AudioProbeResult probe;
+		AudioSourceStatus sourceStatus = file.Open (path);
+		if (sourceStatus != AUDIO_SOURCE_OK)
+		{
+			Check (false, ComparisonName (name, "file source open status", sourceStatus, AUDIO_SOURCE_OK).c_str ());
+			return;
+		}
 		probe = ProbeAudioFormat (file);
-		Check (DecodeAudioToPCM16 (file, probe, &filePCM) == AUDIO_DECODE_OK && EqualDecodedPCM (memoryPCM, filePCM), name);
-		wrapper = fopen (slicePath, "wb");
+		if (probe.Status != AUDIO_PROBE_RECOGNIZED)
+		{
+			Check (false, ComparisonName (name, "file probe status", probe.Status, AUDIO_PROBE_RECOGNIZED).c_str ());
+			return;
+		}
+		if (probe.Format != expectedFormat)
+		{
+			Check (false, ComparisonName (name, "file probe format", probe.Format, expectedFormat).c_str ());
+			return;
+		}
+		AudioDecodeStatus decodeStatus = DecodeAudioToPCM16 (file, probe, &filePCM);
+		if (decodeStatus != AUDIO_DECODE_OK)
+		{
+			Check (false, ComparisonName (name, "file decode status", decodeStatus, AUDIO_DECODE_OK).c_str ());
+		}
+		else
+		{
+			Check (EqualDecodedPCM (memoryPCM, filePCM), PCMComparisonName (name, memoryPCM, filePCM).c_str ());
+		}
+	}
+
+	bool TestFixtureSliceParity (const std::vector<unsigned char> &bytes, AudioFormat expectedFormat, const AudioDecodedPCM16 &memoryPCM, const char *name)
+	{
+		const char *slicePath = "audio_decoder_tests_fixture_slice.bin";
+		AudioFileSource slice;
+		AudioDecodedPCM16 slicePCM;
+		AudioProbeResult probe;
+		FILE *wrapper = fopen (slicePath, "wb");
 		if (wrapper == NULL)
 		{
-			Check (false, name);
-			return;
+			Check (false, ComparisonName (name, "slice wrapper open status", 0, 1).c_str ());
+			return false;
 		}
 		fwrite ("head", 1, 4, wrapper);
 		fwrite (&bytes[0], 1, bytes.size (), wrapper);
 		fwrite ("tail", 1, 4, wrapper);
 		fclose (wrapper);
-		Check (slice.OpenSlice (slicePath, 4, bytes.size ()) == AUDIO_SOURCE_OK, name);
+		AudioSourceStatus sourceStatus = slice.OpenSlice (slicePath, 4, bytes.size ());
+		if (sourceStatus != AUDIO_SOURCE_OK)
+		{
+			Check (false, ComparisonName (name, "slice source open status", sourceStatus, AUDIO_SOURCE_OK).c_str ());
+			remove (slicePath);
+			return false;
+		}
 		probe = ProbeAudioFormat (slice);
-		Check (DecodeAudioToPCM16 (slice, probe, &slicePCM) == AUDIO_DECODE_OK && EqualDecodedPCM (memoryPCM, slicePCM), name);
+		if (probe.Status != AUDIO_PROBE_RECOGNIZED)
+		{
+			Check (false, ComparisonName (name, "slice probe status", probe.Status, AUDIO_PROBE_RECOGNIZED).c_str ());
+			slice.Close ();
+			remove (slicePath);
+			return false;
+		}
+		if (probe.Format != expectedFormat)
+		{
+			Check (false, ComparisonName (name, "slice probe format", probe.Format, expectedFormat).c_str ());
+			slice.Close ();
+			remove (slicePath);
+			return false;
+		}
+		AudioDecodeStatus decodeStatus = DecodeAudioToPCM16 (slice, probe, &slicePCM);
+		if (decodeStatus != AUDIO_DECODE_OK)
+		{
+			Check (false, ComparisonName (name, "slice decode status", decodeStatus, AUDIO_DECODE_OK).c_str ());
+		}
+		else
+		{
+			Check (EqualDecodedPCM (memoryPCM, slicePCM), PCMComparisonName (name, memoryPCM, slicePCM).c_str ());
+		}
 		slice.Close ();
 		remove (slicePath);
+		return true;
+	}
+
+	void TestFixtureParity (const char *filename, AudioFormat expectedFormat, unsigned int expectedRate, unsigned int expectedChannels, unsigned long long expectedFrames, unsigned long long expectedPCMHash, const char *name)
+	{
+		std::string path = FixturePath (filename);
+		std::vector<unsigned char> bytes;
+		AudioDecodedPCM16 memoryPCM;
+		bool readSucceeded = ReadFileBytes (path.c_str (), &bytes);
+		if (!readSucceeded)
+		{
+			Check (false, ComparisonName (name, "fixture bytes read", 0, 1).c_str ());
+			return;
+		}
+		if (bytes.empty ())
+		{
+			Check (false, ComparisonName (name, "fixture byte count", bytes.size (), 1).c_str ());
+			return;
+		}
+		if (!TestFixtureMemoryDecode (bytes, expectedFormat, expectedRate, expectedChannels, expectedFrames, expectedPCMHash, name, &memoryPCM))
+		{
+			return;
+		}
+		TestFixtureFileParity (path.c_str (), expectedFormat, memoryPCM, name);
+		if (!TestFixtureSliceParity (bytes, expectedFormat, memoryPCM, name))
+		{
+			return;
+		}
 		TestDecoderReadAndSeek (path.c_str (), expectedFrames, name);
 	}
 
@@ -1065,7 +1321,7 @@ namespace
 		std::vector<unsigned char> floatWave = MakeWave (3);
 		source.Assign (&floatWave[0], floatWave.size ());
 		result = ProbeAudioFormat (source);
-		Check (result.Status == AUDIO_PROBE_RECOGNIZED && result.Format == AUDIO_FORMAT_WAVE_FLOAT && result.PCM.FloatingPoint, "float WAVE probe");
+		Check (result.Status == AUDIO_PROBE_RECOGNIZED && result.Format == AUDIO_FORMAT_WAVE_FLOAT && result.PCM.FloatingPoint, ComparisonName ("float WAVE probe", "format", result.Format, AUDIO_FORMAT_WAVE_FLOAT).c_str ());
 		Check (source.Tell () == 0, "probe restores initial position");
 		Check (source.Seek (AUDIO_SEEK_BEGIN, 1) == AUDIO_SOURCE_OK, "position restoration setup");
 		result = ProbeAudioFormat (source);
@@ -2017,10 +2273,20 @@ namespace
 	void TestVorbisTemporaryMemoryRequirements ()
 	{
 		unsigned int required = 0;
-		Check (stb_vorbis_test_temp_memory_required (16, 8192, 2, 0, 8192, 1, 1, &required) && required == 1048704, "Vorbis type-2 maximum temporary memory");
-		Check (stb_vorbis_test_temp_memory_required (16, 8192, 0, 0, 8192, 1, 1, &required) && required == 524416, "Vorbis type-0 temporary memory");
-		Check (stb_vorbis_test_temp_memory_required (16, 8192, 1, 0, 8192, 1, 1, &required) && required == 524416, "Vorbis type-1 temporary memory");
-		Check (stb_vorbis_test_temp_memory_required (16, 8192, 2, 8192, UINT_MAX, 1, 1, &required) && required == 16384, "Vorbis temporary memory clamp");
+		const unsigned int type2Required = sizeof (void *) == 4 ? 524352 : 1048704;
+		const unsigned int type01Required = sizeof (void *) == 4 ? 262208 : 524416;
+		bool requirementSucceeded = stb_vorbis_test_temp_memory_required (16, 8192, 2, 0, 8192, 1, 1, &required) != 0;
+		if (!requirementSucceeded) Check (false, ComparisonName ("Vorbis type-2 maximum temporary memory", "requirement status", 0, 1).c_str ());
+		else Check (required == type2Required, ComparisonName ("Vorbis type-2 maximum temporary memory", "required bytes", required, type2Required).c_str ());
+		requirementSucceeded = stb_vorbis_test_temp_memory_required (16, 8192, 0, 0, 8192, 1, 1, &required) != 0;
+		if (!requirementSucceeded) Check (false, ComparisonName ("Vorbis type-0 temporary memory", "requirement status", 0, 1).c_str ());
+		else Check (required == type01Required, ComparisonName ("Vorbis type-0 temporary memory", "required bytes", required, type01Required).c_str ());
+		requirementSucceeded = stb_vorbis_test_temp_memory_required (16, 8192, 1, 0, 8192, 1, 1, &required) != 0;
+		if (!requirementSucceeded) Check (false, ComparisonName ("Vorbis type-1 temporary memory", "requirement status", 0, 1).c_str ());
+		else Check (required == type01Required, ComparisonName ("Vorbis type-1 temporary memory", "required bytes", required, type01Required).c_str ());
+		requirementSucceeded = stb_vorbis_test_temp_memory_required (16, 8192, 2, 8192, UINT_MAX, 1, 1, &required) != 0;
+		if (!requirementSucceeded) Check (false, ComparisonName ("Vorbis temporary memory clamp", "requirement status", 0, 1).c_str ());
+		else Check (required == 16384, ComparisonName ("Vorbis temporary memory clamp", "required bytes", required, 16384).c_str ());
 		Check (!stb_vorbis_test_temp_memory_required (16, 8192, 2, 0, 8192, 0, 1, &required), "Vorbis zero partition size rejected");
 		Check (!stb_vorbis_test_temp_memory_required (16, INT_MAX, 2, 0, UINT_MAX, 1, 1, &required), "Vorbis temporary memory overflow rejected");
 	}
