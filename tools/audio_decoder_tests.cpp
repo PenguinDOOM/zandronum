@@ -832,6 +832,62 @@ namespace
 		return hash;
 	}
 
+	const char *PCMReferenceProfile ()
+	{
+		const char *profile = getenv ("AUDIO_DECODER_PCM_REFERENCE_PROFILE");
+		return profile != NULL && profile[0] != 0 ? profile : "default";
+	}
+
+	bool IsKnownPCMReferenceProfile ()
+	{
+		return strcmp (PCMReferenceProfile (), "msvc-194435229-win32-ia32-fast-release-v1") == 0;
+	}
+
+	bool CanUseKnownPCMReferenceProfile ()
+	{
+#if defined(_MSC_FULL_VER) && _MSC_FULL_VER == 194435229 && defined(_M_IX86) && !defined(_M_X64) && defined(_M_IX86_FP) && _M_IX86_FP == 0 && !defined(_DEBUG)
+		return sizeof (void *) == 4;
+#else
+		return false;
+#endif
+	}
+
+	bool ValidatePCMReferenceProfile ()
+	{
+		if (strcmp (PCMReferenceProfile (), "default") == 0)
+		{
+			return true;
+		}
+		if (!IsKnownPCMReferenceProfile ())
+		{
+			fprintf (stderr, "FAILED: PCM reference profile unknown: %s\n", PCMReferenceProfile ());
+			return false;
+		}
+		if (!CanUseKnownPCMReferenceProfile ())
+		{
+			fprintf (stderr, "FAILED: PCM reference profile %s requires MSVC 194435229, Win32 x86, _M_IX86_FP=0, and a non-Debug build\n", PCMReferenceProfile ());
+			return false;
+		}
+		return true;
+	}
+
+	unsigned long long PCMReferenceExpectedHash (const char *filename, unsigned long long defaultHash)
+	{
+		if (!IsKnownPCMReferenceProfile ())
+		{
+			return defaultHash;
+		}
+		if (strcmp (filename, "float32_mono.wav") == 0)
+		{
+			return 660772755265263697ULL;
+		}
+		if (strcmp (filename, "mp3_mono.mp3") == 0)
+		{
+			return 5678258263728297510ULL;
+		}
+		return defaultHash;
+	}
+
 	bool IsEvidenceFixture (const char *filename)
 	{
 		return strcmp (filename, "float32_mono.wav") == 0 || strcmp (filename, "mp3_mono.mp3") == 0;
@@ -944,11 +1000,14 @@ namespace
 
 	std::string EvidenceMetadata (const char *filename, AudioFormat format, const AudioDecodedPCM16 &decoded, unsigned long long expectedHash, std::size_t byteCount)
 	{
-		char numbers[384];
+		char numbers[224];
 		unsigned long long frames = decoded.Channels == 0 ? 0 : (unsigned long long)(decoded.Samples.size () / decoded.Channels);
-		snprintf (numbers, sizeof (numbers), ",\"actualRate\":%u,\"channels\":%u,\"sampleCount\":%llu,\"frameCount\":%llu,\"byteCount\":%llu,\"actualHash\":\"%llu\",\"expectedHash\":\"%llu\",\"dataHashAlgorithm\":\"HashPCM16\",\"dataHashIncludesMetadata\":false,\"testTU\":{\"compiler\":\"%s\",\"architecture\":\"%s\",\"pointerWidth\":%u,\"mIx86Fp\":\"%s\",\"decoderCompileFlags\":\"not-decoder-compile-flags\"}}\n", decoded.SampleRate, decoded.Channels, (unsigned long long)decoded.Samples.size (), frames, (unsigned long long)byteCount, HashPCM16 (decoded), expectedHash, JSONEscape (EvidenceCompilerName ().c_str ()).c_str (), EvidenceArchitecture (), (unsigned int)(sizeof (void *) * CHAR_BIT), JSONEscape (EvidenceMIx86Fp ().c_str ()).c_str ()
-		);
-		return std::string ("{\"schema\":\"phase2-evidence-v1\",\"fixture\":\"") + JSONEscape (filename) + "\",\"format\":\"" + EvidenceFormatName (format) + "\"" + numbers;
+		int written = snprintf (numbers, sizeof (numbers), ",\"actualRate\":%u,\"channels\":%u,\"sampleCount\":%llu,\"frameCount\":%llu,\"byteCount\":%llu,\"actualHash\":\"%llu\",\"expectedHash\":\"%llu\"", decoded.SampleRate, decoded.Channels, (unsigned long long)decoded.Samples.size (), frames, (unsigned long long)byteCount, HashPCM16 (decoded), expectedHash);
+		if (written < 0 || (std::size_t)written >= sizeof (numbers))
+		{
+			return "{\"schema\":\"phase2-evidence-v1\",\"metadataError\":\"numeric metadata truncation\"}\n";
+		}
+		return std::string ("{\"schema\":\"phase2-evidence-v1\",\"fixture\":\"") + JSONEscape (filename) + "\",\"format\":\"" + EvidenceFormatName (format) + "\"" + numbers + ",\"dataHashAlgorithm\":\"HashPCM16\",\"dataHashIncludesMetadata\":false,\"pcmReferenceProfile\":\"" + JSONEscape (PCMReferenceProfile ()) + "\",\"pcmReferenceProfileSelected\":" + (IsKnownPCMReferenceProfile () ? "true" : "false") + ",\"testTU\":{\"compiler\":\"" + JSONEscape (EvidenceCompilerName ().c_str ()) + "\",\"architecture\":\"" + EvidenceArchitecture () + "\",\"pointerWidth\":" + std::to_string ((unsigned int)(sizeof (void *) * CHAR_BIT)) + ",\"mIx86Fp\":\"" + JSONEscape (EvidenceMIx86Fp ().c_str ()) + "\",\"decoderCompileFlags\":\"not-decoder-compile-flags\"}}\n";
 	}
 
 	void CollectFixtureEvidence (const char *filename, AudioFormat format, const AudioDecodedPCM16 &decoded, unsigned long long expectedHash)
@@ -1845,11 +1904,17 @@ namespace
 
 	void TestCodecFixtures ()
 	{
+		fprintf (stderr, "PCM reference profile: %s\n", PCMReferenceProfile ());
+		if (!ValidatePCMReferenceProfile ())
+		{
+			++Failures;
+			return;
+		}
 		TestFixtureParity ("pcm16_stereo.wav", AUDIO_FORMAT_WAVE_PCM, 8000, 2, 529, 0xbd9ea28d7d1f5ebeULL, "PCM WAVE fixture parity");
-		TestFixtureParity ("float32_mono.wav", AUDIO_FORMAT_WAVE_FLOAT, 8000, 1, 529, 0x00149f86578b3dbaULL, "float WAVE fixture parity");
+		TestFixtureParity ("float32_mono.wav", AUDIO_FORMAT_WAVE_FLOAT, 8000, 1, 529, PCMReferenceExpectedHash ("float32_mono.wav", 0x00149f86578b3dbaULL), "float WAVE fixture parity");
 		TestFixtureParity ("flac_mono.flac", AUDIO_FORMAT_FLAC, 8000, 1, 529, 0xae1a6ff7e4b9ff1bULL, "mono FLAC fixture parity");
 		TestFixtureParity ("flac_stereo.flac", AUDIO_FORMAT_FLAC, 8000, 2, 529, 0xbd9ea28d7d1f5ebeULL, "stereo FLAC fixture parity");
-		TestFixtureParity ("mp3_mono.mp3", AUDIO_FORMAT_MPEG, 8000, 1, 1728, 0xc0324ec2431f1394ULL, "MP3 fixture parity");
+		TestFixtureParity ("mp3_mono.mp3", AUDIO_FORMAT_MPEG, 8000, 1, 1728, PCMReferenceExpectedHash ("mp3_mono.mp3", 0xc0324ec2431f1394ULL), "MP3 fixture parity");
 		TestFixtureParity ("vorbis_mono.ogg", AUDIO_FORMAT_OGG_VORBIS, 8000, 1, 529, 0x04b79fb4e2b4a807ULL, "mono Ogg Vorbis fixture parity");
 		TestFixtureParity ("vorbis_stereo.ogg", AUDIO_FORMAT_OGG_VORBIS, 8000, 2, 529, 0xf7005ad1fbefb6c2ULL, "stereo Ogg Vorbis fixture parity");
 		TestTruncatedFixture ("flac_mono.flac", "truncated FLAC rejected");

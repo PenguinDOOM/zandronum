@@ -175,10 +175,43 @@ jobs:
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
-                $evidenceDirectory = Join-Path $env:RUNNER_TEMP 'ci-runtime-evidence'
+        Remove-Item Env:AUDIO_DECODER_PCM_REFERENCE_PROFILE -ErrorAction SilentlyContinue
+                function Assert-PcmProfileDecision {
+                    param($Profile, [string]$ExpectedArchitecture, [string]$ExpectedConfiguration)
+                    if ($null -eq $Profile -or $Profile -is [Array]) { throw 'PCM profile gate decision must be an object.' }
+                    foreach ($name in @('schema', 'decision', 'reason', 'architecture', 'configuration', 'profile')) {
+                        if ($Profile.PSObject.Properties.Match($name).Count -ne 1) { throw "PCM profile gate decision must contain exactly one $name property." }
+                    }
+                    foreach ($name in @('schema', 'decision', 'reason', 'architecture', 'configuration')) {
+                        if ($Profile.$name -isnot [string] -or [string]::IsNullOrWhiteSpace($Profile.$name)) { throw "PCM profile gate $name must be a non-empty string." }
+                    }
+                    if ($Profile.schema -cne 'phase2-win32-pcm-profile-v2' -or $Profile.architecture -cne $ExpectedArchitecture -or $Profile.configuration -cne $ExpectedConfiguration) { throw 'PCM profile gate decision has an invalid identity.' }
+                    if ($ExpectedArchitecture -ceq 'Win32' -and $ExpectedConfiguration -ceq 'Release') {
+                        if ($Profile.decision -cne 'accepted' -or $Profile.profile -isnot [string] -or $Profile.profile -cne 'msvc-194435229-win32-ia32-fast-release-v1') { throw 'Win32 Release must select the approved PCM profile token.' }
+                        return
+                    }
+                    if ($ExpectedArchitecture -ceq 'x64' -and $ExpectedConfiguration -ceq 'Release') {
+                        if ($Profile.decision -cne 'not_applicable' -or $null -ne $Profile.profile) { throw 'x64 Release must report a null non-applicable PCM profile.' }
+                        return
+                    }
+                    throw "PCM profile gate has no approved decision matrix entry for $ExpectedArchitecture|$ExpectedConfiguration."
+                }
+                $evidenceRoot = Join-Path $env:RUNNER_TEMP 'ci-runtime-evidence'
+                $evidenceDirectory = Join-Path $evidenceRoot ([guid]::NewGuid().ToString('N'))
                 New-Item -ItemType Directory -Force -Path $evidenceDirectory | Out-Null
                 $env:AUDIO_DECODER_PCM_DUMP_DIR = $evidenceDirectory
                 $env:ALSOFT_LOGLEVEL = '3'
+        & pwsh -NoProfile -File '${{ github.workspace }}\scripts\verify-win32-pcm-profile.ps1' -WorkspaceRoot '${{ github.workspace }}' -BuildDirectory '${{ steps.strings.outputs.build-output-dir }}' -Configuration '${{ matrix.build_type }}' -Architecture '${{ matrix.platform }}' -EvidenceDirectory $evidenceDirectory
+        $profileExitCode = $LASTEXITCODE
+        $profileEvidence = Join-Path $evidenceDirectory 'pcm-reference-profile.json'
+        if (!(Test-Path -LiteralPath $profileEvidence -PathType Leaf)) { throw 'PCM profile gate did not produce a fresh decision.' }
+        $profile = Get-Content -LiteralPath $profileEvidence -Raw | ConvertFrom-Json
+                Assert-PcmProfileDecision $profile '${{ matrix.platform }}' '${{ matrix.build_type }}'
+                if ($profileExitCode -ne 0) { throw "PCM profile gate rejected this build: $($profile.reason)" }
+        if ($profile.decision -eq 'accepted') {
+                    $env:AUDIO_DECODER_PCM_REFERENCE_PROFILE = $profile.profile
+                }
+                Write-Host "PCM reference profile for CTest: $($env:AUDIO_DECODER_PCM_REFERENCE_PROFILE)"
         $openalRoot = '${{ github.workspace }}\openal-soft-install-${{ matrix.platform }}'
         $openalRuntime = Join-Path $openalRoot 'bin\OpenAL32.dll'
         if (!(Test-Path -LiteralPath $openalRuntime -PathType Leaf)) {

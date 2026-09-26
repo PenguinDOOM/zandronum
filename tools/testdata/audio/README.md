@@ -115,6 +115,100 @@ includes `stb_vorbis.c` with `STB_VORBIS_HEADER_ONLY`, while the vendored
 `stb_vorbis.c` is compiled as the single implementation translation unit by the source and
 test targets.
 
+## Win32 PCM reference profile
+
+The test-only `AUDIO_DECODER_PCM_REFERENCE_PROFILE` variable records a reviewed
+reference profile for two fixture hashes. It does not describe product audio
+behavior, require an IA32 CPU, or change the decoder's file, memory, or bounded
+file-slice inputs. The existing metadata, full PCM comparison, partial final
+read, EOF, repeated seek, and source-parity checks remain unchanged.
+
+The variable is absent or empty by default, which selects `default` and retains
+the existing golden hashes. The only reviewed profile is
+`msvc-194435229-win32-ia32-fast-release-v1`. It is valid only when the runtime
+test guard sees MSVC full version `_MSC_FULL_VER == 194435229`, `_M_IX86`, not
+`_M_X64`, 32-bit pointers, `_M_IX86_FP == 0`, and no `_DEBUG`. It selects the
+reviewed full-PCM hash for `float32_mono.wav` and exactly these 64-bit integer
+hash values:
+
+| Fixture | Default golden hash | Reviewed profile hash |
+| --- | ---: | ---: |
+| `float32_mono.wav` | `5804898877390266` | `660772755265263697` |
+| `mp3_mono.mp3` | `13849218400374428564` | `5678258263728297510` |
+
+There is no +/-1 tolerance, fallback, or multiple-hash admission. An unknown
+profile, or a known profile used by an incompatible binary such as x64, is a
+failure. A compiler update is therefore blocked until a new profile has a
+separately reviewed complete-PCM reference and compile-condition record.
+
+The JSON evidence emitted for the two profile fixtures uses the fields
+`pcmReferenceProfile` and `pcmReferenceProfileSelected` to identify selection.
+The surrounding fields `actualRate`, `channels`, `sampleCount`, `frameCount`,
+`byteCount`, `actualHash`, and `expectedHash` describe the decoded result;
+`dataHashAlgorithm` is `HashPCM16` and `dataHashIncludesMetadata` is `false`.
+The `testTU` object records `compiler`, `architecture`, `pointerWidth`,
+`mIx86Fp`, and `decoderCompileFlags`; the last value is explicitly metadata,
+not proof of the decoder translation unit's actual flags.
+
+The direct gate is `scripts/verify-win32-pcm-profile.ps1`. It is called with
+explicit `WorkspaceRoot`, `BuildDirectory`, `Configuration`, `Architecture`,
+and `EvidenceDirectory` roots:
+
+```powershell
+pwsh -NoProfile -File scripts/verify-win32-pcm-profile.ps1 `
+-WorkspaceRoot C:\path\to\zandronum `
+-BuildDirectory C:\path\to\build `
+-Configuration Release `
+-Architecture Win32 `
+-EvidenceDirectory C:\path\to\evidence
+```
+
+Each invocation writes a fresh `pcm-reference-profile.json` with schema
+`phase2-win32-pcm-profile-v2`, `decision`, `reason`, `architecture`,
+`configuration`, `profile`, and evidence. A Release/Win32 build is
+`accepted` only after the `audio_decoder_tests` project, its Release tlog, and
+its binary are matched to the actual
+`src/sound/audio_decoder_miniaudio.cpp` and test TU. The gate also checks the
+v143 XML configuration, source-specific tlog records, `/O2`, `/fp:fast`,
+`/arch:IA32`, approved definitions, the pinned fixture/header hashes, and the
+decoder's normalized-EOL source hash. An x64 Release build is
+`not_applicable` with `profile: null`; missing, conflicting, or stale evidence
+is `rejected`, and a rejected or unsaved decision is nonzero.
+
+The Windows workflow caller separately checks the process exit code, JSON
+shape and schema, architecture/configuration, decision, and the exact profile
+token before passing an accepted token to CTest. It does not reuse an old
+accepted JSON or persist the token through `GITHUB_ENV`; `not_applicable`
+leaves the profile unset and `rejected` stops before CTest. The direct gate
+does not reimplement the decoder's PCM decision and does not infer the
+compiler's full `CL.exe` version from project metadata. The recorded
+`_MSC_FULL_VER == 194435229` condition is supported by the test guard and
+profile contract; a raw full-version measurement of `CL.exe` is not claimed.
+
+The 2026-09-26 positive evidence at
+`completes/native-openal-soft-phase-2/2e/win32-pcm-profile/direct-gate/20260926-positive/atlas-keyfix-check/`
+is a saved direct-gate run with `NATIVE_EXIT=0`, decision `accepted`, and the
+fixed profile token. Its copied project XML and UTF-16 tlog are byte-identical
+recorded inputs for the current read-only facts; the placeholder EXE was not
+executed, so its SHA-256 is only a property hash and not proof of Win32
+runtime execution. The round2b refusal and caller-validation result is at
+`completes/native-openal-soft-phase-2/2e/win32-pcm-profile/direct-gate/refusal-validation-round2b/result-matrix.json`:
+all 22/22 cases passed. The matrix covers x64 `not_applicable`, x64-as-Win32
+rejection, missing and duplicate source records, unrelated-target exclusion,
+conflicting flags and definitions, pinned-input and toolset/source failures,
+stale or unwritable output, source-specific XML overrides, and duplicate
+applicable conditional metadata. The workflow caller also rejects typed JSON
+arrays and invalid architecture/decision/profile combinations while accepting
+the exact Win32 Release combination. These are semantic gate checks, not
+evidence of actual Win32 execution.
+
+The two default/profile golden pairs remain strict exact 64-bit matches: there
+is no one-LSB acceptance, automatic fallback, or hash adoption. The default
+x64 test pass remains valid. The selected Win32 profile was not run on a new
+remote Win32 binary; current CI was not run for this evidence, and native
+OpenAL lifecycle validation remains unresolved. None of these is claimed as
+complete Phase 2 evidence.
+
 ## FFmpeg provenance
 
 Retrieved on 2026-09-03 from the final URL
