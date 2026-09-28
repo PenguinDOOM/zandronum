@@ -1,5 +1,63 @@
 # Native OpenAL Soft: Phase 2D-1 Current State
 
+## Current Phase 2E Overview
+
+**Status: APPROVED (2026-09-29).**
+
+This document now records the evidence-based Phase 2E closeout state. The
+implementation and verification evidence below is assembled for the final
+independent review. Phase 2E final independent review is APPROVED under the
+original contract and approved standard-Doppler amendment, with the
+limitations and deferred work recorded below. This status is intentionally
+narrower than a release or compatibility guarantee.
+
+The current evidence maps to the approved 2E requirements as follows:
+
+- H01-H05 and F01-F07 reuse the accepted Phase 2A-2D observations and
+  focused regression records. H05 uses the accepted moving 3D water,
+  eviction, virtual-source, and restart lifecycle result. M04-M06 remain
+  subjective observations with limited directional discrimination, and D09
+  remains a bounded prediction-correction observation.
+- Windows x64 native evidence is the local vcpkg OpenAL run using
+  `1.25.1#2`; the hosted CI package pin at `1.25.2` is a separate static
+  package/provenance result, not a claim that the CI x64 game was run with
+  that package. Win32 artifact `10899687197` reached MAP01, used its package
+  OpenAL library, reported Built-In HRTF, and exited with game status `0`.
+- Linux artifact `10899716823` is covered by the accepted package, notice,
+  loader, native lifecycle, and post-recovery game records. The post-recovery
+  direct run used the private runtime and configuration, opened Pulse,
+  reported Built-In HRTF, reached MAP01, and ended after the user's quit with
+  native and launcher status `0`. The exact package source is the accepted
+  `94e4d0f7526fdb94f27b7ae6b252900afd6e1f39` result. The latest game PID's
+  module map was not captured; an earlier same-artifact PID map and the later
+  loader/config/OpenAL observations are retained as distinct evidence, not
+  merged into a latest-map claim.
+- Hosted sound-enabled clients retain `4 pass / 0 fail / 1 skip` each. The
+  native lifecycle result obtained elsewhere does not convert a hosted CI
+  skip into a pass. The accepted `NO_SOUND` and `SERVERONLY` evidence remains
+  valid.
+- Stock compatibility is supported only for the accepted localhost scope:
+  stock x86 server, fork x64 client, matching stock PK3, authentication,
+  MAP01, and initial snapshot. This is not a WAN or all-protocol guarantee.
+
+The two recent legacy safety fixes, commits
+`680665d0bc28b73e06c4fa066858a2166481f65f` and
+`9ebcf289b24b810c5e3f393471773a6204312d28`, and their focused tests and
+analyses are part of the retained evidence. They do not establish the cause
+of the historical Linux SIGSEGV, and OpenAL behavior was not changed by those
+fixes. The user's decision to end Linux SIGSEGV investigation is respected:
+the unexplained failure is recorded as a known risk, not turned into either a
+repair claim or a new mandatory debugging gate.
+
+The authoritative closeout references are
+`completes/native-openal-soft-phase-2-2e-evidence-assessment-20260927.md`,
+`completes/native-openal-soft-phase-2-linux-native-complete.md`,
+`completes/native-openal-soft-phase-2-win32-native-complete.md`,
+`completes/native-openal-soft-phase-2-post-recovery-native-complete.md`, and
+`completes/linux-audio-crash-boundaries-complete.md`. The detailed sections
+that follow preserve the earlier implementation and listening observations;
+where they describe an older checkpoint, this overview is the current status.
+
 ## Scope
 
 This document describes the implemented 2B-1 shared environment state and
@@ -25,7 +83,9 @@ registration. 2C adds the bounded source-radius behavior described below.
 2D-1 adds the standard source-only Doppler behavior described below; FMOD is
 unchanged.
 
-This is the current 2D-1 implementation state, not a Phase 2 completion claim.
+This is the retained 2D-1 implementation record. Overall Phase 2E approval is
+recorded in the current overview above as APPROVED on 2026-09-29 under the
+original contract and approved standard-Doppler amendment.
 
 ## 2B-3 Underwater Implementation
 
@@ -293,14 +353,15 @@ it passed with exit code 0, `Raw=601078`, `Baseline=7503`, `New=0`, and
 it reports no new complexity regressions, `EXIT_CODE=0`, and
 `REAL_INDEX_UNCHANGED=True`. The parallel formal parent-review1 Lizard run is
 also recorded zero new findings with `REAL_INDEX_UNCHANGED=True`. These
-analysis gates apply to the captured working tree; they do not make the
-overall Phase 2 complete.
+analysis gates apply to the captured working tree; at that historical
+checkpoint they were not by themselves a Phase 2 completion decision.
 
 The review1 Release product/test gate and focused CTest gate recorded the
 Release build as successful and `2/2` tests passed. The shared `NO_SOUND` and
 `SERVERONLY` results remain valid because the shared source is reported
-unchanged from the accepted baseline. These are 2B-3 validation results; they
-do not make the overall Phase 2 complete.
+unchanged from the accepted baseline. These are 2B-3 validation results; the
+historical checkpoint did not use them as an overall Phase 2 completion
+decision.
 
 ## 2D-1 Verification Record
 
@@ -334,8 +395,9 @@ index and reported no new complexity regressions. Its raw log is retained at
 it records `LIZARD_EXIT=0` and `REAL_INDEX_UNCHANGED=True`. Saved legacy PK3
 Release byte equality also remains unverified.
 The local runtime identity is `1.1 ALSOFT`; it is not an exact OpenAL Soft
-`1.25.2` claim. No stock-compatibility passing claim is made for 2E, which
-remains unapproved.
+`1.25.2` claim. At this earlier 2D-1 checkpoint, no stock-compatibility
+passing claim had been made; the current limited localhost result is recorded
+in the overview above.
 
 The latest 2B-3 terminal-repair full Cppcheck input is the six-file working-tree
 capture at
