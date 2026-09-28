@@ -11,6 +11,8 @@
 #include <wordexp.h>
 #include <signal.h>
 
+#include "timidity_pipe.h"
+
 int ChildQuit;
 
 void ChildSigHandler (int signum)
@@ -519,10 +521,14 @@ bool TimidityPPMIDIDevice::FillStream(SoundStream *stream, void *buff, int len, 
 		} 
 	}
 #else
-	ssize_t got;
-	fd_set rfds;
-	struct timeval tv;
-
+	if (buff != NULL && len >= 0)
+	{
+		memset(buff, 0, len);
+	}
+	if (song->ChildProcess <= 0)
+	{
+		return false;
+	}
 	if (ChildQuit == song->ChildProcess)
 	{
 		ChildQuit = 0;
@@ -530,25 +536,7 @@ bool TimidityPPMIDIDevice::FillStream(SoundStream *stream, void *buff, int len, 
 		song->ChildProcess = -1;
 		return false;
 	}
-
-	FD_ZERO(&rfds);
-	FD_SET(song->WavePipe[0], &rfds);
-	tv.tv_sec = 0;
-	tv.tv_usec = 50;
-//	fprintf(stderr,"select\n");
-	if (select(1, &rfds, NULL, NULL, &tv) <= 0 && 0)
-	{ // Nothing available, so play silence.
-//	fprintf(stderr,"nothing\n");
-	 //   memset(buff, 0, len);
-	    return true;
-	}
-//	fprintf(stderr,"something\n");
-
-	got = read(song->WavePipe[0], (BYTE *)buff, len);
-	if (got < len)
-	{
-		memset((BYTE *)buff+got, 0, len-got);
-	}
+	return TimidityPipeFillBuffer(&song->WavePipe[0], buff, len, select, read);
 #endif
 	return true;
 }
