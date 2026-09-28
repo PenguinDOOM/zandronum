@@ -58,6 +58,7 @@
 #include "errors.h"
 #include "version.h"
 #include "w_wad.h"
+#include "crash_report_buffer.h"
 #include "g_level.h"
 #include "r_state.h"
 #include "cmdlib.h"
@@ -144,57 +145,78 @@ static void STACK_ARGS NewFailure ()
     I_FatalError ("Failed to allocate memory from system heap");
 }
 
+static bool AppendCrashReportHeader(CrashReportBuffer &report)
+{
+	if (!report.Append(GAMENAME" version %s (%s)\n", GetVersionString(), GetGitHash()))
+		return false;
+#ifdef __VERSION__
+	if (!report.Append("Compiler version: %s\n", __VERSION__))
+		return false;
+#endif
+	return report.Append("\nCommand line:");
+}
+
+static bool AppendCrashReportCommandLine(CrashReportBuffer &report)
+{
+	for (int i = 0; i < Args->NumArgs(); ++i)
+	{
+		if (!report.Append(" %s", Args->GetArg(i)))
+			return false;
+	}
+	return report.Append("\n");
+}
+
+static bool AppendCrashReportWads(CrashReportBuffer &report)
+{
+	for (int i = 0; ; ++i)
+	{
+		const char *arg = Wads.GetWadName(i);
+		if (arg == NULL)
+			return true;
+		if (!report.Append("\nWad %d: %s", i, arg))
+			return false;
+	}
+}
+
+static bool AppendCrashReportView(CrashReportBuffer &report)
+{
+	if (!report.Append("\n\nviewx = %d", (int)viewx))
+		return false;
+	if (!report.Append("\nviewy = %d", (int)viewy))
+		return false;
+	if (!report.Append("\nviewz = %d", (int)viewz))
+		return false;
+	return report.Append("\nviewangle = %x", (unsigned int)viewangle);
+}
+
+static bool AppendCrashReportLevel(CrashReportBuffer &report)
+{
+	if (gamestate != GS_LEVEL && gamestate != GS_TITLELEVEL)
+		return report.Append("\n\nNot in a level.");
+
+	char name[9];
+	strncpy(name, level.mapname, 8);
+	name[8] = 0;
+	if (!report.Append("\n\nCurrent map: %s", name))
+		return false;
+	if (!viewactive)
+		return report.Append("\n\nView not active.");
+	return AppendCrashReportView(report);
+}
+
 static int DoomSpecificInfo (char *buffer, char *end)
 {
-	const char *arg;
-	int size = end-buffer-2;
-	int i, p;
+	CrashReportBuffer report(buffer, end);
 
-	p = 0;
-	p += snprintf (buffer+p, size-p, GAMENAME" version %s (%s)\n", GetVersionString(), GetGitHash());
-#ifdef __VERSION__
-	p += snprintf (buffer+p, size-p, "Compiler version: %s\n", __VERSION__);
-#endif
-	p += snprintf (buffer+p, size-p, "\nCommand line:");
-	for (i = 0; i < Args->NumArgs(); ++i)
-	{
-		p += snprintf (buffer+p, size-p, " %s", Args->GetArg(i));
-	}
-	p += snprintf (buffer+p, size-p, "\n");
-	
-	for (i = 0; (arg = Wads.GetWadName (i)) != NULL; ++i)
-	{
-		p += snprintf (buffer+p, size-p, "\nWad %d: %s", i, arg);
-	}
-
-	if (gamestate != GS_LEVEL && gamestate != GS_TITLELEVEL)
-	{
-		p += snprintf (buffer+p, size-p, "\n\nNot in a level.");
-	}
-	else
-	{
-		char name[9];
-
-		strncpy (name, level.mapname, 8);
-		name[8] = 0;
-		p += snprintf (buffer+p, size-p, "\n\nCurrent map: %s", name);
-
-		if (!viewactive)
-		{
-			p += snprintf (buffer+p, size-p, "\n\nView not active.");
-		}
-		else
-		{
-			p += snprintf (buffer+p, size-p, "\n\nviewx = %d", (int)viewx);
-			p += snprintf (buffer+p, size-p, "\nviewy = %d", (int)viewy);
-			p += snprintf (buffer+p, size-p, "\nviewz = %d", (int)viewz);
-			p += snprintf (buffer+p, size-p, "\nviewangle = %x", (unsigned int)viewangle);
-		}
-	}
-	buffer[p++] = '\n';
-	buffer[p++] = '\0';
-
-	return p;
+	if (!AppendCrashReportHeader(report))
+		return report.Finish();
+	if (!AppendCrashReportCommandLine(report))
+		return report.Finish();
+	if (!AppendCrashReportWads(report))
+		return report.Finish();
+	if (!AppendCrashReportLevel(report))
+		return report.Finish();
+	return report.Finish();
 }
 
 #if defined(__MACH__) && !defined(NOASM)
