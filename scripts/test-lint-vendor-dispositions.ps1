@@ -76,6 +76,70 @@ function Import-LintFunction {
     Invoke-Expression $definition
 }
 
+function Assert-CppcheckProjectSelection {
+    $preparationState = [PSCustomObject]@{ Count = 0 }
+    $emptySelection = Select-CppcheckProjects `
+        -Projects @() `
+        -ChangedFiles @('src/sdl/i_main.cpp', 'tools/timidity_pipe_tests.cpp') `
+        -IsInputManifest:$false `
+        -IsWindowsVisualStudioBuild:$true `
+        -BuildDirectory 'build-v143' `
+        -PrepareAnalysis { $preparationState.Count++ }
+
+    if (($emptySelection.Projects.Count -ne 0) -or ($emptySelection.PlatformNotApplicable.Count -ne 2) -or
+        ($preparationState.Count -ne 0) -or
+        ($emptySelection.PlatformNotApplicable[0].Reason -notmatch 'src/CMakeLists\.txt') -or
+        ($emptySelection.PlatformNotApplicable[1].Reason -notmatch 'tools/CMakeLists\.txt')) {
+        throw 'Platform-not-applicable selection did not skip analysis preparation for the exact Windows-excluded sources.'
+    }
+
+    $registeredProject = [PSCustomObject]@{
+        RelativeProject = 'src/fixture.vcxproj'
+        Sources = @{ 'src/registered.cpp' = 'src/registered.cpp'; 'src/other.cpp' = 'src/other.cpp' }
+        Files = @()
+    }
+    $mixedSelection = Select-CppcheckProjects `
+        -Projects @($registeredProject) `
+        -ChangedFiles @('src/registered.cpp', 'tools/timidity_pipe_tests.cpp') `
+        -IsInputManifest:$false `
+        -IsWindowsVisualStudioBuild:$true `
+        -BuildDirectory 'build-v143' `
+        -PrepareAnalysis { $preparationState.Count++ }
+
+    if (($mixedSelection.Projects.Count -ne 1) -or ($mixedSelection.Projects[0].Files.Count -ne 2) -or
+        ($mixedSelection.PlatformNotApplicable.Count -ne 1) -or ($preparationState.Count -ne 1)) {
+        throw 'Mixed project selection did not retain every translation unit of the registered project.'
+    }
+
+    $registeredAllowedPathProject = [PSCustomObject]@{
+        RelativeProject = 'src/registered-allowed.vcxproj'
+        Sources = @{ 'src/sdl/i_main.cpp' = 'src/sdl/i_main.cpp'; 'src/other.cpp' = 'src/other.cpp' }
+        Files = @()
+    }
+    $registeredAllowedPathSelection = Select-CppcheckProjects `
+        -Projects @($registeredAllowedPathProject) `
+        -ChangedFiles @('src/sdl/i_main.cpp') `
+        -IsInputManifest:$false `
+        -IsWindowsVisualStudioBuild:$true `
+        -BuildDirectory 'build-v143'
+
+    if (($registeredAllowedPathSelection.Projects.Count -ne 1) -or
+        ($registeredAllowedPathSelection.Projects[0].Files.Count -ne 2) -or
+        ($registeredAllowedPathSelection.PlatformNotApplicable.Count -ne 0)) {
+        throw 'A registered platform-not-applicable path was not analyzed through its owning project.'
+    }
+
+    Assert-ExpectedException -Expected "Changed source 'src/unknown.cpp'" -Action {
+        Select-CppcheckProjects -Projects @() -ChangedFiles @('src/unknown.cpp') -IsInputManifest:$false -IsWindowsVisualStudioBuild:$true -BuildDirectory 'build-v143' | Out-Null
+    }
+    Assert-ExpectedException -Expected "Changed source 'src/sdl/i_main.cpp'" -Action {
+        Select-CppcheckProjects -Projects @() -ChangedFiles @('src/sdl/i_main.cpp') -IsInputManifest:$false -IsWindowsVisualStudioBuild:$false -BuildDirectory 'build-v143' | Out-Null
+    }
+    Assert-ExpectedException -Expected "InputManifest C/C++ source 'tools/timidity_pipe_tests.cpp'" -Action {
+        Select-CppcheckProjects -Projects @() -ChangedFiles @('tools/timidity_pipe_tests.cpp') -IsInputManifest:$true -IsWindowsVisualStudioBuild:$true -BuildDirectory 'build-v143' | Out-Null
+    }
+}
+
 function Assert-ClassifiedFailureEvidence {
     param(
         [string]$FixtureRoot,
@@ -265,6 +329,112 @@ function Assert-LintOuterFinalizationIntegration {
     }
 }
 
+function Assert-ProductionPreparationFailureReleasesAcquiredLock {
+    $lintScript = Join-Path $PSScriptRoot 'lint.ps1'
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($lintScript, [ref]$tokens, [ref]$errors)
+
+    if ($errors.Count -ne 0) {
+        throw "Could not parse lint.ps1: $($errors[0].Message)"
+    }
+
+    $prepareAnalysisArgument = $ast.FindAll({
+            param($node)
+            ($node -is [System.Management.Automation.Language.CommandAst]) -and
+            ($node.GetCommandName() -eq 'Select-CppcheckProjects')
+        }, $true) |
+        ForEach-Object {
+            $_.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.ScriptBlockExpressionAst] } | Select-Object -First 1
+        } |
+        Select-Object -First 1
+
+    if ($null -eq $prepareAnalysisArgument) {
+        throw 'lint.ps1 does not retain a production PrepareAnalysis callback.'
+    }
+
+    $preparationTry = $prepareAnalysisArgument.ScriptBlock.FindAll({
+            param($node)
+            ($node -is [System.Management.Automation.Language.TryStatementAst]) -and
+            ($node.CatchClauses.Count -ne 0)
+        }, $true) | Select-Object -First 1
+
+    if (($null -eq $preparationTry) -or
+        ($preparationTry.CatchClauses[0].Extent.Text -notmatch 'Exit-CppcheckCacheLock -Lock \$acquiredCacheLock') -or
+        ($preparationTry.CatchClauses[0].Extent.Text -notmatch 'throw')) {
+        throw 'Production PrepareAnalysis callback does not release its locally acquired cache lock before rethrowing stage creation failures.'
+    }
+
+    $childScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ('zandronum-prepare-analysis-' + [guid]::NewGuid().ToString('N') + '.ps1')
+    $resultPath = Join-Path ([System.IO.Path]::GetTempPath()) ('zandronum-prepare-analysis-' + [guid]::NewGuid().ToString('N') + '.json')
+    $callbackText = $prepareAnalysisArgument.ScriptBlock.Extent.Text
+    $childScript = @'
+param([bool]$UseExistingLock, [string]$ResultPath)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$state = [PSCustomObject]@{ EnterCalls = 0; ExitCalls = 0; Message = $null }
+$acquiredLock = [System.IO.MemoryStream]::new()
+$cacheLock = if ($UseExistingLock) { [System.IO.MemoryStream]::new() } else { $null }
+function Enter-CppcheckCacheLock {
+    param($CacheRoot, $Name)
+    $state.EnterCalls++
+    return $acquiredLock
+}
+function New-CppcheckDisposableStage {
+    param($CacheRoot, $Name)
+    throw 'fixture stage creation failure'
+}
+function Exit-CppcheckCacheLock {
+    param($Lock)
+    $state.ExitCalls++
+    $Lock.Dispose()
+}
+$cppcheckCacheRoot = 'fixture-cache-root'
+$inputManifestData = $null
+$inputManifestRoots = $null
+$prepare =
+'@ + $callbackText + @'
+
+try {
+    & $prepare
+    $state.Message = 'no exception'
+}
+catch {
+    $state.Message = $_.Exception.Message
+}
+finally {
+    @{ Message = $state.Message; EnterCalls = $state.EnterCalls; ExitCalls = $state.ExitCalls; AcquiredCanRead = $acquiredLock.CanRead; ExistingCanRead = if ($null -eq $cacheLock) { $null } else { $cacheLock.CanRead } } | ConvertTo-Json -Compress | Set-Content -LiteralPath $ResultPath -NoNewline
+    $acquiredLock.Dispose()
+    if ($null -ne $cacheLock) { $cacheLock.Dispose() }
+}
+'@
+
+    try {
+        Set-Content -LiteralPath $childScriptPath -Value $childScript -NoNewline
+        foreach ($case in @(
+            @{ Name = 'acquired'; UseExistingLock = $false; ExpectedEnterCalls = 1; ExpectedExitCalls = 1; ExpectedAcquiredCanRead = $false; ExpectedExistingCanRead = $null },
+            @{ Name = 'existing'; UseExistingLock = $true; ExpectedEnterCalls = 0; ExpectedExitCalls = 0; ExpectedAcquiredCanRead = $true; ExpectedExistingCanRead = $true }
+        )) {
+            & pwsh -NoProfile -File $childScriptPath -UseExistingLock:$case.UseExistingLock -ResultPath $resultPath
+            if ($LASTEXITCODE -ne 0) {
+                throw "Production PrepareAnalysis $($case.Name) lock fixture exited with $LASTEXITCODE."
+            }
+
+            $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+            if (($result.Message -ne 'fixture stage creation failure') -or
+                ($result.EnterCalls -ne $case.ExpectedEnterCalls) -or
+                ($result.ExitCalls -ne $case.ExpectedExitCalls) -or
+                ($result.AcquiredCanRead -ne $case.ExpectedAcquiredCanRead) -or
+                ($result.ExistingCanRead -ne $case.ExpectedExistingCanRead)) {
+                throw "Production PrepareAnalysis callback did not preserve the expected $($case.Name) cache lock ownership after stage creation failure."
+            }
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $childScriptPath, $resultPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Assert-ManifestDoesNotReconfigureBaseline {
     $lintScript = Join-Path $PSScriptRoot 'lint.ps1'
     $tokens = $null
@@ -371,10 +541,11 @@ function Assert-NativeCppcheckCacheInvalidation {
 }
 
 function Save-NativeCppcheckCacheEvidence {
-    param([string]$FixtureRoot)
+    param(
+        [string]$FixtureRoot,
+        [string]$EvidenceRoot
+    )
 
-    $repositoryRoot = Split-Path -Parent $PSScriptRoot
-    $evidenceRoot = Join-Path $repositoryRoot 'completes/lint-cache-key-reuse'
     $runRoot = Join-Path $evidenceRoot ('native-cache-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $runRoot | Out-Null
     Copy-Item -LiteralPath (Join-Path $FixtureRoot 'native-cache/evidence') -Destination (Join-Path $runRoot 'isolated-fixture') -Recurse
@@ -589,10 +760,12 @@ Import-LintFunction -Name 'Save-LintEvidenceResult'
 Import-LintFunction -Name 'Complete-LintFinalization'
 Import-LintFunction -Name 'Invoke-LintChild'
 Import-LintFunction -Name 'Invoke-CppcheckProject'
+Import-LintFunction -Name 'Select-CppcheckProjects'
 
 $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('zandronum-vendor-policy-' + [guid]::NewGuid().ToString('N'))
 
 try {
+    Assert-CppcheckProjectSelection
     $cacheFixtureRoot = Join-Path $fixtureRoot 'cppcheck-cache'
     $contextBuildRoot = Join-Path $fixtureRoot 'context-build'
     $contextProjectPath = Join-Path $contextBuildRoot 'fixture.vcxproj'
@@ -635,6 +808,7 @@ try {
     Assert-FinalizationSuccessCleanupOnce
     Assert-LintEvidenceStateSnapshotsCacheConfigurations -FixtureRoot $fixtureRoot
     Assert-LintOuterFinalizationIntegration
+    Assert-ProductionPreparationFailureReleasesAcquiredLock
     $normalIdentity = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -RootIdentity 'C:\fixture\source'
     $manifestIdentity = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'input-manifest' -RootIdentity 'fixed-regression-manifest-stage'
     $differentToolsetIdentity = Get-CppcheckCacheIdentity -AnalyzerVersion 'Cppcheck 2.21.0' -AnalyzerSHA256 ('a' * 64) -InputMode 'normal' -Toolset 'v142' -RootIdentity 'C:\fixture\source'
@@ -646,7 +820,7 @@ try {
     Assert-NativeCppcheckCacheInvalidation -FixtureRoot $fixtureRoot -CacheRoot $cacheFixtureRoot
     Assert-RealCppcheckProjectCacheRoute -FixtureRoot $fixtureRoot -CacheRoot $cacheFixtureRoot
     Assert-ProductionRegressionCacheLeafExcludesGateControls -FixtureRoot $fixtureRoot -CacheRoot $cacheFixtureRoot
-    Save-NativeCppcheckCacheEvidence -FixtureRoot $fixtureRoot
+    Save-NativeCppcheckCacheEvidence -FixtureRoot $fixtureRoot -EvidenceRoot (Join-Path (Split-Path -Parent $PSScriptRoot) 'completes/windows-prepush-platform-scope')
     $cacheLock = Enter-CppcheckCacheLock -CacheRoot $cacheFixtureRoot -Name 'fixture'
     try {
         Assert-ExpectedException -Expected 'already running' -Action { Enter-CppcheckCacheLock -CacheRoot $cacheFixtureRoot -Name 'fixture' | Out-Null }

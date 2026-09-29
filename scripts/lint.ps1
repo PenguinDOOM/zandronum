@@ -1261,6 +1261,63 @@ function Get-ProjectSources {
     return $projects
 }
 
+function Select-CppcheckProjects {
+    param(
+        [object[]]$Projects,
+        [string[]]$ChangedFiles,
+        [bool]$IsInputManifest,
+        [bool]$IsWindowsVisualStudioBuild,
+        [string]$BuildDirectory,
+        [scriptblock]$PrepareAnalysis = $null
+    )
+
+    $selectedProjects = @()
+    $platformNotApplicable = @()
+    $platformReasons = @{
+        'src/sdl/i_main.cpp' = 'src/CMakeLists.txt selects this SDL entry point only outside Windows; it is not analyzed by the Windows Visual Studio projects.'
+        'tools/timidity_pipe_tests.cpp' = 'tools/CMakeLists.txt includes this test only on UNIX; it is not analyzed by the Windows Visual Studio projects.'
+    }
+
+    foreach ($file in $ChangedFiles) {
+        $projectMatches = @($Projects | Where-Object { $_.Sources.ContainsKey($file) })
+
+        if ($projectMatches.Count -ne 0) {
+            foreach ($project in $projectMatches) {
+                $project.Files = @($project.Sources.Keys | Sort-Object)
+                $selectedProjects += $project
+            }
+
+            continue
+        }
+
+        if ((-not $IsInputManifest) -and $IsWindowsVisualStudioBuild -and $platformReasons.ContainsKey($file)) {
+            $platformNotApplicable += [PSCustomObject]@{
+                Path = $file
+                Reason = $platformReasons[$file]
+            }
+            continue
+        }
+
+        if ($IsInputManifest) {
+            throw "InputManifest C/C++ source '$file' is not present in an archive-generated Visual Studio project."
+        }
+
+        throw "Changed source '$file' is not present in any generated Visual Studio project. Reconfigure '$BuildDirectory' before linting."
+    }
+
+    $analysisPreparation = $null
+
+    if (($selectedProjects.Count -ne 0) -and ($null -ne $PrepareAnalysis)) {
+        $analysisPreparation = & $PrepareAnalysis
+    }
+
+    return [PSCustomObject]@{
+        Projects = @($selectedProjects | Sort-Object RelativeProject -Unique)
+        PlatformNotApplicable = @($platformNotApplicable)
+        AnalysisPreparation = $analysisPreparation
+    }
+}
+
 function Assert-EqualCppcheckProjectContext {
     param(
         [object]$Expected,
@@ -1634,7 +1691,7 @@ if ($PreflightOnly -and ($null -eq $inputManifestData)) {
 
 $repositoryRoot = Get-GitSingleLine -Arguments @('rev-parse', '--show-toplevel') -ErrorMessage 'This script must run inside a Git worktree.'
 $cppcheckCacheRoot = Join-Path $repositoryRoot '.cppcheck-cache'
-$cacheLock = Enter-CppcheckCacheLock -CacheRoot $cppcheckCacheRoot -Name 'regression'
+$cacheLock = $null
 $evidence = $null
 $inputManifestRoots = $null
 $tempRoot = $null
@@ -1642,6 +1699,7 @@ $cppcheckSHA256 = (Get-FileHash -LiteralPath $cppcheck.Source -Algorithm SHA256)
 
 try {
 if ($null -ne $inputManifestData) {
+    $cacheLock = Enter-CppcheckCacheLock -CacheRoot $cppcheckCacheRoot -Name 'regression'
     $effectiveEvidenceDir = if ([string]::IsNullOrWhiteSpace($EvidenceDir)) { Join-Path $repositoryRoot 'completes/openal-full-gate-preparation/evidence' } else { $EvidenceDir }
     $evidence = Initialize-LintEvidence -RootPath $effectiveEvidenceDir -ManifestPath $inputManifestData.Path -CppcheckPath $cppcheck.Source -CppcheckSHA256 $cppcheckSHA256 -CppcheckVersion ''
 }
@@ -1732,6 +1790,8 @@ if (-not (Test-Path -LiteralPath $cacheFile -PathType Leaf)) {
     exit 1
 }
 
+$generatorSetting = Get-CMakeCacheSetting -CachePath $cacheFile -Name 'CMAKE_GENERATOR'
+$platformSetting = Get-CMakeCacheSetting -CachePath $cacheFile -Name 'CMAKE_GENERATOR_PLATFORM'
 $toolsetSetting = Get-CMakeCacheSetting -CachePath $cacheFile -Name 'CMAKE_GENERATOR_TOOLSET'
 $cachePaths = @{}
 $cacheIdentities = @{}
@@ -1765,22 +1825,52 @@ if ($changedFiles.Count -eq 0) {
 }
 
 $headProjects = Get-ProjectSources -BuildRoot $analysisBuildRoot -RepositoryRoot $analysisRepositoryRoot
+$isWindowsVisualStudioBuild = ($null -ne $generatorSetting) -and
+    ($generatorSetting.Value -match '^Visual Studio ') -and
+    ($null -ne $platformSetting) -and
+    (-not [string]::IsNullOrWhiteSpace($platformSetting.Value))
+$selection = Select-CppcheckProjects `
+    -Projects $headProjects `
+    -ChangedFiles $changedFiles `
+    -IsInputManifest:($null -ne $inputManifestData) `
+    -IsWindowsVisualStudioBuild:$isWindowsVisualStudioBuild `
+    -BuildDirectory $BuildDir `
+    -PrepareAnalysis {
+        $acquiredCacheLock = $null
+        $preparedCacheLock = $cacheLock
 
-foreach ($file in $changedFiles) {
-    $projectMatches = @($headProjects | Where-Object { $_.Sources.ContainsKey($file) })
+        if ($null -eq $preparedCacheLock) {
+            $acquiredCacheLock = Enter-CppcheckCacheLock -CacheRoot $cppcheckCacheRoot -Name 'regression'
+            $preparedCacheLock = $acquiredCacheLock
+        }
 
-    if ($projectMatches.Count -eq 0) {
-        Write-Error "Changed source '$file' is not present in any generated Visual Studio project. Reconfigure '$BuildDir' before linting."
-        exit 1
+        try {
+            [PSCustomObject]@{
+                CacheLock = $preparedCacheLock
+                TempRoot = if ($null -ne $inputManifestData) { $inputManifestRoots.TempRoot } else { New-CppcheckDisposableStage -CacheRoot $cppcheckCacheRoot -Name 'regression-normal' }
+            }
+        }
+        catch {
+            if ($null -ne $acquiredCacheLock) {
+                Exit-CppcheckCacheLock -Lock $acquiredCacheLock
+            }
+
+            throw
+        }
     }
+$analysisProjects = $selection.Projects
 
-    foreach ($project in $projectMatches) {
-        $project.Files = @($project.Sources.Keys | Sort-Object)
-    }
+foreach ($disposition in $selection.PlatformNotApplicable) {
+    Write-Host "Platform-not-applicable source '$($disposition.Path)': $($disposition.Reason)"
 }
 
-$analysisProjects = @($headProjects | Where-Object { $_.Files.Count -ne 0 })
-$tempRoot = if ($null -ne $inputManifestData) { $inputManifestRoots.TempRoot } else { New-CppcheckDisposableStage -CacheRoot $cppcheckCacheRoot -Name 'regression-normal' }
+if ($analysisProjects.Count -eq 0) {
+    Write-Host 'No changed C/C++ translation units are analyzed by this Windows Visual Studio configuration.'
+    exit 0
+}
+
+$cacheLock = $selection.AnalysisPreparation.CacheLock
+$tempRoot = $selection.AnalysisPreparation.TempRoot
 $baselineRoot = if ($null -ne $inputManifestData) { $inputManifestRoots.BaselineRoot } else { Join-Path $tempRoot 'baseline' }
 $baselineBuildRoot = if ($null -ne $inputManifestData) { $inputManifestRoots.BaselineBuildRoot } else { Join-Path $baselineRoot 'build' }
 $baselineWorktreeCreated = $false
