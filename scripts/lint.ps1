@@ -1113,7 +1113,7 @@ function Assert-MaterializedProtocolspecProvenance {
             continue
         }
 
-        $actualBlob = @(& git hash-object -- $sourcePath 2>$null)
+        $actualBlob = @(& git -c core.autocrlf=true hash-object --path $relativePath -- $sourcePath 2>$null)
 
         if (($LASTEXITCODE -ne 0) -or ($actualBlob.Count -ne 1) -or ($actualBlob[0].Trim() -ne $ExpectedInputs[$relativePath])) {
             $differentPaths += $relativePath
@@ -2104,7 +2104,8 @@ try {
         -Diagnostics $headDiagnostics `
         -PolicyPath $vendorDispositionPolicy `
         -RepositoryRoot $analysisRepositoryRoot `
-        -Contexts $vendorDispositionContexts
+        -Contexts $vendorDispositionContexts `
+        -NormalizeTrackedTextNewlines:($null -eq $inputManifestData)
     $headDiagnosticsForComparison = @($vendorDispositionResult.Unaccepted)
 
     $comparison = Get-CppcheckBaselineComparisonResult `

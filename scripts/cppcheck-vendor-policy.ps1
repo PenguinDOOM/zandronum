@@ -9,7 +9,8 @@ function Get-VendorPolicyRecordKey {
 function Get-VendorPolicyFileHash {
     param(
         [string]$RepositoryRoot,
-        [string]$RelativePath
+        [string]$RelativePath,
+        [switch]$NormalizeTrackedTextNewlines
     )
 
     if ([string]::IsNullOrWhiteSpace($RelativePath) -or [System.IO.Path]::IsPathRooted($RelativePath) -or $RelativePath.Contains('..')) {
@@ -20,6 +21,49 @@ function Get-VendorPolicyFileHash {
 
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Vendor disposition source is missing: $RelativePath"
+    }
+
+    $item = Get-Item -LiteralPath $path -Force
+
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Vendor disposition source must not be a reparse point: $RelativePath"
+    }
+
+    if ($NormalizeTrackedTextNewlines) {
+        $trackedPath = @(& git -C $RepositoryRoot ls-files --error-unmatch -- $RelativePath 2>$null)
+
+        if (($LASTEXITCODE -ne 0) -or ($trackedPath.Count -ne 1) -or ($trackedPath[0].Trim() -ne $RelativePath)) {
+            throw "Vendor disposition canonical text source is not tracked: $RelativePath"
+        }
+
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        $stream = New-Object System.IO.MemoryStream
+
+        try {
+            for ($index = 0; $index -lt $bytes.Length; $index++) {
+                if ($bytes[$index] -eq [byte]13) {
+                    if (($index + 1 -ge $bytes.Length) -or ($bytes[$index + 1] -ne [byte]10)) {
+                        throw "Vendor disposition canonical text source contains a bare CR byte: $RelativePath"
+                    }
+
+                    $index++
+                }
+
+                $stream.WriteByte($bytes[$index])
+            }
+
+            $sha256 = [System.Security.Cryptography.SHA256]::Create()
+
+            try {
+                return ([BitConverter]::ToString($sha256.ComputeHash($stream.ToArray()))).Replace('-', '')
+            }
+            finally {
+                $sha256.Dispose()
+            }
+        }
+        finally {
+            $stream.Dispose()
+        }
     }
 
     return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
@@ -40,7 +84,8 @@ function Assert-VendorPolicyPreconditions {
     param(
         [object]$Disposition,
         [string]$RepositoryRoot,
-        [hashtable]$Context
+        [hashtable]$Context,
+        [switch]$NormalizeTrackedTextNewlines
     )
 
     $required = @('Path', 'SHA256', 'Line', 'Column', 'Severity', 'Identifier', 'Message', 'Target', 'TranslationUnit', 'AnalyzerVersion', 'Reason', 'Preconditions')
@@ -77,6 +122,10 @@ function Assert-VendorPolicyPreconditions {
         }
 
         $apiHash = Get-VendorPolicyFileHash -RepositoryRoot $RepositoryRoot -RelativePath $apiRoot.Path
+
+        if ($NormalizeTrackedTextNewlines -and ($apiHash -ne $apiRoot.SHA256)) {
+            $apiHash = Get-VendorPolicyFileHash -RepositoryRoot $RepositoryRoot -RelativePath $apiRoot.Path -NormalizeTrackedTextNewlines
+        }
 
         if ($apiHash -ne $apiRoot.SHA256) {
             throw "Vendor disposition API root hash changed: $($apiRoot.Path)"
@@ -214,7 +263,8 @@ function Get-CppcheckVendorDispositionResult {
         [object[]]$Diagnostics,
         [string]$PolicyPath,
         [string]$RepositoryRoot,
-        [hashtable]$Contexts
+        [hashtable]$Contexts,
+        [switch]$NormalizeTrackedTextNewlines
     )
 
     if (-not (Test-Path -LiteralPath $PolicyPath -PathType Leaf)) {
@@ -259,7 +309,7 @@ function Get-CppcheckVendorDispositionResult {
                 throw "Vendor disposition target context is missing: $($diagnostic.Target)"
             }
 
-            Assert-VendorPolicyPreconditions -Disposition $disposition -RepositoryRoot $RepositoryRoot -Context $Contexts[$diagnostic.Target]
+            Assert-VendorPolicyPreconditions -Disposition $disposition -RepositoryRoot $RepositoryRoot -Context $Contexts[$diagnostic.Target] -NormalizeTrackedTextNewlines:$NormalizeTrackedTextNewlines
             [void]$accepted.Add([PSCustomObject]@{ Diagnostic = $diagnostic; Disposition = $disposition })
         }
         else {

@@ -41,13 +41,13 @@ function Assert-LintInputRejected {
     )
 
     $lintScript = Join-Path $PSScriptRoot 'lint.ps1'
-    $output = @(& pwsh -NoProfile -File $lintScript @Arguments 2>&1 | ForEach-Object { $_.ToString() })
+    $output = @(& pwsh -NoProfile -File $lintScript @Arguments 2>&1 | Out-String -Width 4096)
 
     if ($LASTEXITCODE -ne 1) {
         throw "lint.ps1 expected exit code 1 for input rejection, got $LASTEXITCODE."
     }
 
-    if (($output -join [Environment]::NewLine) -notmatch [regex]::Escape($Expected)) {
+    if (((($output -join [Environment]::NewLine) -replace '\|\s*', '') -replace '\s+', ' ') -notmatch [regex]::Escape($Expected)) {
         throw "lint.ps1 did not report expected input rejection '$Expected'."
     }
 }
@@ -755,6 +755,7 @@ Import-LintFunction -Name 'Convert-LFBytesToCRLFBytes'
 Import-LintFunction -Name 'Resolve-ApiRootRepresentation'
 Import-LintFunction -Name 'Get-ManifestApiRoots'
 Import-LintFunction -Name 'Assert-ApiRootBlobIdentity'
+Import-LintFunction -Name 'Assert-MaterializedProtocolspecProvenance'
 Import-LintFunction -Name 'Save-LintEvidenceState'
 Import-LintFunction -Name 'Save-LintEvidenceResult'
 Import-LintFunction -Name 'Complete-LintFinalization'
@@ -870,6 +871,17 @@ try {
     Set-Content -LiteralPath (Join-Path $fixtureRoot $adapterPath) -Value 'ma_decoder_init_memory()' -NoNewline
     $vendorHash = Get-VendorPolicyFileHash -RepositoryRoot $fixtureRoot -RelativePath $vendorPath
     $adapterHash = Get-VendorPolicyFileHash -RepositoryRoot $fixtureRoot -RelativePath $adapterPath
+    & git -C $fixtureRoot init -q
+    if ($LASTEXITCODE -ne 0) { throw 'Could not initialize canonical text hash fixture repository.' }
+    & git -C $fixtureRoot add -- $adapterPath
+    if ($LASTEXITCODE -ne 0) { throw 'Could not track canonical text hash fixture.' }
+    [System.IO.File]::WriteAllBytes((Join-Path $fixtureRoot $adapterPath), [System.Text.Encoding]::ASCII.GetBytes("ma_decoder_init_memory()`r`n"))
+    $canonicalAdapterHash = Get-VendorPolicyFileHash -RepositoryRoot $fixtureRoot -RelativePath $adapterPath -NormalizeTrackedTextNewlines
+    $expectedCanonicalAdapterHash = Get-ByteSHA256 -Bytes ([System.Text.Encoding]::ASCII.GetBytes("ma_decoder_init_memory()`n"))
+    if ($canonicalAdapterHash -ne $expectedCanonicalAdapterHash) { throw 'Tracked CRLF API root did not use canonical LF hash.' }
+    [System.IO.File]::WriteAllBytes((Join-Path $fixtureRoot $adapterPath), [System.Text.Encoding]::ASCII.GetBytes("changed_adapter`r`n"))
+    if ((Get-VendorPolicyFileHash -RepositoryRoot $fixtureRoot -RelativePath $adapterPath -NormalizeTrackedTextNewlines) -eq $expectedCanonicalAdapterHash) { throw 'Canonical API root hash accepted a content mutation.' }
+    [System.IO.File]::WriteAllBytes((Join-Path $fixtureRoot $adapterPath), [System.Text.Encoding]::ASCII.GetBytes('ma_decoder_init_memory()'))
     $context = @{ AnalyzerVersion = 'Cppcheck 2.21.0'; Compiler = 'MSVC'; Toolset = 'v143'; Abi = 'x64'; Configuration = 'Release|x64'; Defines = 'Release' }
     $contexts = @{ zdoom = $context }
     $diagnostic = [PSCustomObject]@{ Target = 'zdoom'; TranslationUnit = $adapterPath; RelativePath = $vendorPath; Line = 10; Column = 4; Severity = 'warning'; Identifier = 'id'; Message = 'message' }
@@ -885,6 +897,36 @@ try {
     $crlfApiHash = Get-ByteSHA256 -Bytes $crlfApiBytes
     $crlfApiRepresentation = Resolve-ApiRootRepresentation -Bytes $rawApiBytes -ExpectedSHA256 $crlfApiHash -Path $adapterPath
     if (($crlfApiRepresentation.Representation -ne 'lf-to-crlf') -or ($crlfApiRepresentation.FinalSHA256 -ne $crlfApiHash)) { throw 'API root LF-to-CRLF representation was not restored.' }
+    $protocolspecFixtureRoot = Join-Path $fixtureRoot 'protocolspec'
+    $protocolspecFixturePath = Join-Path $protocolspecFixtureRoot 'protocolspec/spec.txt'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $protocolspecFixturePath) | Out-Null
+    $protocolspecBlob = @(& git rev-parse 'HEAD:protocolspec/spec.txt')
+    if (($LASTEXITCODE -ne 0) -or ($protocolspecBlob.Count -ne 1)) { throw 'Could not resolve protocolspec fixture blob.' }
+    $protocolspecSourcePath = Join-Path (Split-Path -Parent $PSScriptRoot) 'protocolspec\spec.txt'
+    $protocolspecBytes = [System.IO.File]::ReadAllBytes($protocolspecSourcePath)
+    $protocolspecLfStream = New-Object System.IO.MemoryStream
+    try {
+        for ($index = 0; $index -lt $protocolspecBytes.Length; $index++) {
+            if ($protocolspecBytes[$index] -eq [byte]13) {
+                if (($index + 1 -ge $protocolspecBytes.Length) -or ($protocolspecBytes[$index + 1] -ne [byte]10)) { throw 'Protocolspec fixture contains a bare CR byte.' }
+                $index++
+            }
+            $protocolspecLfStream.WriteByte($protocolspecBytes[$index])
+        }
+        [System.IO.File]::WriteAllBytes($protocolspecFixturePath, (Convert-LFBytesToCRLFBytes -Bytes $protocolspecLfStream.ToArray()))
+    }
+    finally {
+        $protocolspecLfStream.Dispose()
+    }
+    Assert-MaterializedProtocolspecProvenance -SourceRoot $protocolspecFixtureRoot -ExpectedInputs @{ 'protocolspec/spec.txt' = $protocolspecBlob[0].Trim() }
+    [System.IO.File]::AppendAllText($protocolspecFixturePath, 'mutated')
+    Assert-ExpectedException -Expected 'protocolspec inputs differ' -Action {
+        Assert-MaterializedProtocolspecProvenance -SourceRoot $protocolspecFixtureRoot -ExpectedInputs @{ 'protocolspec/spec.txt' = $protocolspecBlob[0].Trim() }
+    }
+    Remove-Item -LiteralPath $protocolspecFixturePath -Force
+    Assert-ExpectedException -Expected 'protocolspec inputs differ' -Action {
+        Assert-MaterializedProtocolspecProvenance -SourceRoot $protocolspecFixtureRoot -ExpectedInputs @{ 'protocolspec/spec.txt' = $protocolspecBlob[0].Trim() }
+    }
     $isolatedSourceRoot = Join-Path $fixtureRoot 'isolated/source'
     $isolatedBuildRoot = Join-Path $fixtureRoot 'isolated/build'
     $productionSourceRoot = Join-Path $fixtureRoot 'production/source'
