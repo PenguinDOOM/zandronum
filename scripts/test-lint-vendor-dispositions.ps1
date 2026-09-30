@@ -54,10 +54,11 @@ function Assert-LintInputRejected {
 
 function Import-LintFunction {
     param(
-        [string]$Name
+        [string]$Name,
+        [string]$LintScript = (Join-Path $PSScriptRoot 'lint.ps1'),
+        [string]$ImportedName = $Name
     )
 
-    $lintScript = Join-Path $PSScriptRoot 'lint.ps1'
     $tokens = $null
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($lintScript, [ref]$tokens, [ref]$errors)
@@ -72,8 +73,363 @@ function Import-LintFunction {
         throw "lint.ps1 function '$Name' was not found."
     }
 
-    $definition = $function.Extent.Text -replace ("(?m)^function\s+" + [regex]::Escape($Name) + '\b'), "function global:$Name"
+    $definition = $function.Extent.Text -replace ("(?m)^function\s+" + [regex]::Escape($Name) + '\b'), "function global:$ImportedName"
     Invoke-Expression $definition
+}
+
+function New-CppcheckSchedulerFixture {
+    param([string]$FixtureRoot, [int[]]$Delays = @(1000, 100, 400), [string]$Role = 'head')
+
+    $root = Join-Path $FixtureRoot $Role
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    $childPath = Join-Path $root 'fake analyzer.ps1'
+    $child = @'
+param([string]$ConfigPath, [string]$Sentinel)
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+@{ PID = $PID; Start = [DateTime]::UtcNow.ToString('o'); Cwd = (Get-Location).Path; Sentinel = $Sentinel } | ConvertTo-Json | Set-Content -LiteralPath $config.StartPath
+[Console]::Out.Write($config.Stdout)
+[Console]::Error.Write($config.Stderr)
+$null = [Threading.Tasks.Task]::Delay([int]$config.Delay).GetAwaiter().GetResult()
+@{ PID = $PID; End = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json | Set-Content -LiteralPath $config.EndPath
+exit ([int]$config.ExitCode)
+'@
+    Set-Content -LiteralPath $childPath -Value $child -NoNewline
+    $hostPath = (Get-Process -Id $PID).Path
+    $sentinel = 'space "quote"' + "`t" + [char]0x65e5 + [char]0x672c
+    for ($index = 0; $index -lt $Delays.Count; $index++) {
+        $unit = "unit-$index.cpp"
+        $message = "message-$index " + [char]0x65e5 + [char]0x672c
+        $line = (Join-Path $root $unit) + "`t1`t2`twarning`tfixture`t$message"
+        $configPath = Join-Path $root "config-$index.json"
+        @{ Delay = $Delays[$index]; Stdout = "progress-$index`n`n"; Stderr = "$line`n$line"; ExitCode = 1; StartPath = (Join-Path $root "start-$index.json"); EndPath = (Join-Path $root "end-$index.json") } | ConvertTo-Json | Set-Content -LiteralPath $configPath
+        $descriptor = New-CppcheckDescriptor -CppcheckPath $hostPath -ProjectPath (Join-Path $root 'compile_commands.json') -CachePath (Join-Path $root "cache/$unit") -RepositoryRoot $root -BuildRoot $root -TargetName 'fixture' -TranslationUnit $unit -Index $index -UseProjectConfiguration:$false
+        $descriptor.Path = $hostPath
+        $descriptor.Arguments = @('-NoProfile', '-File', $childPath, '-ConfigPath', $configPath, '-Sentinel', $sentinel)
+        $descriptor.WorkingDirectory = $root
+        $descriptor
+    }
+}
+
+function Assert-CppcheckProcessIntervals {
+    param([object[]]$Invocations, [int]$Limit, [int]$Minimum = 1)
+
+    $events = @(foreach ($invocation in $Invocations) {
+        if (($null -eq $invocation.ProcessId) -or (-not $invocation.StdoutComplete) -or (-not $invocation.StderrComplete)) { throw 'Incomplete native invocation.' }
+        [PSCustomObject]@{ Time = ([DateTime]$invocation.StartedAtUtc).ToUniversalTime(); Change = 1 }
+        [PSCustomObject]@{ Time = ([DateTime]$invocation.EndedAtUtc).ToUniversalTime(); Change = -1 }
+        $liveProcess = Get-Process -Id $invocation.ProcessId -ErrorAction SilentlyContinue
+        if ($null -ne $liveProcess) {
+            try {
+                $liveStartTime = $liveProcess.StartTime
+                if ($null -ne $liveStartTime -and -not $liveProcess.HasExited -and $liveStartTime.ToUniversalTime() -eq ([DateTime]$invocation.StartedAtUtc).ToUniversalTime()) {
+                    throw "Owned PID $($invocation.ProcessId) survived the batch."
+                }
+            }
+            finally { $liveProcess.Dispose() }
+        }
+    })
+    $count = 0
+    $maximum = 0
+    foreach ($processEvent in @($events | Sort-Object Time, Change)) {
+        $count += $processEvent.Change
+        $maximum = [Math]::Max($maximum, $count)
+    }
+    if (($maximum -lt $Minimum) -or ($maximum -gt $Limit) -or ($count -ne 0)) { throw "Observed process overlap $maximum outside $Minimum..$Limit." }
+    return $maximum
+}
+
+function Assert-CppcheckSchedulerTransport {
+    param([string]$FixtureRoot, [string]$OldDefinitionsPath = '')
+
+    $global:utf8 = [Text.UTF8Encoding]::new($false)
+    [Console]::OutputEncoding = $utf8
+    $global:generatedBundlePaths = @()
+    $root = Join-Path $FixtureRoot ('scheduler space ' + [char]0x65e5)
+    $descriptors = @(New-CppcheckSchedulerFixture -FixtureRoot $root)
+    $expected = $null
+    $completionOrders = @()
+    foreach ($jobs in @(1, 2, 9)) {
+        $evidenceRoot = Join-Path $root "jobs-$jobs"
+        New-Item -ItemType Directory -Force -Path (Join-Path $evidenceRoot 'commands') | Out-Null
+        $evidence = [PSCustomObject]@{ Root = $evidenceRoot; Counter = 40 }
+        $results = @(Invoke-CppcheckProcessBatch -Descriptors $descriptors -CppcheckJobs $jobs -Evidence $evidence)
+        $diagnostics = @(foreach ($descriptor in $descriptors) {
+            $result = $results[$descriptor.Index]
+            ConvertFrom-CppcheckProjectOutput -Output $result.Output -ExitCode $result.ExitCode -RepositoryRoot $descriptor.RepositoryRoot -BuildRoot $descriptor.BuildRoot -TargetName $descriptor.TargetName -TranslationUnit $descriptor.TranslationUnit
+        })
+        @{ Results = $results; Diagnostics = $diagnostics } | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $evidenceRoot 'results.json')
+        $actual = $diagnostics | ConvertTo-Json -Depth 8 -Compress
+        if ($jobs -eq 1) { $expected = $actual }
+        elseif ($actual -cne $expected) { throw 'Worker count changed full diagnostic fields/order/duplicates.' }
+        $invocations = @(Get-ChildItem (Join-Path $evidenceRoot 'commands') -Filter '*.invocation.json' | Sort-Object Name | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json })
+        $null = Assert-CppcheckProcessIntervals -Invocations $invocations -Limit ([Math]::Min($jobs, 3)) -Minimum $(if ($jobs -eq 1) { 1 } else { 2 })
+        if (($evidence.Counter -ne 43) -or ($invocations.Count -ne 3) -or (@(Get-ChildItem (Join-Path $evidenceRoot 'commands') -Filter '*.raw.txt').Count -ne 3)) { throw 'Counter/raw/invocation mapping failed.' }
+        foreach ($descriptor in $descriptors) {
+            $index = $descriptor.Index
+            $invocation = $invocations[$index]
+            $config = Get-Content $descriptor.Arguments[4] -Raw | ConvertFrom-Json
+            $start = Get-Content $config.StartPath -Raw | ConvertFrom-Json
+            if (($invocation.Stdout -cne $config.Stdout) -or ($invocation.Stderr -cne $config.Stderr) -or ($start.Sentinel -cne $descriptor.Arguments[6]) -or ($start.Cwd -cne $descriptor.WorkingDirectory)) { throw 'Stream/ArgumentList/cwd corruption.' }
+            $raw = Get-Content (Get-ChildItem (Join-Path $evidenceRoot 'commands') -Filter '*.raw.txt' | Sort-Object Name)[$index].FullName -Raw
+            if ($raw -cne ($results[$index].Output -join [Environment]::NewLine)) { throw 'TU raw output was misassociated.' }
+        }
+        $completionOrders += ,@($results | Sort-Object EndedAtUtc | ForEach-Object { $_.Index })
+    }
+    if (($completionOrders[0] -join ',') -eq ($completionOrders[1] -join ',')) { throw 'Fixture did not produce a different completion order.' }
+    $reverse = @(New-CppcheckSchedulerFixture -FixtureRoot (Join-Path $root 'reverse') -Delays @(100, 1000, 400))
+    $reverseResults = @(Invoke-CppcheckProcessBatch -Descriptors $reverse -CppcheckJobs 2)
+    $reverseOrder = @($reverseResults | Sort-Object EndedAtUtc | ForEach-Object { $_.Index })
+    if (($reverseOrder -join ',') -eq ($completionOrders[1] -join ',')) { throw 'Swapping delays did not change completion order.' }
+    @{ Orders = $completionOrders; Reverse = $reverseResults } | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $root 'completion-orders.json')
+    $withoutEvidence = @(Invoke-CppcheckBatch -Descriptors $descriptors -CppcheckJobs 2)
+    if (($withoutEvidence | ConvertTo-Json -Depth 8 -Compress) -cne $expected) { throw 'Evidence-disabled result differs.' }
+    $single = @(Invoke-CppcheckProcessBatch -Descriptors @($descriptors[0]) -CppcheckJobs 9)
+    $null = Assert-CppcheckProcessIntervals -Invocations $single -Limit 1
+    if (@(Invoke-CppcheckProcessBatch -Descriptors @() -CppcheckJobs 2).Count -ne 0) { throw 'Empty batch started a child.' }
+    Assert-ExpectedException -Expected 'duplicate cache leaf' -Action {
+        $duplicate = $descriptors[1].PSObject.Copy()
+        $duplicate.CachePath = $descriptors[0].CachePath
+        Invoke-CppcheckProcessBatch -Descriptors @($descriptors[0], $duplicate) -CppcheckJobs 2 | Out-Null
+    }
+    if (-not [string]::IsNullOrWhiteSpace($OldDefinitionsPath)) {
+        Import-LintFunction -Name 'Invoke-LintChild' -LintScript $OldDefinitionsPath -ImportedName 'Invoke-OldLintChild'
+        $oldResults = @(foreach ($descriptor in $descriptors) { Invoke-OldLintChild -Path $descriptor.Path -Arguments $descriptor.Arguments -Label $descriptor.Label -WorkingDirectory $descriptor.WorkingDirectory })
+        $newResults = @(Invoke-CppcheckProcessBatch -Descriptors $descriptors -CppcheckJobs 1)
+        @{ Old = $oldResults; New = $newResults } | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $root 'V1-three-TU.json')
+        for ($index = 0; $index -lt 3; $index++) {
+            $oldDiagnostics = @(ConvertFrom-CppcheckProjectOutput -Output $oldResults[$index].Output -ExitCode $oldResults[$index].ExitCode -RepositoryRoot $descriptors[$index].RepositoryRoot -BuildRoot $descriptors[$index].BuildRoot -TargetName 'fixture' -TranslationUnit $descriptors[$index].TranslationUnit)
+            $newDiagnostics = @(ConvertFrom-CppcheckProjectOutput -Output $newResults[$index].Output -ExitCode $newResults[$index].ExitCode -RepositoryRoot $descriptors[$index].RepositoryRoot -BuildRoot $descriptors[$index].BuildRoot -TargetName 'fixture' -TranslationUnit $descriptors[$index].TranslationUnit)
+            Assert-EqualCppcheckRunResult -ExpectedDiagnostics $oldDiagnostics -ActualDiagnostics $newDiagnostics -ExpectedEvidence ([PSCustomObject]@{ ExitCode = $oldResults[$index].ExitCode; RawDiagnostics = @($oldResults[$index].Output | Where-Object { $_ -match "`t\d+`t\d+`t" }) }) -ActualEvidence ([PSCustomObject]@{ ExitCode = $newResults[$index].ExitCode; RawDiagnostics = @($newResults[$index].Output | Where-Object { $_ -match "`t\d+`t\d+`t" }) }) -Description 'old/new three-TU serial transport'
+        }
+    }
+    $large = @(New-CppcheckSchedulerFixture -FixtureRoot (Join-Path $root 'large') -Delays @(0))
+    $configPath = $large[0].Arguments[4]
+    $config = Get-Content $configPath -Raw | ConvertFrom-Json
+    $config.Stdout = (('out ' + "`t" + [char]0x65e5 + "`n`n") * 20000) + 'last stdout'
+    $config.Stderr = (('err ' + "`t" + [char]0x672c + "`n") * 20000) + $config.Stderr
+    $config | ConvertTo-Json | Set-Content $configPath
+    $largeEvidenceRoot = Join-Path $root 'large/evidence'
+    New-Item -ItemType Directory -Force -Path (Join-Path $largeEvidenceRoot 'commands') | Out-Null
+    $largeResults = @(Invoke-CppcheckProcessBatch -Descriptors $large -CppcheckJobs 2 -Evidence ([PSCustomObject]@{ Root = $largeEvidenceRoot; Counter = 0 }))
+    if (($largeResults[0].Stdout -cne $config.Stdout) -or ($largeResults[0].Stderr -cne $config.Stderr)) { throw 'Pipe-buffer output was truncated or corrupted.' }
+    $largeDiagnostics = @(ConvertFrom-CppcheckProjectOutput -Output $largeResults[0].Output -ExitCode 1 -RepositoryRoot $large[0].RepositoryRoot -BuildRoot $large[0].BuildRoot -TargetName 'fixture' -TranslationUnit $large[0].TranslationUnit)
+    if ($largeDiagnostics.Count -ne 2 -or $largeDiagnostics[0].Message -cne $largeDiagnostics[1].Message) { throw 'Large output lost duplicate diagnostics.' }
+    $config.Stdout = 'cppcheck: error: injected stdout fatal'
+    $config.ExitCode = 0
+    $config | ConvertTo-Json | Set-Content $configPath
+    Assert-ExpectedException -Expected 'tool or configuration error' -Action { Invoke-CppcheckBatch -Descriptors $large -CppcheckJobs 2 | Out-Null }
+    Write-Host 'V1/V2/V4/V5 scheduler transport: passed.'
+}
+
+function Assert-CppcheckBatchIntegration {
+    param([string]$LintScript = (Join-Path $PSScriptRoot 'lint.ps1'))
+
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($LintScript, [ref]$tokens, [ref]$errors)
+    if ($errors.Count) { throw $errors[0].Message }
+    $targetLoop = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.ForEachStatementAst] -and $node.Variable.VariablePath.UserPath -eq 'project' -and $node.Condition.Extent.Text -eq '$analysisProjects' }, $true) | Select-Object -Last 1
+    if ($null -eq $targetLoop) { throw 'Production target loop missing.' }
+    $calls = @($targetLoop.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Invoke-CppcheckBatch' }, $true))
+    if ($calls.Count -ne 2 -or $calls[0].Extent.Text -notmatch '\$headDescriptors.ToArray\(\)' -or $calls[1].Extent.Text -notmatch '\$baselineDescriptors.ToArray\(\)') { throw 'Production HEAD/baseline batch connections missing or reordered.' }
+    $loops = @($targetLoop.FindAll({ param($node) $node -is [System.Management.Automation.Language.ForEachStatementAst] -and $node.Variable.VariablePath.UserPath -eq 'translationUnit' }, $true))
+    if ($loops.Count -ne 2 -or $loops[0].Condition.Extent.Text -ne '$project.Files' -or $loops[1].Condition.Extent.Text -ne '@($baselineProject.Sources.Keys | Sort-Object)') { throw 'Production TU selection/order changed.' }
+    if (($loops[0].Extent.EndOffset -ge $calls[0].Extent.StartOffset) -or ($calls[0].Extent.EndOffset -ge $loops[1].Extent.StartOffset) -or ($loops[1].Extent.EndOffset -ge $calls[1].Extent.StartOffset)) { throw 'Production role barrier moved inside a TU loop.' }
+    foreach ($role in @('head', 'baseline')) {
+        $loop = $loops[$(if ($role -eq 'head') { 0 } else { 1 })]
+        $text = $loop.Extent.Text
+        if ($text -notmatch 'New-CppcheckDescriptor' -or $text -match 'Invoke-CppcheckProject|Invoke-CppcheckBatch' -or $text -notmatch ([regex]::Escape('-CachePath $' + $role + 'Cache'))) { throw "Production $role descriptor preparation differs." }
+    }
+    Write-Host 'V3 production AST connections/role barrier: passed.'
+}
+
+function Assert-CppcheckRoleClassification {
+    param([string]$FixtureRoot)
+
+    $root = Join-Path $FixtureRoot 'classification'
+    $head = @(New-CppcheckSchedulerFixture -FixtureRoot $root -Delays @(300, 0, 100) -Role 'head')
+    $baseline = @(New-CppcheckSchedulerFixture -FixtureRoot $root -Delays @(0, 300, 100) -Role 'baseline')
+    $vendorPath = 'src/sound/thirdparty/miniaudio/miniaudio.h'
+    $adapterPath = 'src/sound/audio_decoder_miniaudio.cpp'
+    foreach ($role in @($head, $baseline)) {
+        New-Item -ItemType Directory -Force -Path (Split-Path (Join-Path $role[0].RepositoryRoot $vendorPath)) | Out-Null
+        Set-Content (Join-Path $role[0].RepositoryRoot $vendorPath) 'vendor' -NoNewline
+        Set-Content (Join-Path $role[0].RepositoryRoot $adapterPath) 'ma_decoder_init_memory()' -NoNewline
+        foreach ($descriptor in $role) { $descriptor.TargetName = 'zdoom' }
+        $role[0].TranslationUnit = $adapterPath
+    }
+    $policyPath = Join-Path $root 'policy.json'
+    $record = @{ Path = $vendorPath; SHA256 = (Get-VendorPolicyFileHash -RepositoryRoot $head[0].RepositoryRoot -RelativePath $vendorPath); Line = 10; Column = 4; Severity = 'warning'; Identifier = 'id'; Message = 'message'; Target = 'zdoom'; TranslationUnit = $adapterPath; AnalyzerVersion = 'Cppcheck fixture'; Reason = 'fixture'; Preconditions = @{ Compiler = 'MSVC'; Toolset = 'v143'; Abi = 'x64'; Configuration = 'Release|x64'; Defines = 'Release'; ApiTokens = @('ma_decoder_init_memory'); ApiRoots = @(@{ Path = $adapterPath; SHA256 = (Get-VendorPolicyFileHash -RepositoryRoot $head[0].RepositoryRoot -RelativePath $adapterPath) }) } }
+    @{ SchemaVersion = 1; Dispositions = @($record) } | ConvertTo-Json -Depth 8 | Set-Content $policyPath
+    $contexts = @{ zdoom = @{ AnalyzerVersion = 'Cppcheck fixture'; Compiler = 'MSVC'; Toolset = 'v143'; Abi = 'x64'; Configuration = 'Release|x64'; Defines = 'Release' } }
+    foreach ($role in @($head, $baseline)) {
+        for ($index = 0; $index -lt 3; $index++) {
+            $descriptor = $role[$index]
+            $config = Get-Content $descriptor.Arguments[4] -Raw | ConvertFrom-Json
+            $roleRoot = $descriptor.RepositoryRoot
+            if ($index -eq 0) { $config.Stderr = (Join-Path $roleRoot $vendorPath) + "`t10`t4`twarning`tid`tmessage" }
+            elseif ($index -eq 1) {
+                $config.Stderr = (Join-Path $roleRoot 'src/local.cpp') + "`t2`t1`twarning`tcommon`tunchanged"
+                if ($roleRoot -eq $head[0].RepositoryRoot) { $config.Stderr += "`n" + (Join-Path $roleRoot 'src/local.cpp') + "`t3`t1`twarning`tnew`tnew message" }
+            }
+            elseif ($roleRoot -eq $head[0].RepositoryRoot) { $config.Stderr = (Join-Path $roleRoot $vendorPath) + "`t11`t4`twarning`tunresolved`tunproven vendor" }
+            else { $config.Stderr = (Join-Path $roleRoot 'src/local.cpp') + "`t4`t1`twarning`tremoved`tbaseline only" }
+            $config | ConvertTo-Json | Set-Content $descriptor.Arguments[4]
+        }
+    }
+    $expected = $null
+    foreach ($jobs in @(1, 2)) {
+        $evidenceRoot = Join-Path $root "jobs-$jobs"
+        New-Item -ItemType Directory -Force -Path (Join-Path $evidenceRoot 'commands') | Out-Null
+        $evidence = [PSCustomObject]@{ Root = $evidenceRoot; Counter = 0 }
+        $headDiagnostics = @(Invoke-CppcheckBatch -Descriptors $head -CppcheckJobs $jobs -Evidence $evidence)
+        $baselineDiagnostics = @(Invoke-CppcheckBatch -Descriptors $baseline -CppcheckJobs $jobs -Evidence $evidence)
+        $dispositions = Get-CppcheckVendorDispositionResult -Diagnostics $headDiagnostics -PolicyPath $policyPath -RepositoryRoot $head[0].RepositoryRoot -Contexts $contexts
+        $comparison = Get-CppcheckBaselineComparisonResult -BaselineDiagnostics $baselineDiagnostics -HeadDiagnostics $headDiagnostics -UnacceptedDiagnostics $dispositions.Unaccepted
+        $classification = @{ RawHead = $headDiagnostics; AcceptedVendor = $dispositions.Accepted; BaselineInput = $baselineDiagnostics; Comparison = $comparison; Gate = $(if ($comparison.UnresolvedVendor.Count) { 'failed-unresolved-vendor' } elseif ($comparison.New.Count) { 'failed-new' } else { 'passed' }) }
+        $classification | ConvertTo-Json -Depth 15 | Set-Content (Join-Path $evidenceRoot 'classification.json')
+        $actual = $classification | ConvertTo-Json -Depth 15 -Compress
+        if ($jobs -eq 1) { $expected = $actual }
+        elseif ($expected -cne $actual) { throw 'Role/classification full content changed with Jobs.' }
+        if ($headDiagnostics.Count -ne 4 -or $dispositions.Accepted.Count -ne 1 -or $comparison.Baseline.Count -ne 3 -or $comparison.Unchanged.Count -ne 1 -or $comparison.BaselineOnly.Count -ne 2 -or $comparison.New.Count -ne 2 -or $comparison.UnresolvedVendor.Count -ne 1) { throw 'Classification fixture did not cover every category.' }
+        $invocations = @(Get-ChildItem (Join-Path $evidenceRoot 'commands') -Filter '*.invocation.json' | Sort-Object Name | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json })
+        $headEnd = ($invocations[0..2] | Sort-Object EndedAtUtc | Select-Object -Last 1).EndedAtUtc
+        $baselineStart = ($invocations[3..5] | Sort-Object StartedAtUtc | Select-Object -First 1).StartedAtUtc
+        if ([DateTime]$baselineStart -lt [DateTime]$headEnd) { throw 'HEAD/baseline process lifetimes overlapped.' }
+    }
+    Write-Host 'V3 full role/classification comparison: passed.'
+}
+
+function Assert-CppcheckSchedulerFailures {
+    param([string]$FixtureRoot, [string]$LintScript = (Join-Path $PSScriptRoot 'lint.ps1'), [string]$TestScript = $PSCommandPath)
+
+    $root = Join-Path $FixtureRoot 'scheduler-failures'
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    $childPath = Join-Path $root 'outer-finalization.ps1'
+    $child = @'
+param([string]$Case, [string]$Root, [string]$LintScript, [string]$TestScript)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($TestScript, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw $errors[0].Message }
+$import = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Import-LintFunction' }, $true) | Select-Object -First 1
+Invoke-Expression $import.Extent.Text
+Import-LintFunction -Name 'New-CppcheckSchedulerFixture' -LintScript $TestScript
+foreach ($name in @('New-CppcheckDescriptor', 'Invoke-CppcheckProcessBatch', 'Invoke-CppcheckBatch', 'Save-LintChildEvidence', 'Save-LintEvidenceResult', 'Complete-LintFinalization', 'Complete-LintTemporaryCleanup')) { Import-LintFunction -Name $name -LintScript $LintScript }
+$scripts = Split-Path $LintScript
+. (Join-Path $scripts 'cppcheck-cache.ps1')
+. (Join-Path $scripts 'cppcheck-vendor-policy.ps1')
+Import-LintFunction -Name 'Get-RepositoryRelativePath' -LintScript $TestScript
+$global:utf8 = [Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $utf8
+$global:generatedBundlePaths = @()
+$evidenceRoot = Join-Path $Root 'evidence'
+New-Item -ItemType Directory -Force -Path (Join-Path $evidenceRoot 'commands') | Out-Null
+$analyzer = (Get-Command cppcheck).Source
+@{ ScriptPath = $LintScript; ScriptSHA256 = (Get-FileHash $LintScript).Hash; PolicyPath = (Join-Path $scripts 'cppcheck-vendor-dispositions.json'); PolicySHA256 = (Get-FileHash (Join-Path $scripts 'cppcheck-vendor-dispositions.json')).Hash; AnalyzerPath = $analyzer; AnalyzerSHA256 = (Get-FileHash $analyzer).Hash; AnalyzerVersion = (& $analyzer --version) } | ConvertTo-Json | Set-Content (Join-Path $evidenceRoot 'tool-provenance.json')
+$evidence = [PSCustomObject]@{ Root = $evidenceRoot; Counter = 0 }
+$cacheRoot = Join-Path $Root 'cache'
+$lock = Enter-CppcheckCacheLock -CacheRoot $cacheRoot -Name 'failure-fixture'
+$stage = New-CppcheckDisposableStage -CacheRoot $cacheRoot -Name 'failure-stage'
+$repo = Join-Path $Root 'repo'
+New-Item -ItemType Directory -Force -Path $repo | Out-Null
+& git -C $repo init -q
+if ($LASTEXITCODE) { throw 'Fixture git init failed.' }
+Set-Content (Join-Path $repo 'input.txt') 'fixture'
+& git -C $repo add input.txt
+& git -C $repo -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm fixture
+if ($LASTEXITCODE) { throw 'Fixture git commit failed.' }
+$baselineRoot = Join-Path $stage 'baseline'
+& git -C $repo worktree add --detach -q $baselineRoot HEAD
+if ($LASTEXITCODE) { throw 'Fixture worktree add failed.' }
+$descriptors = @(New-CppcheckSchedulerFixture -FixtureRoot (Join-Path $stage 'inputs') -Delays @(100, 1200, 800))
+$configPath = $descriptors[0].Arguments[4]
+$config = Get-Content $configPath -Raw | ConvertFrom-Json
+switch ($Case) {
+    'exit2' { $config.ExitCode = 2; $config.Stderr = ''; $config.Stdout = 'injected exit 2' }
+    'exit1-empty' { $config.ExitCode = 1; $config.Stderr = '' }
+    'fatal' { $config.ExitCode = 0; $config.Stdout = 'cppcheck: error: injected stdout fatal' }
+    'missing' { $config.Stderr = (Join-Path $descriptors[0].RepositoryRoot 'unsupported.cpp') + "`t1`t1`terror`tmissingFile`tinjected missing input" }
+    'start' { $config.Delay = 8000; $descriptors[1].Path = Join-Path $Root 'not-an-analyzer.exe' }
+    'evidence' {
+        foreach ($index in @(0, 1)) {
+            $prefix = '{0:D4}-{1}' -f ($index + 1), $descriptors[$index].Label
+            New-Item -ItemType Directory -Path (Join-Path $evidenceRoot "commands/$prefix.raw.txt") | Out-Null
+        }
+    }
+}
+$config | ConvertTo-Json | Set-Content $configPath
+$lifecycle = [Collections.Generic.List[object]]::new()
+$cleanupState = [PSCustomObject]@{ Completed = $false }
+$cleanupAction = {
+    $invocations = @(Get-ChildItem (Join-Path $evidenceRoot 'commands') -Filter '*.invocation.json' -File | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json })
+    $starts = @(Get-ChildItem (Join-Path $stage 'inputs') -Filter 'start-*.json' -Recurse -File | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json })
+    $ownedPids = @(@($invocations | ForEach-Object { $_.ProcessId }) + @($starts | ForEach-Object { $_.PID }) | Sort-Object -Unique)
+    foreach ($ownedPid in $ownedPids) {
+        if (Get-Process -Id $ownedPid -ErrorAction SilentlyContinue) { throw "Owned PID $ownedPid survived before outer cleanup." }
+    }
+    $lifecycle.Add(@{ Event = 'owned-stopped-before-cleanup'; Time = [DateTime]::UtcNow.ToString('o'); PIDs = $ownedPids; Invocations = $invocations; Starts = $starts })
+    Push-Location $repo
+    try { Complete-LintTemporaryCleanup -BaselineWorktreeCreated -BaselineRoot $baselineRoot -TempRoot $stage -CppcheckCacheRoot $cacheRoot -StageName 'failure-stage' }
+    finally { Pop-Location }
+    $cleanupState.Completed = $true
+    $lifecycle.Add(@{ Event = 'cleanup'; Time = [DateTime]::UtcNow.ToString('o'); StageExists = (Test-Path $stage); BaselineExists = (Test-Path $baselineRoot); Worktrees = @(& git -C $repo worktree list --porcelain) })
+}
+$finalization = $null
+try {
+    $finalization = Complete-LintFinalization -SaveEvidenceAction { $null = @(Invoke-CppcheckBatch -Descriptors $descriptors -CppcheckJobs 2 -Evidence $evidence) } -CleanupAction $cleanupAction -SaveResultAction {
+        param($status, $exitCode, $errorMessage)
+        Save-LintEvidenceResult -Evidence $evidence -Status $status -ExitCode $exitCode -Error $errorMessage
+        $lifecycle.Add(@{ Event = 'result'; Status = $status; Error = $errorMessage; Time = [DateTime]::UtcNow.ToString('o') })
+    }
+}
+finally {
+    try { if (-not $cleanupState.Completed) { & $cleanupAction } }
+    finally { Exit-CppcheckCacheLock -Lock $lock }
+}
+$reacquired = Enter-CppcheckCacheLock -CacheRoot $cacheRoot -Name 'failure-fixture'
+Exit-CppcheckCacheLock -Lock $reacquired
+$lifecycle.Add(@{ Event = 'lock-reacquired'; Time = [DateTime]::UtcNow.ToString('o'); Counter = $evidence.Counter })
+$lifecycle | ConvertTo-Json -Depth 15 | Set-Content (Join-Path $Root 'lifecycle.json')
+if ($null -eq $finalization -or (-not $finalization.Succeeded)) { exit 1 }
+exit 0
+'@
+    Set-Content -LiteralPath $childPath -Value $child -NoNewline
+    $expectedErrors = @{ exit2 = 'with code 2'; 'exit1-empty' = 'before producing diagnostics'; fatal = 'tool or configuration error'; missing = 'unsupported missing input'; start = 'not-an-analyzer.exe'; evidence = '0001-cppcheck-fixture-unit-0.cpp.raw.txt' }
+    foreach ($case in @('valid', 'exit2', 'exit1-empty', 'fatal', 'missing', 'start', 'evidence')) {
+        $caseRoot = Join-Path $root $case
+        $outerEvidenceRoot = Join-Path $caseRoot 'outer'
+        New-Item -ItemType Directory -Force -Path (Join-Path $outerEvidenceRoot 'commands') | Out-Null
+        $arguments = @('-NoProfile', '-File', $childPath, '-Case', $case, '-Root', $caseRoot, '-LintScript', $LintScript, '-TestScript', $TestScript)
+        $outer = Invoke-LintChild -Path (Get-Process -Id $PID).Path -Arguments $arguments -Label "outer-$case" -Evidence ([PSCustomObject]@{ Root = $outerEvidenceRoot; Counter = 0 })
+        $expectedExit = if ($case -eq 'valid') { 0 } else { 1 }
+        if ($outer.ExitCode -ne $expectedExit) { throw "V6 $case outer exit was $($outer.ExitCode): $($outer.Output -join ' ')" }
+        $result = Get-Content (Join-Path $caseRoot 'evidence/final-result.json') -Raw | ConvertFrom-Json
+        if ($result.ExitCode -ne $expectedExit -or $result.Status -ne $(if ($case -eq 'valid') { 'passed' } else { 'failed' })) { throw "V6 $case final result mismatch." }
+        if ($case -ne 'valid' -and $result.Error -notmatch [regex]::Escape($expectedErrors[$case])) { throw "V6 $case lost original error: $($result.Error)" }
+        if ($case -eq 'evidence' -and ($result.Error -notmatch 'Secondary failures:.*0002-cppcheck-fixture-unit-1.cpp.raw.txt')) { throw 'V6 secondary save failure was lost.' }
+        $lifecycle = @(Get-Content (Join-Path $caseRoot 'lifecycle.json') -Raw | ConvertFrom-Json)
+        $stopped = @($lifecycle | Where-Object { $_.Event -eq 'owned-stopped-before-cleanup' })[0]
+        $cleanup = @($lifecycle | Where-Object { $_.Event -eq 'cleanup' })[0]
+        $reacquired = @($lifecycle | Where-Object { $_.Event -eq 'lock-reacquired' })[0]
+        if ($stopped.PIDs.Count -lt 1 -or $cleanup.StageExists -or $cleanup.BaselineExists -or [DateTime]$cleanup.Time -lt [DateTime]$stopped.Time) { throw "V6 $case cleanup occurred before owned process exit or leaked stage/worktree." }
+        foreach ($ownedPid in $stopped.PIDs) { if (Get-Process -Id $ownedPid -ErrorAction SilentlyContinue) { throw "V6 PID $ownedPid remains alive." } }
+        if ($case -eq 'start') {
+            if ($stopped.Invocations.Count -ne 1 -or $reacquired.Counter -ne 1) { throw 'V6 infrastructure failure did not stop further submissions.' }
+        }
+        elseif ($reacquired.Counter -ne 3) { throw "V6 $case did not attempt all started TU evidence before interpreting." }
+        if ($case -eq 'evidence' -and $stopped.Invocations.Count -ne 1) { throw 'V6 save failure skipped later TU evidence.' }
+        foreach ($invocation in $stopped.Invocations) {
+            $unitArgument = @($invocation.Arguments | Where-Object { $_ -like '*config-*.json' })[0]
+            $unitIndex = [regex]::Match($unitArgument, 'config-(\d+)\.json').Groups[1].Value
+            if ($case -ne 'start' -and $invocation.Stdout -notmatch "progress-$unitIndex|injected|cppcheck: error") { throw 'V6 saved raw output was associated with the wrong TU.' }
+        }
+    }
+    Write-Host 'V6 real process/finalization/worktree/lock failure matrix: passed (six expected failures, one success).'
 }
 
 function Assert-CppcheckProjectSelection {
@@ -540,6 +896,91 @@ function Assert-NativeCppcheckCacheInvalidation {
     Assert-EqualCppcheckRunResult -ExpectedDiagnostics $headerFresh -ExpectedEvidence (Get-CppcheckCommandEvidence -EvidenceRoot $evidenceRoot) -ActualDiagnostics $headerChanged -ActualEvidence $headerChangedEvidence -Description 'header invalidation against fresh cache'
 }
 
+function Assert-NativeCppcheckBatchSmoke {
+    param([string]$FixtureRoot, [string]$OldDefinitionsPath = '')
+
+    $cppcheck = (Get-Command cppcheck -ErrorAction Stop).Source
+    $nativeSource = Join-Path $FixtureRoot 'native-cache/build/src/sample.cpp'
+    $nativeHeader = Join-Path $FixtureRoot 'native-cache/build/src/sample.h'
+    if (-not (Test-Path $nativeSource) -or -not (Test-Path $nativeHeader)) { throw 'Native cache fixture must run before smoke.' }
+    $root = Join-Path $FixtureRoot 'native-smoke'
+    $templateSource = Get-Content $nativeSource -Raw
+    $templateHeader = Get-Content $nativeHeader -Raw
+    $smokePassed = $false
+    foreach ($attempt in @(1, 2)) {
+        $functionCount = if ($attempt -eq 1) { 200 } else { 1000 }
+        $attemptRoot = Join-Path $root "attempt-$attempt"
+        $observedOverlap = $true
+        foreach ($role in @('head', 'baseline')) {
+            $buildRoot = Join-Path $attemptRoot "$role/build"
+            $sourceRoot = Join-Path $buildRoot 'src'
+            New-Item -ItemType Directory -Force -Path $sourceRoot | Out-Null
+            Set-Content (Join-Path $buildRoot 'CMakeCache.txt') 'CMAKE_GENERATOR_TOOLSET:INTERNAL=v143' -NoNewline
+            Set-Content (Join-Path $sourceRoot 'sample.h') $templateHeader -NoNewline
+            $entries = @(for ($unitIndex = 0; $unitIndex -lt 3; $unitIndex++) {
+                $unit = "sample-$unitIndex.cpp"
+                $helpers = @(for ($functionIndex = 0; $functionIndex -lt $functionCount; $functionIndex++) { "int helper_$functionIndex(int value) { return value * value + $functionIndex; }" }) -join "`n"
+                Set-Content (Join-Path $sourceRoot $unit) ($templateSource + "`n" + $helpers) -NoNewline
+                @{ directory = $sourceRoot; command = ('cl.exe /I"' + $sourceRoot + '" /c ' + $unit); file = (Join-Path $sourceRoot $unit) }
+            })
+            $projectPath = Join-Path $buildRoot 'compile_commands.json'
+            $entries | ConvertTo-Json -AsArray | Set-Content $projectPath
+            $context = Get-CppcheckRegressionAnalysisContext -BuildRoot $buildRoot -RepositoryRoot $buildRoot -ProjectPath $projectPath -InputRootIdentities @('native-cache-fixture') -AnalyzerConfigurationPaths (Get-CppcheckInstalledConfigurationPaths -AnalyzerPath $cppcheck) -AnalyzerOptions @('--project-configuration=Release|x64', '--enable=warning,performance,portability')
+            $identity = Get-CppcheckCacheIdentity -AnalyzerVersion (& $cppcheck --version) -AnalyzerSHA256 (Get-FileHash $cppcheck).Hash -InputMode 'normal' -Toolset 'v143' -RootIdentity 'native-cache-fixture' -AnalysisContext $context
+            $identity | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $buildRoot 'identity.json')
+            $expected = $null
+            $serialInvocations = @()
+            foreach ($jobs in @(1, 3)) {
+                $evidenceRoot = Join-Path $attemptRoot "$role/jobs-$jobs"
+                New-Item -ItemType Directory -Force -Path (Join-Path $evidenceRoot 'commands') | Out-Null
+                $evidence = [PSCustomObject]@{ Root = $evidenceRoot; Counter = 0 }
+                $descriptors = @(for ($unitIndex = 0; $unitIndex -lt 3; $unitIndex++) {
+                    $unit = "sample-$unitIndex.cpp"
+                    $leaf = Get-CppcheckCacheLeaf -CacheRoot (Join-Path $FixtureRoot "smoke-cache-$attempt-$jobs") -Namespace 'regression' -Identity $identity -Role $role -TargetName 'compile_commands.json' -TranslationUnit $unit
+                    New-CppcheckDescriptor -CppcheckPath $cppcheck -ProjectPath $projectPath -CachePath $leaf -RepositoryRoot $buildRoot -BuildRoot $buildRoot -TargetName 'compile_commands.json' -TranslationUnit $unit -Index $unitIndex -UseProjectConfiguration:$false
+                })
+                $diagnostics = @(Invoke-CppcheckBatch -Descriptors $descriptors -CppcheckJobs $jobs -Evidence $evidence)
+                $invocations = @(Get-ChildItem (Join-Path $evidenceRoot 'commands') -Filter '*.invocation.json' | Sort-Object Name | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json })
+                @{ Diagnostics = $diagnostics; Invocations = $invocations; Descriptors = $descriptors } | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $evidenceRoot 'results.json')
+                $actual = $diagnostics | ConvertTo-Json -Depth 8 -Compress
+                if ($jobs -eq 1) { $expected = $actual; $serialInvocations = $invocations }
+                elseif ($expected -cne $actual) { throw 'Native Jobs=1/3 diagnostics differ.' }
+                if ($diagnostics.Count -lt 3) { throw 'Native smoke fixture did not produce all TU diagnostics.' }
+                foreach ($invocation in $invocations) {
+                    $jobIndex = [Array]::IndexOf($invocation.Arguments, '-j')
+                    if ($jobIndex -lt 0 -or $invocation.Arguments[$jobIndex + 1] -ne '1' -or $invocation.Path -ne $cppcheck) { throw 'Native smoke did not run installed Cppcheck with -j 1.' }
+                }
+                $overlap = Assert-CppcheckProcessIntervals -Invocations $invocations -Limit $jobs -Minimum 0
+                if ($jobs -gt 1 -and $overlap -lt 2) { $observedOverlap = $false }
+                if ($jobs -eq 3) {
+                    $withoutEvidence = @(Invoke-CppcheckBatch -Descriptors $descriptors -CppcheckJobs 2)
+                    if (($withoutEvidence | ConvertTo-Json -Depth 8 -Compress) -cne $expected) { throw 'Native evidence-disabled batch differs.' }
+                }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($OldDefinitionsPath)) {
+                Import-LintFunction -Name 'Invoke-LintChild' -LintScript $OldDefinitionsPath -ImportedName 'Invoke-OldLintChild'
+                Import-LintFunction -Name 'Invoke-CppcheckProject' -LintScript $OldDefinitionsPath -ImportedName 'Invoke-OldCppcheckProject'
+                $oldDefinition = (Get-Command Invoke-OldCppcheckProject).Definition -replace 'Invoke-LintChild', 'Invoke-OldLintChild'
+                Invoke-Expression ("function global:Invoke-OldCppcheckProject {`n" + $oldDefinition + "`n}")
+                $oldEvidenceRoot = Join-Path $attemptRoot "$role/old"
+                New-Item -ItemType Directory -Force -Path (Join-Path $oldEvidenceRoot 'commands') | Out-Null
+                $oldEvidence = [PSCustomObject]@{ Root = $oldEvidenceRoot; Counter = 0 }
+                $oldDiagnostics = @(for ($unitIndex = 0; $unitIndex -lt 3; $unitIndex++) {
+                    Invoke-OldCppcheckProject -CppcheckPath $cppcheck -ProjectPath $projectPath -CachePath (Join-Path $oldEvidenceRoot "cache-$unitIndex") -RepositoryRoot $buildRoot -BuildRoot $buildRoot -TargetName 'compile_commands.json' -TranslationUnit "sample-$unitIndex.cpp" -CppcheckJobs 1 -Evidence $oldEvidence -UseProjectConfiguration:$false
+                })
+                $oldInvocations = @(Get-ChildItem (Join-Path $oldEvidenceRoot 'commands') -Filter '*.invocation.json' | Sort-Object Name | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json })
+                @{ Diagnostics = $oldDiagnostics; Invocations = $oldInvocations } | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $oldEvidenceRoot 'results.json')
+                if (($oldDiagnostics | ConvertTo-Json -Depth 8 -Compress) -cne $expected) { throw 'V1 three native TU old/new full diagnostics differ.' }
+                for ($unitIndex = 0; $unitIndex -lt 3; $unitIndex++) { if ($oldInvocations[$unitIndex].ExitCode -ne $serialInvocations[$unitIndex].ExitCode) { throw 'V1 native three-TU exit mismatch.' } }
+            }
+        }
+        @{ Attempt = $attempt; FunctionsPerTU = $functionCount; ObservedRealCppcheckOverlap = $observedOverlap } | ConvertTo-Json | Set-Content (Join-Path $attemptRoot 'observation.json')
+        if ($observedOverlap) { $smokePassed = $true; break }
+    }
+    if (-not $smokePassed) { throw 'Native Cppcheck PID overlap was not observed after the one permitted fixture increase.' }
+    Write-Host 'V1/V7 three native TU diagnostics/exit and real Cppcheck process overlap: passed.'
+}
+
 function Save-NativeCppcheckCacheEvidence {
     param(
         [string]$FixtureRoot,
@@ -556,11 +997,11 @@ function Save-NativeCppcheckCacheEvidence {
 function Assert-RealCppcheckProjectCacheRoute {
     param(
         [string]$FixtureRoot,
-        [string]$CacheRoot
+        [string]$CacheRoot,
+        [string]$RepositoryRoot = (Split-Path -Parent $PSScriptRoot)
     )
 
     $cppcheck = Get-Command cppcheck -ErrorAction Stop
-    $repositoryRoot = Split-Path -Parent $PSScriptRoot
     $buildRoot = Join-Path $repositoryRoot 'build-v143'
     $projectPath = Join-Path $buildRoot 'src/zdoom.vcxproj'
     $translationUnit = 'src/sound/i_sound.cpp'
@@ -592,10 +1033,10 @@ function Assert-RealCppcheckProjectCacheRoute {
 function Assert-ProductionRegressionCacheLeafExcludesGateControls {
     param(
         [string]$FixtureRoot,
-        [string]$CacheRoot
+        [string]$CacheRoot,
+        [string]$LintScript = (Join-Path $PSScriptRoot 'lint.ps1')
     )
 
-    $lintScript = Join-Path $PSScriptRoot 'lint.ps1'
     $tokens = $null
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($lintScript, [ref]$tokens, [ref]$errors)
@@ -760,10 +1201,14 @@ Import-LintFunction -Name 'Save-LintEvidenceState'
 Import-LintFunction -Name 'Save-LintEvidenceResult'
 Import-LintFunction -Name 'Complete-LintFinalization'
 Import-LintFunction -Name 'Invoke-LintChild'
+Import-LintFunction -Name 'Save-LintChildEvidence'
+Import-LintFunction -Name 'New-CppcheckDescriptor'
+Import-LintFunction -Name 'Invoke-CppcheckProcessBatch'
+Import-LintFunction -Name 'Invoke-CppcheckBatch'
 Import-LintFunction -Name 'Invoke-CppcheckProject'
 Import-LintFunction -Name 'Select-CppcheckProjects'
 
-$fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('zandronum-vendor-policy-' + [guid]::NewGuid().ToString('N'))
+$fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('zn-vp-' + [guid]::NewGuid().ToString('N'))
 
 try {
     Assert-CppcheckProjectSelection
@@ -821,6 +1266,15 @@ try {
     Assert-NativeCppcheckCacheInvalidation -FixtureRoot $fixtureRoot -CacheRoot $cacheFixtureRoot
     Assert-RealCppcheckProjectCacheRoute -FixtureRoot $fixtureRoot -CacheRoot $cacheFixtureRoot
     Assert-ProductionRegressionCacheLeafExcludesGateControls -FixtureRoot $fixtureRoot -CacheRoot $cacheFixtureRoot
+    $schedulerEvidenceRoot = Join-Path (Split-Path -Parent $PSScriptRoot) ('completes/lint-cppcheck-tu-parallel/suite-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $schedulerEvidenceRoot | Out-Null
+    Copy-Item -LiteralPath (Join-Path $fixtureRoot 'native-cache') -Destination (Join-Path $schedulerEvidenceRoot 'native-cache') -Recurse
+    Assert-CppcheckBatchIntegration
+    Assert-CppcheckSchedulerTransport -FixtureRoot $schedulerEvidenceRoot
+    Assert-CppcheckRoleClassification -FixtureRoot $schedulerEvidenceRoot
+    Assert-CppcheckSchedulerFailures -FixtureRoot $schedulerEvidenceRoot
+    Assert-NativeCppcheckBatchSmoke -FixtureRoot $fixtureRoot
+    Copy-Item -LiteralPath (Join-Path $fixtureRoot 'native-smoke') -Destination (Join-Path $schedulerEvidenceRoot 'native-smoke') -Recurse
     Save-NativeCppcheckCacheEvidence -FixtureRoot $fixtureRoot -EvidenceRoot (Join-Path (Split-Path -Parent $PSScriptRoot) 'completes/windows-prepush-platform-scope')
     $cacheLock = Enter-CppcheckCacheLock -CacheRoot $cacheFixtureRoot -Name 'fixture'
     try {

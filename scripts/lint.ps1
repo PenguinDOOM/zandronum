@@ -8,6 +8,12 @@ param(
     [int]$CppcheckJobs = [Math]::Min(12, [Environment]::ProcessorCount)
 )
 
+if (($PSVersionTable.PSVersion.Major -lt 7) -or
+    ($null -eq [System.Diagnostics.ProcessStartInfo].GetProperty('ArgumentList')) -or
+    ($null -eq [System.IO.StreamReader].GetMethod('ReadToEndAsync', [type[]]@()))) {
+    throw 'lint.ps1 requires PowerShell 7 and .NET ProcessStartInfo.ArgumentList / StreamReader.ReadToEndAsync.'
+}
+
 $utf8 = New-Object System.Text.UTF8Encoding $false
 [Console]::OutputEncoding = $utf8
 $OutputEncoding = $utf8
@@ -103,20 +109,37 @@ function Invoke-LintChild {
         }
     }
 
+    $result = [PSCustomObject]@{ Output = $output; ExitCode = $exitCode; ElapsedMilliseconds = $stopwatch.ElapsedMilliseconds }
+    Save-LintChildEvidence -Path $Path -Arguments $Arguments -Label $Label -Evidence $Evidence -WorkingDirectory $WorkingDirectory -Result $result
+    return $result
+}
+
+function Save-LintChildEvidence {
+    param(
+        [string]$Path,
+        [string[]]$Arguments,
+        [string]$Label,
+        [object]$Evidence,
+        [string]$WorkingDirectory,
+        [object]$Result
+    )
+
     if ($null -ne $Evidence) {
         $Evidence.Counter++
         $prefix = '{0:D4}-{1}' -f $Evidence.Counter, ($Label -replace '[^A-Za-z0-9._-]', '_')
-        [System.IO.File]::WriteAllText((Join-Path $Evidence.Root (Join-Path 'commands' ($prefix + '.raw.txt'))), ($output -join [Environment]::NewLine), $utf8)
-        [PSCustomObject]@{
+        [System.IO.File]::WriteAllText((Join-Path $Evidence.Root (Join-Path 'commands' ($prefix + '.raw.txt'))), ($Result.Output -join [Environment]::NewLine), $utf8)
+        $invocation = [ordered]@{
             Path = $Path
             Arguments = $Arguments
             WorkingDirectory = $WorkingDirectory
-            ExitCode = $exitCode
-            ElapsedMilliseconds = $stopwatch.ElapsedMilliseconds
-        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $Evidence.Root (Join-Path 'commands' ($prefix + '.invocation.json'))) -NoNewline
+            ExitCode = $Result.ExitCode
+            ElapsedMilliseconds = $Result.ElapsedMilliseconds
+        }
+        foreach ($name in @('ProcessId', 'StartedAtUtc', 'EndedAtUtc', 'Stdout', 'Stderr', 'StdoutComplete', 'StderrComplete', 'TransportErrors')) {
+            if ($null -ne $Result.PSObject.Properties[$name]) { $invocation[$name] = $Result.$name }
+        }
+        $invocation | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $Evidence.Root (Join-Path 'commands' ($prefix + '.invocation.json'))) -NoNewline
     }
-
-    return [PSCustomObject]@{ Output = $output; ExitCode = $exitCode; ElapsedMilliseconds = $stopwatch.ElapsedMilliseconds }
 }
 
 function Save-LintEvidenceState {
@@ -1612,7 +1635,7 @@ function Copy-VerifiedGeneratedBundle {
     }
 }
 
-function Invoke-CppcheckProject {
+function New-CppcheckDescriptor {
     param(
         [string]$CppcheckPath,
         [string]$ProjectPath,
@@ -1621,12 +1644,9 @@ function Invoke-CppcheckProject {
         [string]$BuildRoot,
         [string]$TargetName,
         [string]$TranslationUnit,
-        [int]$CppcheckJobs,
-        [object]$Evidence = $null,
+        [int]$Index = 0,
         [bool]$UseProjectConfiguration = $true
     )
-
-    New-Item -ItemType Directory -Force -Path $CachePath | Out-Null
 
     $template = '{file}' + "`t" + '{line}' + "`t" + '{column}' + "`t" + '{severity}' + "`t" + '{id}' + "`t" + '{message}'
     $arguments = @(
@@ -1639,24 +1659,177 @@ function Invoke-CppcheckProject {
         "--template=$template"
         "--quiet"
         "-j"
-        "$CppcheckJobs"
+        '1'
     )
 
     if ($UseProjectConfiguration) {
         $arguments += '--project-configuration=Release|x64'
     }
 
-    $result = Invoke-LintChild -Path $CppcheckPath -Arguments $arguments -Label "cppcheck-$TargetName-$TranslationUnit" -Evidence $Evidence
-    $output = $result.Output
-    $exitCode = $result.ExitCode
-    return ConvertFrom-CppcheckProjectOutput `
-        -Output $output `
-        -ExitCode $exitCode `
-        -RepositoryRoot $RepositoryRoot `
-        -BuildRoot $BuildRoot `
-        -TargetName $TargetName `
-        -TranslationUnit $TranslationUnit `
-        -AllowedMissingFiles $generatedBundlePaths
+    return [PSCustomObject]@{
+        Index = $Index; Path = $CppcheckPath; Arguments = $arguments
+        WorkingDirectory = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.Path
+        RepositoryRoot = $RepositoryRoot; BuildRoot = $BuildRoot; TargetName = $TargetName
+        TranslationUnit = $TranslationUnit; CachePath = $CachePath
+        Label = "cppcheck-$TargetName-$TranslationUnit"
+    }
+}
+
+function Invoke-CppcheckProcessBatch {
+    param([object[]]$Descriptors, [int]$CppcheckJobs, [object]$Evidence = $null)
+
+    if ($CppcheckJobs -lt 1) { throw 'Cppcheck TU workers must be positive.' }
+    $leaves = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    for ($index = 0; $index -lt $Descriptors.Count; $index++) {
+        if ($Descriptors[$index].Index -ne $index) { throw 'Cppcheck descriptors must have contiguous ordered indices.' }
+        if (-not $leaves.Add([System.IO.Path]::GetFullPath($Descriptors[$index].CachePath))) {
+            throw "Cppcheck batch contains a duplicate cache leaf '$($Descriptors[$index].CachePath)'."
+        }
+    }
+    $workerCount = [Math]::Min($CppcheckJobs, $Descriptors.Count)
+    $owned = [System.Collections.Generic.List[object]]::new()
+    $active = [System.Collections.Generic.List[object]]::new()
+    $results = [object[]]::new($Descriptors.Count)
+    $failures = [System.Collections.Generic.List[object]]::new()
+    $nextIndex = 0
+    try {
+        while (($nextIndex -lt $Descriptors.Count) -or ($active.Count -gt 0)) {
+            while (($nextIndex -lt $Descriptors.Count) -and ($active.Count -lt $workerCount)) {
+                $descriptor = $Descriptors[$nextIndex]
+                New-Item -ItemType Directory -Force -Path $descriptor.CachePath | Out-Null
+                $process = [System.Diagnostics.Process]::new()
+                $state = [PSCustomObject]@{
+                    Descriptor = $descriptor; Process = $process; Started = $false
+                    Stdout = $null; Stderr = $null; Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                }
+                $owned.Add($state)
+                $process.StartInfo.FileName = $descriptor.Path
+                $process.StartInfo.WorkingDirectory = $descriptor.WorkingDirectory
+                $process.StartInfo.UseShellExecute = $false
+                $process.StartInfo.RedirectStandardOutput = $true
+                $process.StartInfo.RedirectStandardError = $true
+                $process.StartInfo.StandardOutputEncoding = [Console]::OutputEncoding
+                $process.StartInfo.StandardErrorEncoding = [Console]::OutputEncoding
+                foreach ($argument in $descriptor.Arguments) { $process.StartInfo.ArgumentList.Add($argument) }
+                $state.Started = $process.Start()
+                if (-not $state.Started) { throw "Could not start '$($descriptor.Path)'." }
+                $state.Stdout = $process.StandardOutput.ReadToEndAsync()
+                $state.Stderr = $process.StandardError.ReadToEndAsync()
+                $active.Add($state)
+                $nextIndex++
+            }
+            foreach ($state in @($active.ToArray())) {
+                if ($state.Stdout.IsFaulted) { $null = $state.Stdout.GetAwaiter().GetResult() }
+                if ($state.Stderr.IsFaulted) { $null = $state.Stderr.GetAwaiter().GetResult() }
+                if ($state.Process.HasExited -and $state.Stdout.IsCompleted -and $state.Stderr.IsCompleted) {
+                    $state.Stopwatch.Stop()
+                    $null = $active.Remove($state)
+                }
+            }
+            if (($active.Count -gt 0) -and (($nextIndex -ge $Descriptors.Count) -or ($active.Count -eq $workerCount))) {
+                $waiting = $active[0]
+                if (-not $waiting.Process.HasExited) { $null = $waiting.Process.WaitForExit(25) }
+                elseif (-not $waiting.Stdout.IsCompleted) { $null = $waiting.Stdout.Wait(25) }
+                elseif (-not $waiting.Stderr.IsCompleted) { $null = $waiting.Stderr.Wait(25) }
+            }
+        }
+    }
+    catch { $failures.Add($_) }
+    finally {
+        foreach ($state in $owned) {
+            if ($state.Started) {
+                try {
+                    if (-not $state.Process.HasExited) { $state.Process.Kill($true) }
+                }
+                catch { $failures.Add($_) }
+            }
+        }
+        foreach ($state in $owned) {
+            try {
+                if ($state.Started) {
+                    $transportErrors = [System.Collections.Generic.List[string]]::new()
+                    $result = [PSCustomObject]@{
+                        Index = $state.Descriptor.Index; Output = @(); ExitCode = $null
+                        ElapsedMilliseconds = $null; ProcessId = $null; StartedAtUtc = $null; EndedAtUtc = $null
+                        Stdout = $null; Stderr = $null; StdoutComplete = $false; StderrComplete = $false
+                        TransportErrors = @()
+                    }
+                    try {
+                        $state.Process.WaitForExit()
+                        $result.ExitCode = $state.Process.ExitCode
+                        $result.ProcessId = $state.Process.Id
+                        $result.StartedAtUtc = $state.Process.StartTime.ToUniversalTime().ToString('o')
+                        $result.EndedAtUtc = $state.Process.ExitTime.ToUniversalTime().ToString('o')
+                    }
+                    catch { $failures.Add($_); $transportErrors.Add($_.Exception.Message) }
+                    foreach ($stream in @('Stdout', 'Stderr')) {
+                        try {
+                            if ($null -eq $state.$stream) {
+                                $reader = if ($stream -eq 'Stdout') { $state.Process.StandardOutput } else { $state.Process.StandardError }
+                                $state.$stream = $reader.ReadToEndAsync()
+                            }
+                            $result.$stream = $state.$stream.GetAwaiter().GetResult()
+                            $result.($stream + 'Complete') = $true
+                        }
+                        catch { $failures.Add($_); $transportErrors.Add($_.Exception.Message) }
+                    }
+                    $state.Stopwatch.Stop()
+                    $result.ElapsedMilliseconds = $state.Stopwatch.ElapsedMilliseconds
+                    $result.TransportErrors = $transportErrors.ToArray()
+                    $result.Output = @(foreach ($text in @($result.Stdout, $result.Stderr)) {
+                        if (-not [string]::IsNullOrEmpty($text)) {
+                            $lines = [regex]::Split($text, '\r\n|\n|\r')
+                            $count = $lines.Count
+                            if ($lines[-1] -eq '') { $count-- }
+                            for ($lineIndex = 0; $lineIndex -lt $count; $lineIndex++) { $lines[$lineIndex] }
+                        }
+                    })
+                    $results[$state.Descriptor.Index] = $result
+                }
+            }
+            catch { $failures.Add($_) }
+            finally {
+                try { $state.Process.Dispose() }
+                catch { $failures.Add($_) }
+            }
+        }
+        foreach ($descriptor in $Descriptors) {
+            if ($null -ne $results[$descriptor.Index]) {
+                try {
+                    Save-LintChildEvidence -Path $descriptor.Path -Arguments $descriptor.Arguments -Label $descriptor.Label -WorkingDirectory $descriptor.WorkingDirectory -Evidence $Evidence -Result $results[$descriptor.Index]
+                }
+                catch { $failures.Add($_) }
+            }
+        }
+    }
+    if ($failures.Count -gt 0) {
+        $message = $failures[0].Exception.Message
+        if ($failures.Count -gt 1) { $message += ' Secondary failures: ' + (($failures | Select-Object -Skip 1 | ForEach-Object { $_.Exception.Message }) -join '; ') }
+        throw [System.Exception]::new($message, $failures[0].Exception)
+    }
+    return $results
+}
+
+function Invoke-CppcheckBatch {
+    param([object[]]$Descriptors, [int]$CppcheckJobs, [object]$Evidence = $null)
+
+    $results = @(Invoke-CppcheckProcessBatch -Descriptors $Descriptors -CppcheckJobs $CppcheckJobs -Evidence $Evidence)
+    foreach ($descriptor in $Descriptors) {
+        $result = $results[$descriptor.Index]
+        ConvertFrom-CppcheckProjectOutput -Output $result.Output -ExitCode $result.ExitCode -RepositoryRoot $descriptor.RepositoryRoot -BuildRoot $descriptor.BuildRoot -TargetName $descriptor.TargetName -TranslationUnit $descriptor.TranslationUnit -AllowedMissingFiles $generatedBundlePaths
+    }
+}
+
+function Invoke-CppcheckProject {
+    param(
+        [string]$CppcheckPath, [string]$ProjectPath, [string]$CachePath,
+        [string]$RepositoryRoot, [string]$BuildRoot, [string]$TargetName,
+        [string]$TranslationUnit, [int]$CppcheckJobs, [object]$Evidence = $null,
+        [bool]$UseProjectConfiguration = $true
+    )
+
+    $descriptor = New-CppcheckDescriptor -CppcheckPath $CppcheckPath -ProjectPath $ProjectPath -CachePath $CachePath -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot -TargetName $TargetName -TranslationUnit $TranslationUnit -UseProjectConfiguration $UseProjectConfiguration
+    Invoke-CppcheckBatch -Descriptors @($descriptor) -CppcheckJobs $CppcheckJobs -Evidence $Evidence
 }
 
 $inputManifestData = $null
@@ -2037,10 +2210,11 @@ try {
         Save-CppcheckCacheIdentity -CacheRoot $cppcheckCacheRoot -Namespace 'regression' -Identity $headIdentity
         Write-Host "  $targetName"
 
+        $headDescriptors = [System.Collections.Generic.List[object]]::new()
         foreach ($translationUnit in $project.Files) {
             $headCache = Get-CppcheckCacheLeaf -CacheRoot $cppcheckCacheRoot -Namespace 'regression' -Identity $headIdentity -Role 'head' -TargetName $targetName -TranslationUnit $translationUnit
             $cachePaths["head/$targetName/$translationUnit"] = $headCache
-            [void]$headDiagnostics.AddRange(@(Invoke-CppcheckProject `
+            $headDescriptors.Add((New-CppcheckDescriptor `
                 -CppcheckPath $cppcheck.Source `
                 -ProjectPath $project.ProjectPath `
                 -CachePath $headCache `
@@ -2048,9 +2222,10 @@ try {
                 -BuildRoot $analysisBuildRoot `
                 -TargetName $targetName `
                 -TranslationUnit $translationUnit `
-                -CppcheckJobs $CppcheckJobs `
-                -Evidence $evidence))
+                -Index $headDescriptors.Count))
         }
+        Write-Host "Cppcheck TU workers: $([Math]::Min($CppcheckJobs, $headDescriptors.Count)) ($targetName/head)"
+        [void]$headDiagnostics.AddRange(@(Invoke-CppcheckBatch -Descriptors $headDescriptors.ToArray() -CppcheckJobs $CppcheckJobs -Evidence $evidence))
 
         $baselineProject = $baselineProjectsByTarget[$targetName]
 
@@ -2078,10 +2253,11 @@ try {
                 -AnalysisContext $baselineCacheContext
             $cacheIdentities["baseline/$targetName"] = $baselineIdentity
             Save-CppcheckCacheIdentity -CacheRoot $cppcheckCacheRoot -Namespace 'regression' -Identity $baselineIdentity
+            $baselineDescriptors = [System.Collections.Generic.List[object]]::new()
             foreach ($translationUnit in @($baselineProject.Sources.Keys | Sort-Object)) {
                 $baselineCache = Get-CppcheckCacheLeaf -CacheRoot $cppcheckCacheRoot -Namespace 'regression' -Identity $baselineIdentity -Role 'baseline' -TargetName $targetName -TranslationUnit $translationUnit
                 $cachePaths["baseline/$baseCommit/$targetName/$translationUnit"] = $baselineCache
-                [void]$baselineDiagnostics.AddRange(@(Invoke-CppcheckProject `
+                $baselineDescriptors.Add((New-CppcheckDescriptor `
                     -CppcheckPath $cppcheck.Source `
                     -ProjectPath $baselineProject.ProjectPath `
                     -CachePath $baselineCache `
@@ -2089,9 +2265,10 @@ try {
                     -BuildRoot $baselineBuildRoot `
                     -TargetName $targetName `
                     -TranslationUnit $translationUnit `
-                    -CppcheckJobs $CppcheckJobs `
-                    -Evidence $evidence))
+                        -Index $baselineDescriptors.Count))
             }
+                    Write-Host "Cppcheck TU workers: $([Math]::Min($CppcheckJobs, $baselineDescriptors.Count)) ($targetName/baseline)"
+                    [void]$baselineDiagnostics.AddRange(@(Invoke-CppcheckBatch -Descriptors $baselineDescriptors.ToArray() -CppcheckJobs $CppcheckJobs -Evidence $evidence))
         }
     }
 
