@@ -25,6 +25,7 @@ guardrails/
 plans/
 requests/
 2b3/
+cppcheck/
 
 # Codacy
 .codacy/
