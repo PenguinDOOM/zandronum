@@ -1844,11 +1844,17 @@ if (-not [string]::IsNullOrWhiteSpace($InputManifest)) {
     }
 }
 
-$cppcheck = Get-Command cppcheck -ErrorAction SilentlyContinue
+$localCppcheckPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'cppcheck/cppcheck.exe'
+if (Test-Path -LiteralPath $localCppcheckPath -PathType Leaf) {
+    $cppcheck = Get-Command $localCppcheckPath -ErrorAction Stop
+}
+else {
+    $cppcheck = Get-Command cppcheck -ErrorAction SilentlyContinue
+}
 $cmake = Get-Command cmake -ErrorAction SilentlyContinue
 
 if (-not $cppcheck) {
-    Write-Error "Cppcheck was not found in PATH. Install Cppcheck and restart your terminal/IDE."
+    Write-Error "Cppcheck was not found at '$localCppcheckPath' or in PATH. Place Cppcheck at that path or install it in PATH and restart your terminal/IDE."
     exit 1
 }
 
