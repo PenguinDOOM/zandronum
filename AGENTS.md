@@ -13,7 +13,6 @@ The primary validated platform is Windows x64. Linux is not actively validated, 
 
 Later work may include:
 
-* OpenAL Soft HRTF, EFX, Doppler, and source-radius support
 * BSP-aware occlusion, diffraction, and reflection
 * Carefully isolated multithreading
 * Refactoring voice playback/capture away from direct FMOD coupling
