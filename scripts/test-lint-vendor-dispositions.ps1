@@ -525,37 +525,86 @@ function Assert-CppcheckSourceRouting {
 
     Import-LintFunction -Name 'Get-CppcheckSourceRoute' -LintScript $LintScript
     $source = [PSCustomObject]@{ Status = 'M'; Path = 'src/sample.cpp'; OldPath = '' }
+    $exemptChanges = @(
+        'tools/testdata/audio/phase1b-validation.json',
+        'tools/testdata/audio/validate_phase1b_manifest.py',
+        'tools/testdata/audio/README.md'
+    ) | ForEach-Object { [PSCustomObject]@{ Status = 'M'; Path = $_; OldPath = '' } }
+    foreach ($change in $exemptChanges) {
+        $route = Get-CppcheckSourceRoute -Changes @($change)
+        if ($route.Mode -ne 'Skip' -or $route.Sources.Count) { throw "Ordinary audio contract modification did not skip: $($change.Path)." }
+        foreach ($status in @('A', 'D', 'T', 'R100', 'C100', 'M')) {
+            $route = Get-CppcheckSourceRoute -Changes @([PSCustomObject]@{ Status = $status; Path = $change.Path; OldPath = if ($status -in @('R100', 'C100', 'M')) { 'docs/audio.txt' } else { '' } })
+            if ($route.Mode -ne 'Error' -or $route.Sources.Count) { throw "Non-ordinary audio contract change was skipped: $status $($change.Path)." }
+        }
+    }
+    $cleanupChanges = @($exemptChanges) + @(
+        'scripts/lint.ps1',
+        'scripts/test-lint-vendor-dispositions.ps1',
+        'scripts/phase1b_audio_gate.py',
+        'AGENTS.md',
+        'README.md',
+        'docs/native-openal-soft-phase-2.md'
+    ) | ForEach-Object {
+        if ($_ -is [string]) { [PSCustomObject]@{ Status = 'M'; Path = $_; OldPath = '' } } else { $_ }
+    }
+    $cleanupChanges += @(
+        '.github/workflows/ci-windows.yml',
+        '.github/workflows/ci-linux.yml',
+        '.gitlab-ci.yml',
+        'appimage/AppRun',
+        'appimage/zandronum.desktop',
+        'appimage/zandronum.png'
+    ) | ForEach-Object { [PSCustomObject]@{ Status = 'D'; Path = $_; OldPath = '' } }
     foreach ($case in @(
-        @{ Changes = @($source); Dirty = $false; Mode = 'Candidate' },
-        @{ Changes = @($source); Dirty = $true; Mode = 'Full' },
-        @{ Changes = @($source, [PSCustomObject]@{ Status = 'M'; Path = 'src/sample.h' }); Dirty = $false; Mode = 'Full' },
-        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'README.md' }); Dirty = $false; Mode = 'Skip' },
-        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'src/sample.h' }); Dirty = $false; Mode = 'Skip' },
-        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'CMakeLists.txt' }); Dirty = $false; Mode = 'Error' },
-        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'protocolspec/spec.txt' }); Dirty = $false; Mode = 'Error' },
-        @{ Changes = @([PSCustomObject]@{ Status = 'D'; Path = 'src/sample.cpp' }); Dirty = $false; Mode = 'Error' },
-        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'tools/lemon/lemon.c' }); Dirty = $false; Mode = 'Full' },
-        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'src/sound/thirdparty/vendor.cpp' }); Dirty = $false; Mode = 'Full' }
+        @{ Changes = @($source); Dirty = $false; Mode = 'Candidate'; Sources = @('src/sample.cpp') },
+        @{ Changes = @($source); Dirty = $true; Mode = 'Full'; Sources = @('src/sample.cpp') },
+        @{ Changes = @($source, [PSCustomObject]@{ Status = 'M'; Path = 'src/sample.h' }); Dirty = $false; Mode = 'Full'; Sources = @('src/sample.cpp') },
+        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'README.md' }); Dirty = $false; Mode = 'Skip'; Sources = @() },
+        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'src/sample.h' }); Dirty = $false; Mode = 'Skip'; Sources = @() },
+        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'CMakeLists.txt' }); Dirty = $false; Mode = 'Error'; Sources = @() },
+        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'protocolspec/spec.txt' }); Dirty = $false; Mode = 'Error'; Sources = @() },
+        @{ Changes = @([PSCustomObject]@{ Status = 'D'; Path = 'src/sample.cpp' }); Dirty = $false; Mode = 'Error'; Sources = @() },
+        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'tools/lemon/lemon.c' }); Dirty = $false; Mode = 'Full'; Sources = @('tools/lemon/lemon.c') },
+        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'src/sound/thirdparty/vendor.cpp' }); Dirty = $false; Mode = 'Full'; Sources = @('src/sound/thirdparty/vendor.cpp') },
+        @{ Changes = @($exemptChanges); Dirty = $false; Mode = 'Skip'; Sources = @() },
+        @{ Changes = $cleanupChanges; Dirty = $false; Mode = 'Skip'; Sources = @() },
+        @{ Changes = @($exemptChanges) + @([PSCustomObject]@{ Status = 'M'; Path = 'tools/testdata/audio/generate_phase1b_music_fixtures.py'; OldPath = '' }); Dirty = $false; Mode = 'Error'; Sources = @() },
+        @{ Changes = @($source) + @($exemptChanges); Dirty = $false; Mode = 'Full'; Sources = @('src/sample.cpp') }
     )) {
         $route = Get-CppcheckSourceRoute -Changes $case.Changes -TrackedDirty:$case.Dirty
-        if ($route.Mode -ne $case.Mode) { throw "Source routing mismatch: $($route.Reason)." }
+        if ($route.Mode -ne $case.Mode -or $route.Sources.Count -ne $case.Sources.Count -or ($route.Sources -join '|') -cne ($case.Sources -join '|')) { throw "Source routing mismatch: $($route.Reason)." }
+        if ($case.Mode -eq 'Error') {
+            $route = Get-CppcheckSourceRoute -Changes (@($case.Changes) + @($exemptChanges))
+            if ($route.Mode -ne 'Error' -or $route.Sources.Count) { throw 'Audio contract modification masked an unsupported mixed range.' }
+        }
     }
     foreach ($status in @('R100', 'C100')) {
-        foreach ($pair in @(
+        $pairs = @(
             @('src/sc_man.cpp', 'src/sc_man.txt'),
             @('protocolspec/spec.txt', 'docs/spec.txt'),
             @('CMakeLists.txt', 'CMakeLists.old'),
-            @('src/parser.y', 'docs/parser.txt')
-        )) {
+            @('src/parser.y', 'docs/parser.txt'),
+            @('tools/testdata/audio/generate_phase1b_music_fixtures.py', 'docs/fixtures.txt'),
+            @('src/sc_man.cpp', $exemptChanges[0].Path),
+            @('protocolspec/spec.txt', $exemptChanges[0].Path),
+            @('CMakeLists.txt', $exemptChanges[0].Path)
+        )
+        foreach ($change in $exemptChanges) {
+            $pairs += ,@($change.Path, 'docs/audio.txt')
+        }
+        foreach ($pair in $pairs) {
             $route = Get-CppcheckSourceRoute -Changes @([PSCustomObject]@{ Status = $status; OldPath = $pair[0]; Path = $pair[1] })
             if ($route.Mode -ne 'Error' -or $route.Sources.Count) { throw "Relevant old endpoint was skipped: $status $($pair -join ' -> ')." }
+            $route = Get-CppcheckSourceRoute -Changes (@([PSCustomObject]@{ Status = $status; OldPath = $pair[0]; Path = $pair[1] }) + @($exemptChanges))
+            if ($route.Mode -ne 'Error' -or $route.Sources.Count) { throw "Audio contract modification masked an old endpoint: $status $($pair -join ' -> ')." }
         }
         $route = Get-CppcheckSourceRoute -Changes @([PSCustomObject]@{ Status = $status; OldPath = 'src/sample.h'; Path = 'docs/sample.txt' })
-        if ($route.Mode -ne 'Skip') { throw 'True header/document-only change no longer skips.' }
+        if ($route.Mode -ne 'Skip' -or $route.Sources.Count) { throw 'True header/document-only change no longer skips.' }
     }
     foreach ($status in @('A', 'R100', 'C100', 'T')) {
         $route = Get-CppcheckSourceRoute -Changes @([PSCustomObject]@{ Status = $status; Path = 'src/sample.cpp'; OldPath = 'src/old.cpp' })
-        if ($route.Mode -ne 'Full') { throw "Unsafe source status $status entered Fast qualification." }
+        if ($route.Mode -ne 'Full' -or $route.Sources.Count -ne 1 -or $route.Sources[0] -cne 'src/sample.cpp') { throw "Unsafe source status $status entered Fast qualification." }
     }
     Write-Host 'Conservative all-diff source routing: passed.'
 }

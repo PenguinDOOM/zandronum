@@ -8,6 +8,8 @@ Zandronum is a multiplayer oriented port, based off Skulltag, for Doom and Doom 
 
 Zandronum brings classic Doom into the 21st century, maintaining the essence of what has made Doom great for so many years and, at the same time, adding new features to modernize it, creating a fresh, fun new experience.
 
+Fork maintenance scope: Windows x64 is the primary validated platform; Linux is not actively validated, and hosted CI is intentionally not maintained. See [AGENTS.md](AGENTS.md) for the local build and validation policy. The platform list below is inherited upstream context, not this fork's current validation coverage; this maintenance policy does not remove Linux source support.
+
 Here's why you should kill your time with Zandronum, versus vanilla Doom:
  
 * Excellent online play

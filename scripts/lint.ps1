@@ -1344,7 +1344,13 @@ function Get-CppcheckSourceRoute {
     $unsupported = @($Changes | Where-Object {
         ($_.Status -eq 'D' -and $_.Path -match '\.(c|cc|cpp|cxx)$') -or
         ($_.Status -match '^[RC]' -and $_.OldPath -match '\.(c|cc|cpp|cxx)$') -or
-        $_.Path -match '(^|/)(CMakeLists\.txt|[^/]+\.cmake)$|^(tools|protocolspec)/|(^|/)[^/]+\.(in|re|y)$' -or
+        ($_.Path -match '(^|/)(CMakeLists\.txt|[^/]+\.cmake)$|^(tools|protocolspec)/|(^|/)[^/]+\.(in|re|y)$' -and -not (
+            $_.Status -ceq 'M' -and $_.Path -cin @(
+                'tools/testdata/audio/phase1b-validation.json',
+                'tools/testdata/audio/validate_phase1b_manifest.py',
+                'tools/testdata/audio/README.md'
+            ) -and [string]::IsNullOrEmpty($_.OldPath)
+        )) -or
         ($_.Status -match '^[RC]' -and $_.OldPath -match '(^|/)(CMakeLists\.txt|[^/]+\.cmake)$|^(tools|protocolspec)/|(^|/)[^/]+\.(in|re|y)$')
     })
     $mode = 'Full'

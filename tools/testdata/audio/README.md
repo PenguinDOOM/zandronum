@@ -61,14 +61,87 @@ python tools/testdata/audio/validate_phase1b_manifest.py
 | `phase1b-audio.wad` | `edf900ce2b7abfdc16844ed4e880b81bb4da91e7dcc738b8375dc6c64dcc6c27` | Generated music lumps (`D_MIDI`, `D_XMOGG`, `D_OPL`, `D_MOD`, `D_GME`) |
 | `phase1b-fixtures.pk3` | `e3e2b420c7da6b2afb43fb4c9c260fcdd827f5b1da53710b3336ccf24081800e` | Self-contained PK3 with `phase1b-audio.wad` at its root and other generated files under `music/` |
 
-`phase1b-validation.json` is the source-controlled validation contract. The
-two local rows first run `cmake --build build-v143-openal --config Release
+## Local validation contract
+
+`phase1b-validation.json` is the schema-5 source-controlled validation contract,
+not a completed result log. Its 15 rows form a scoped checklist, not a
+requirement to execute every runtime row on every commit. [AGENTS.md](../../../AGENTS.md)
+is the forward execution authority: Windows x64 is the primary validated
+platform; Linux is not actively validated, and hosted CI is not maintained.
+Select relevant checks for the change and record actual results and limits.
+Only `multiplayer-compatibility` has `required: false` for routine isolated audio
+validation; network/revision/PK3 changes require it, and milestone use is optional.
+
+The `source-provenance` row replaces the former packaging row with local
+source/license/fixture verification. From the repository root, run:
+
+```text
+python scripts/phase1b_audio_gate.py verify-source --source-root .
+python scripts/phase1b_audio_gate.py --self-test
+python tools/testdata/audio/validate_phase1b_manifest.py --self-test
+python tools/testdata/audio/generate_phase1b_music_fixtures.py --verify
+```
+
+Source verification is read-only and checks pinned decoder source/license
+hashes and provenance. Self-test scratch files stay in temporary directories.
+No package executable, CI artifact download, runtime manifest, copied notice,
+or generated handoff JSON is required. The fixture PK3 is checked-in test data,
+not a CI release package. Do not regenerate fixtures or adopt new hashes to
+make validation pass.
+
+For applicable `build-static` checks, retain the configured VS2022/v143 x64
+dependency roots and supply the required x64 runtime DLLs adjacent to the
+launched game and relevant test executable; do not rely on developer PATH.
+Use the local Release build, relevant focused CTests, incremental Lizard,
+incremental Cppcheck, relevant manual runtime observations, then generated-file
+review as specified in AGENTS. The row's client build and five audio CTests are:
+
+```text
+cmake --build build-v143-openal --config Release --target zdoom
+ctest --test-dir build-v143-openal -C Release --output-on-failure -R ^audio_decoder$
+ctest --test-dir build-v143-openal -C Release --output-on-failure -R ^openal_pcm$
+ctest --test-dir build-v143-openal -C Release --output-on-failure -R ^midi_device_selection$
+ctest --test-dir build-v143-openal -C Release --output-on-failure -R ^openal_phase2_unit$
+ctest --test-dir build-v143-openal -C Release --output-on-failure -R ^openal_lifecycle$
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/lint-staged.ps1
+pwsh -NoProfile -File scripts/lint.ps1 -BuildDir build-v143-openal -BaseSha <base-sha> -HeadSha <head-sha>
+```
+
+Replace `<base-sha>` and `<head-sha>` with the actual owned comparison range,
+not example SHAs or an unrelated range. `staged_hook_identity` names the same
+Lizard entry point, not a second required execution. No eligible C/C++ input
+means analysis is not applicable, not an analyzer pass; existing tool/cache
+prerequisites and thresholds still apply. There is no unconditional
+server/no-sound build. Linux, Win32, and AppImage validation is required only
+when explicitly targeted. An `openal_lifecycle` device skip is not runtime proof.
+
+The two focused direct-memory/file-slice rows first run
+`cmake --build build-v143-openal --config Release
 --target openal_lifecycle_tests`, then run
 `build-v143-openal/tools/Release/openal_lifecycle_tests.exe
 --phase1b-direct-memory` and `--phase1b-file-slice` against the exact
 checked-in Vorbis and WAVE bytes. This is the CMake target's canonical Windows
 output location, not a requirement for ignored build output to exist during
 source validation.
+
+## Manual runtime inputs and observations
+
+Before running a selected runtime row, substitute these tokens by hand in its
+launch command and quote the exact paths; do not execute unresolved templates:
+
+| Token | Operator-supplied input |
+| --- | --- |
+| `${CLIENT_EXE}` | The newly built local client executable, not a downloaded package executable. Record its exact path and build identity. |
+| `${TESTDATA}` | The exact checked-in `tools/testdata/audio` corpus directory. |
+| `${STOCK_PK3}` | The stock `zandronum.pk3` matching reference `3.3-alpha-r260112-1855`. Record its exact path and operator-measured SHA256; do not substitute the locally generated build PK3. |
+| `${REFERENCE_SERVER}` | A reference-compatible server address only when running the conditional multiplayer check. |
+
+Measure the stock file with `Get-FileHash -Algorithm SHA256 -LiteralPath
+"C:/exact/path/to/stock/zandronum.pk3"`, substituting its actual path. Record
+the IWAD and private configuration separately; provide them explicitly with
+`-iwad "C:/exact/path/to/doom2.wad" -config "C:/exact/path/to/private.ini"`
+when launching the game. These are separate launch prerequisites, not additional
+manifest placeholders. Keep the required app-local DLL arrangement explicit.
 
 Generated music rows launch the client with the fixture PK3 and `${STOCK_PK3}`
 as a stock package passed to `-file`, then select OpenAL with `+set snd_backend
@@ -86,10 +159,13 @@ and through the target selection; earlier process output is outside this
 observation window. Every non-MIDI runtime row has exactly one post-init
 `changemus D_*` action. The WAD is deliberately at the PK3 root as
 `phase1b-audio.wad`, so embedded-WAD discovery exposes the `D_*` lumps. The
-MIDI, XM, OPL, and MOD rows are local runtime playback checks and do not connect
-to a server. Only the final GME compatibility row uses
-`${REFERENCE_SERVER}`. All runtime rows remain Phase 6 handoff checks; they are
-not claimed as locally executed audio proof. `validate_phase1b_manifest.py`
+MIDI, XM, OPL, and MOD playback checks are local and do not connect to a server.
+Only the conditional final GME compatibility row uses `${REFERENCE_SERVER}`:
+join the reference-compatible server, play, and disconnect cleanly. Connected
+`changemus D_GME` is additional, never a substitute for connection evidence.
+Earlier references to unresolved Phase 6 runtime or handoff checks describe
+their original checkpoint, not a future hosted requirement. Checklist presence
+does not claim locally executed audio proof. `validate_phase1b_manifest.py`
 verifies file, archive-entry, root-WAD, WAD-lump, ordered runtime-action,
 focused-target, and VGM stream contracts without a game runtime. Its
 `--self-test` option uses temporary manifests to reject negative command-line
@@ -138,8 +214,9 @@ hash values:
 
 There is no +/-1 tolerance, fallback, or multiple-hash admission. An unknown
 profile, or a known profile used by an incompatible binary such as x64, is a
-failure. A compiler update is therefore blocked until a new profile has a
-separately reviewed complete-PCM reference and compile-condition record.
+failure. Changing compiler conditions for this optional Win32 profile requires
+a separately reviewed complete-PCM reference and compile-condition record;
+this is not a blanket compiler-upgrade block for normal x64 development.
 
 The JSON evidence emitted for the two profile fixtures uses the fields
 `pcmReferenceProfile` and `pcmReferenceProfileSelected` to identify selection.
@@ -150,17 +227,18 @@ The `testTU` object records `compiler`, `architecture`, `pointerWidth`,
 `mIx86Fp`, and `decoderCompileFlags`; the last value is explicitly metadata,
 not proof of the decoder translation unit's actual flags.
 
-The direct gate is `scripts/verify-win32-pcm-profile.ps1`. It is called with
+The optional manual diagnostic is `scripts/verify-win32-pcm-profile.ps1`.
+It is not required for Windows x64 development. It is called with
 explicit `WorkspaceRoot`, `BuildDirectory`, `Configuration`, `Architecture`,
 and `EvidenceDirectory` roots:
 
 ```powershell
 pwsh -NoProfile -File scripts/verify-win32-pcm-profile.ps1 `
--WorkspaceRoot C:\path\to\zandronum `
--BuildDirectory C:\path\to\build `
+-WorkspaceRoot "C:\path\to\zandronum" `
+-BuildDirectory "C:\path\to\build" `
 -Configuration Release `
 -Architecture Win32 `
--EvidenceDirectory C:\path\to\evidence
+-EvidenceDirectory "C:\path\to\evidence"
 ```
 
 Each invocation writes a fresh `pcm-reference-profile.json` with schema
@@ -174,6 +252,25 @@ v143 XML configuration, source-specific tlog records, `/O2`, `/fp:fast`,
 decoder's normalized-EOL source hash. An x64 Release build is
 `not_applicable` with `profile: null`; missing, conflicting, or stale evidence
 is `rejected`, and a rejected or unsaved decision is nonzero.
+
+The diagnostic decision (`accepted`, `not_applicable`, or `rejected`) is not
+actual PCM execution. For a future explicitly targeted Win32 diagnostic,
+separately validate the process exit, saved JSON shape/schema, architecture,
+configuration, decision, and exact approved profile. Only an accepted Win32
+Release decision permits explicitly selecting
+`AUDIO_DECODER_PCM_REFERENCE_PROFILE=msvc-194435229-win32-ia32-fast-release-v1`
+in the test process environment and then executing the matching built
+`audio_decoder_tests.exe` on this corpus (or its `audio_decoder` CTest).
+Do not select a profile for `not_applicable`; stop on `rejected` or stale
+evidence. Record actual full-PCM test results separately from the decision.
+Retaining this script does not require a Win32 run or restore a hosted caller.
+
+### Historical workflow and checkpoint evidence
+
+The following workflow, `GITHUB_ENV`, and unresolved-validation statements
+describe the original 2026-09-26 checkpoint and its saved results, not current
+hosted instructions or a new validation requirement. Evidence and limits are
+retained verbatim:
 
 The Windows workflow caller separately checks the process exit code, JSON
 shape and schema, architecture/configuration, decision, and the exact profile

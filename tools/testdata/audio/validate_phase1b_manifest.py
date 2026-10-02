@@ -1,4 +1,4 @@
-"""Validate the schema-version 4 Phase 1B audio manifest."""
+"""Validate the schema-version 5 local Phase 1B audio source/fixture contract."""
 
 import argparse
 import copy
@@ -13,7 +13,7 @@ import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parent
 REPOSITORY_ROOT = ROOT.parents[2]
-PLACEHOLDERS = ("${CLIENT_EXE}", "${PACKAGE_EXE}", "${TESTDATA}", "${STOCK_PK3}", "${REFERENCE_SERVER}")
+PLACEHOLDERS = ("${CLIENT_EXE}", "${TESTDATA}", "${STOCK_PK3}", "${REFERENCE_SERVER}")
 ROW_BACKENDS = {
     "source-ownership-ranges-probe": "cross-backend",
     "required-codec-decode": "cross-backend",
@@ -28,7 +28,7 @@ ROW_BACKENDS = {
     "memory-lump-integration": "openal",
     "url-deferred": "cross-backend",
     "build-static": "n/a",
-    "packaging-provenance": "n/a",
+    "source-provenance": "n/a",
     "multiplayer-compatibility": "cross-backend",
 }
 ROW_SOURCE_MODES = {
@@ -45,7 +45,7 @@ ROW_SOURCE_MODES = {
     "memory-lump-integration": "direct-memory-file-slice-and-PK3-WAD-lump",
     "url-deferred": "openal-url-rejection-and-fmod-source",
     "build-static": "build-and-static-validation",
-    "packaging-provenance": "package-gate-and-fixture-provenance",
+    "source-provenance": "source-license-and-fixture-provenance",
     "multiplayer-compatibility": "reference-server-runtime",
 }
 COMMAND_KEYS = {
@@ -61,8 +61,8 @@ COMMAND_KEYS = {
     "midi-compatibility": {"automated_policy", "fmod_preserves_selection", "runtime"},
     "memory-lump-integration": {"focused", "runtime_identity"},
     "url-deferred": {"openal_url_rejection", "fmod_unchanged_source"},
-    "build-static": {"client_build", "server_no_sound_build", "focused_ctests", "manifest_preflight", "lizard", "cppcheck", "staged_hook_identity"},
-    "packaging-provenance": {"gate_self_test", "manifest_self_test", "package_identity", "actual_package"},
+    "build-static": {"client_build", "focused_ctests", "manifest_preflight", "lizard", "cppcheck", "staged_hook_identity"},
+    "source-provenance": {"source_verify", "gate_self_test", "manifest_self_test", "fixture_identity"},
     "multiplayer-compatibility": {"launch", "connection_observation", "additional_connected_operation"},
 }
 CTESTS = {
@@ -70,12 +70,20 @@ CTESTS = {
     "openal_pcm": "ctest --test-dir build-v143-openal -C Release --output-on-failure -R ^openal_pcm$",
     "openal_lifecycle": "ctest --test-dir build-v143-openal -C Release --output-on-failure -R ^openal_lifecycle$",
     "midi_device_selection": "ctest --test-dir build-v143-openal -C Release --output-on-failure -R ^midi_device_selection$",
+    "openal_phase2_unit": "ctest --test-dir build-v143-openal -C Release --output-on-failure -R ^openal_phase2_unit$",
 }
 FOCUSED_BUILD = "cmake --build build-v143-openal --config Release --target openal_lifecycle_tests"
 FOCUSED_EXE = "build-v143-openal/tools/Release/openal_lifecycle_tests.exe"
-LIZARD_COMMAND = "lizard -C 19 -T nloc=80 -w src/sound/oalsound.cpp src/sound/audio_decoder.cpp"
+LIZARD_COMMAND = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/lint-staged.ps1"
 LIZARD_EXPECTED = {"exit_code": 0, "max_accepted_ccn": 19, "max_accepted_nloc": 80}
-ACTUAL_PACKAGE_COMMAND = 'python scripts/phase1b_audio_gate.py verify-package --client-exe "${PACKAGE_EXE}" --source-root . --sound-enabled'
+CPPCHECK_COMMAND = "pwsh -NoProfile -File scripts/lint.ps1 -BuildDir build-v143-openal -BaseSha <base-sha> -HeadSha <head-sha>"
+SOURCE_COMMAND = "python scripts/phase1b_audio_gate.py verify-source --source-root ."
+SOURCE_EXPECTED = {
+    "observation": "Read-only source verification checks pinned miniaudio and stb_vorbis source/license hashes and provenance; both self-tests and fixture identity verification pass.",
+    "tolerance": "No executable, runtime manifest, downloaded dependency, or copied notice is required; existing source, license, and fixture bytes remain unchanged.",
+}
+SOURCE_ASSERTIONS = ["Source verification performs no writes and rejects missing or mismatched source/license hashes and provenance pins; self-test scratch files stay in a temporary directory."]
+MULTIPLAYER_TOLERANCE = "Required for network/revision/PK3 changes; optional at milestones and not required for routine isolated audio validation. Supply the matching stock PK3 and reference server when run; D_GME never substitutes for connection evidence."
 MIDI_ACTIONS = [
     {"phase": "after-renderer-initialization", "kind": "engine-console", "command": "stopmus"},
     {"phase": "after-renderer-initialization", "kind": "engine-console", "command": "set snd_mididevice -1"},
@@ -305,28 +313,27 @@ def validate_url_row(row):
 def validate_build_row(row):
     commands = row["commands"]
     require_exact(commands["client_build"], "cmake --build build-v143-openal --config Release --target zdoom", "client build")
-    require_exact(commands["server_no_sound_build"], "cmake --build build-v143-phase5-serveronly --config Release --target all", "server/no-sound build")
-    require(commands["focused_ctests"] == [CTESTS["audio_decoder"], CTESTS["openal_pcm"], CTESTS["midi_device_selection"], CTESTS["openal_lifecycle"], FOCUSED_EXE + " --phase1b-direct-memory", FOCUSED_EXE + " --phase1b-file-slice"], "focused CTest contract is invalid")
+    require(commands["focused_ctests"] == [CTESTS["audio_decoder"], CTESTS["openal_pcm"], CTESTS["midi_device_selection"], CTESTS["openal_phase2_unit"], CTESTS["openal_lifecycle"], FOCUSED_EXE + " --phase1b-direct-memory", FOCUSED_EXE + " --phase1b-file-slice"], "focused CTest contract is invalid")
     require_exact(commands["manifest_preflight"], "python tools/testdata/audio/validate_phase1b_manifest.py --self-test", "manifest preflight")
     require(isinstance(commands["lizard"], dict), "lizard contract is invalid")
     require_exact(commands["lizard"].get("command"), LIZARD_COMMAND, "lizard command")
     require(commands["lizard"].get("expected") == LIZARD_EXPECTED, "lizard baseline expectation is invalid")
-    require("cppcheck" in commands["cppcheck"] and "--project=build-v143-openal/Zandronum.sln" in commands["cppcheck"], "cppcheck command is invalid")
-    require_exact(commands["staged_hook_identity"], "pwsh -NoProfile -File scripts/lint-staged.ps1", "staged hook identity")
+    require_exact(commands["cppcheck"], CPPCHECK_COMMAND, "cppcheck command")
+    require_exact(commands["staged_hook_identity"], LIZARD_COMMAND, "staged hook identity")
 
 
-def validate_packaging_row(row):
+def validate_provenance_row(row):
     commands = row["commands"]
+    require_exact(commands["source_verify"], SOURCE_COMMAND, "source verification")
     require_exact(commands["gate_self_test"], "python scripts/phase1b_audio_gate.py --self-test", "gate self-test")
     require_exact(commands["manifest_self_test"], "python tools/testdata/audio/validate_phase1b_manifest.py --self-test", "manifest self-test")
-    require_exact(commands["package_identity"], "python tools/testdata/audio/generate_phase1b_music_fixtures.py --verify", "package identity")
-    require_exact(commands["actual_package"], ACTUAL_PACKAGE_COMMAND, "actual package verification")
+    require_exact(commands["fixture_identity"], "python tools/testdata/audio/generate_phase1b_music_fixtures.py --verify", "fixture identity")
     artifacts = row.get("artifacts", [])
     identities = {artifact.get("identity") for artifact in artifacts if isinstance(artifact, dict)}
-    require({"phase1b-audio-gate", "decoder-manifest-contract", "phase1b-fixture-package"} <= identities, "packaging notice identities are incomplete")
-    gate_text = (REPOSITORY_ROOT / "scripts" / "phase1b_audio_gate.py").read_text(encoding="utf-8")
-    require(all(token in gate_text for token in ('"name": "miniaudio"', '"name": "stb_vorbis"', "audio-decoders.md", "verify-package", "verify_existing_package", "codec_runtime_assertion", 'add_argument("--package-exe"', '"${PACKAGE_EXE}"', "package executable is unavailable")), "packaging verification support is incomplete")
-    require(all(token in row["expected"]["observation"] for token in ("actual package", "notices", "provenance", "codec runtime")), "packaging actual-package expectation is incomplete")
+    require({"phase1b-audio-gate", "decoder-manifest-contract", "phase1b-fixture-package"} <= identities, "source/fixture identities are incomplete")
+    require(row["expected"] == SOURCE_EXPECTED, "source provenance expectation is invalid")
+    require(row["resource_assertions"] == SOURCE_ASSERTIONS, "source provenance resource assertions are invalid")
+    require(row["external_prerequisites"] == ["Python 3.", "Checked-in pinned decoder sources, licenses, provenance, and audio fixtures."], "source provenance prerequisites are invalid")
 
 
 def validate_multiplayer_row(row):
@@ -338,6 +345,7 @@ def validate_multiplayer_row(row):
     require(all(any(token in value for value in observation) for token in ("join", "play", "disconnect")), "multiplayer requires join/play/disconnect observation")
     prerequisites = row["external_prerequisites"]
     require(any("${STOCK_PK3}" in value for value in prerequisites) and any("${REFERENCE_SERVER}" in value for value in prerequisites), "multiplayer prerequisites lack external placeholders")
+    require(row["expected"]["tolerance"] == MULTIPLAYER_TOLERANCE, "multiplayer conditional requirement is invalid")
 
 
 def validate_row_semantics(row):
@@ -355,7 +363,7 @@ def validate_row_semantics(row):
         "memory-lump-integration": validate_memory_row,
         "url-deferred": validate_url_row,
         "build-static": validate_build_row,
-        "packaging-provenance": validate_packaging_row,
+        "source-provenance": validate_provenance_row,
         "multiplayer-compatibility": validate_multiplayer_row,
     }
     validators[row["id"]](row)
@@ -376,7 +384,8 @@ def validate_placeholders(row):
 
 
 def validate_row_metadata(row, row_id):
-    require(row.get("required") is True, row_id + " must be required")
+    required = row_id != "multiplayer-compatibility"
+    require(row.get("required") is required, row_id + " has an invalid required flag")
     require(row.get("backend") == ROW_BACKENDS[row_id], row_id + " has an invalid backend")
     require(row.get("source_mode") == ROW_SOURCE_MODES[row_id], row_id + " has an invalid source_mode")
     require(isinstance(row.get("settings"), dict), row_id + " settings must be an object")
@@ -410,7 +419,7 @@ def validate_row_resources(row, row_id, testdata):
 
 
 def validate_document(document, testdata):
-    require(document.get("schema_version") == 4, "unsupported or incomplete manifest")
+    require(document.get("schema_version") == 5, "unsupported or incomplete manifest")
     require(tuple(document.get("placeholders", ())) == PLACEHOLDERS, "unsupported or incomplete manifest")
     rows = document.get("rows")
     require(isinstance(rows, list), "manifest rows are missing")
@@ -468,10 +477,17 @@ def validate_negative_self_tests(document, testdata):
         ("staged hook identity", "set", ("rows", 12, "commands", "staged_hook_identity"), "git diff --cached --check", "staged hook identity is invalid"),
         ("missing OpenAL PCM CTest", "set", ("rows", 12, "commands", "focused_ctests"), [CTESTS["audio_decoder"], CTESTS["midi_device_selection"], CTESTS["openal_lifecycle"], FOCUSED_EXE + " --phase1b-direct-memory", FOCUSED_EXE + " --phase1b-file-slice"], "focused CTest contract is invalid"),
         ("obsolete Lizard -L command", "set", ("rows", 12, "commands", "lizard", "command"), "lizard -C 20 -L 80 src/sound/oalsound.cpp src/sound/audio_decoder.cpp", "lizard command is invalid"),
-        ("packaging client executable", "set", ("rows", 13, "commands", "actual_package"), 'python scripts/phase1b_audio_gate.py verify-package --client-exe "${CLIENT_EXE}" --source-root . --sound-enabled', "actual package verification is invalid"),
-        ("missing package placeholder", "remove", ("placeholders",), 1, "unsupported or incomplete manifest"),
-        ("undeclared package placeholder", "remove", ("rows", 13, "portable_placeholders"), 1, "invalid portable placeholders"),
-        ("self-test-only package check", "set", ("rows", 13, "commands", "actual_package"), "python scripts/phase1b_audio_gate.py --self-test", "actual package verification is invalid"),
+        ("source self-test substitution", "set", ("rows", 13, "commands", "source_verify"), "python scripts/phase1b_audio_gate.py --self-test", "source verification is invalid"),
+        ("source expectation", "set", ("rows", 13, "expected", "observation"), "All checks pass.", "source provenance expectation is invalid"),
+        ("source writes", "set", ("rows", 13, "resource_assertions"), ["Copies notices."], "source provenance resource assertions are invalid"),
+        ("source executable prerequisite", "set", ("rows", 13, "external_prerequisites"), ["Client executable."], "source provenance prerequisites are invalid"),
+        ("missing testdata placeholder", "remove", ("placeholders",), 1, "unsupported or incomplete manifest"),
+        ("undeclared testdata placeholder", "remove", ("rows", 13, "portable_placeholders"), 1, "invalid portable placeholders"),
+        ("missing phase2 unit CTest", "remove", ("rows", 12, "commands", "focused_ctests"), 3, "focused CTest contract is invalid"),
+        ("full Cppcheck substitution", "set", ("rows", 12, "commands", "cppcheck"), "cppcheck --project=build-v143-openal/Zandronum.sln", "cppcheck command is invalid"),
+        ("optional non-multiplayer row", "set", ("rows", 0, "required"), False, "invalid required flag"),
+        ("unconditional multiplayer", "set", ("rows", 14, "required"), True, "invalid required flag"),
+        ("multiplayer requirement waiver", "set", ("rows", 14, "expected", "tolerance"), "Always optional.", "multiplayer conditional requirement is invalid"),
         ("artifact traversal", "set", ("rows", 12, "artifacts", 0), "../CMakeLists.txt", "artifact path escapes"),
         ("fixture traversal", "set", ("rows", 0, "fixtures", 0, "path"), "../phase1b-validation.json", "fixture path escapes"),
     ]

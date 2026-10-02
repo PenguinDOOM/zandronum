@@ -1,5 +1,10 @@
 # Native OpenAL Soft: Phase 2D-1 Current State
 
+**Forward policy (2026-10-03):** [AGENTS.md](../AGENTS.md) governs future work:
+Windows x64 is the primary validated platform; Linux is not actively validated,
+and hosted CI is intentionally not maintained. The APPROVED closeout and
+historical evidence below retain their original scope and limitations.
+
 ## Current Phase 2E Overview
 
 **Status: APPROVED (2026-09-29).**
