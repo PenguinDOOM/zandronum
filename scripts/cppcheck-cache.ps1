@@ -221,6 +221,32 @@ function Enter-CppcheckCacheLock {
     return [PSCustomObject]@{ Path = $lockPath; Stream = $stream }
 }
 
+function Get-CppcheckPreparationReceipt {
+    param([string]$CacheRoot, [string]$BuildRoot)
+
+    $path = Join-Path $CacheRoot ('regression/receipt-v1-' + (Get-CppcheckCacheHash -Value ([IO.Path]::GetFullPath($BuildRoot))) + '.json')
+    Assert-CppcheckPathHasNoReparseAncestor -Path $path
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    try { $receipt = [IO.File]::ReadAllText($path) | ConvertFrom-Json -ErrorAction Stop }
+    catch [ArgumentException] { return $null }
+    if ($null -eq $receipt -or $null -eq $receipt.PSObject.Properties['SchemaVersion'] -or $receipt.SchemaVersion -ne 1) { return $null }
+    return $receipt
+}
+
+function Save-CppcheckPreparationReceipt {
+    param([string]$CacheRoot, [string]$BuildRoot, [object]$Receipt)
+
+    $path = Join-Path $CacheRoot ('regression/receipt-v1-' + (Get-CppcheckCacheHash -Value ([IO.Path]::GetFullPath($BuildRoot))) + '.json')
+    Assert-CppcheckPathHasNoReparseAncestor -Path $path
+    New-Item -ItemType Directory -Force -Path (Split-Path $path) | Out-Null
+    $temporaryPath = $path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        [IO.File]::WriteAllText($temporaryPath, ($Receipt | ConvertTo-Json -Depth 16), [Text.UTF8Encoding]::new($false))
+        [IO.File]::Move($temporaryPath, $path, $true)
+    }
+    finally { if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force } }
+}
+
 function Assert-CppcheckPathHasNoReparseAncestor {
     param([string]$Path)
 

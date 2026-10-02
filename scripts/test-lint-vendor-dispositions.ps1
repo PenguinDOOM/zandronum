@@ -1,3 +1,5 @@
+param([string]$PreparedNativeFixtureRoot = '', [string]$PreparedNativeCommitFile = 'input-commits.json')
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -494,6 +496,68 @@ function Assert-CppcheckProjectSelection {
     Assert-ExpectedException -Expected "InputManifest C/C++ source 'tools/timidity_pipe_tests.cpp'" -Action {
         Select-CppcheckProjects -Projects @() -ChangedFiles @('tools/timidity_pipe_tests.cpp') -IsInputManifest:$true -IsWindowsVisualStudioBuild:$true -BuildDirectory 'build-v143' | Out-Null
     }
+
+    $secondProject = [PSCustomObject]@{
+        RelativeProject = 'tools/fixture.vcxproj'
+        Sources = @{ 'src/registered.cpp' = 'src/registered.cpp'; 'tools/local.cpp' = 'tools/local.cpp' }
+        Files = @()
+    }
+    foreach ($changed in @(@('src/registered.cpp'), @('src/registered.cpp', 'src/other.cpp'))) {
+        $selection = Select-CppcheckProjects -Projects @($registeredProject, $secondProject) -ChangedFiles $changed -IsInputManifest:$false -IsWindowsVisualStudioBuild:$true -BuildDirectory 'build-v143' -SelectedOnly
+        if ($selection.Projects.Count -ne 2) { throw 'Selected-only multi-target selection lost an owning project.' }
+        foreach ($project in $selection.Projects) {
+            $expected = @($changed | Where-Object { $project.Sources.ContainsKey($_) } | Sort-Object -Unique)
+            if (($project.Files -join '|') -cne ($expected -join '|')) { throw 'Selected-only selection expanded or lost translation units.' }
+        }
+    }
+    $single = Select-CppcheckProjects -Projects @($registeredProject) -ChangedFiles @('src/other.cpp', 'src/sdl/i_main.cpp', 'tools/timidity_pipe_tests.cpp') -IsInputManifest:$false -IsWindowsVisualStudioBuild:$true -BuildDirectory 'build-v143' -SelectedOnly
+    if (($single.Projects[0].Files -join '|') -cne 'src/other.cpp' -or $single.PlatformNotApplicable.Count -ne 2) { throw 'Selected-only single-TU/platform exclusion mismatch.' }
+    Assert-ExpectedException -Expected "Changed source 'src/unknown.cpp'" -Action {
+        Select-CppcheckProjects -Projects @($registeredProject) -ChangedFiles @('src/unknown.cpp') -IsInputManifest:$false -IsWindowsVisualStudioBuild:$true -BuildDirectory 'build-v143' -SelectedOnly | Out-Null
+    }
+    $full = Select-CppcheckProjects -Projects @($registeredProject, $secondProject) -ChangedFiles @('src/registered.cpp') -IsInputManifest:$false -IsWindowsVisualStudioBuild:$true -BuildDirectory 'build-v143'
+    if (@($full.Projects | Where-Object { $_.Files.Count -ne 2 }).Count) { throw 'Full selection after selected-only did not restore every TU.' }
+    Write-Host 'Full/selected-only single/multiple/multi-target selection: passed.'
+}
+
+function Assert-CppcheckSourceRouting {
+    param([string]$LintScript = (Join-Path $PSScriptRoot 'lint.ps1'))
+
+    Import-LintFunction -Name 'Get-CppcheckSourceRoute' -LintScript $LintScript
+    $source = [PSCustomObject]@{ Status = 'M'; Path = 'src/sample.cpp'; OldPath = '' }
+    foreach ($case in @(
+        @{ Changes = @($source); Dirty = $false; Mode = 'Candidate' },
+        @{ Changes = @($source); Dirty = $true; Mode = 'Full' },
+        @{ Changes = @($source, [PSCustomObject]@{ Status = 'M'; Path = 'src/sample.h' }); Dirty = $false; Mode = 'Full' },
+        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'README.md' }); Dirty = $false; Mode = 'Skip' },
+        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'src/sample.h' }); Dirty = $false; Mode = 'Skip' },
+        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'CMakeLists.txt' }); Dirty = $false; Mode = 'Error' },
+        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'protocolspec/spec.txt' }); Dirty = $false; Mode = 'Error' },
+        @{ Changes = @([PSCustomObject]@{ Status = 'D'; Path = 'src/sample.cpp' }); Dirty = $false; Mode = 'Error' },
+        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'tools/lemon/lemon.c' }); Dirty = $false; Mode = 'Full' },
+        @{ Changes = @([PSCustomObject]@{ Status = 'M'; Path = 'src/sound/thirdparty/vendor.cpp' }); Dirty = $false; Mode = 'Full' }
+    )) {
+        $route = Get-CppcheckSourceRoute -Changes $case.Changes -TrackedDirty:$case.Dirty
+        if ($route.Mode -ne $case.Mode) { throw "Source routing mismatch: $($route.Reason)." }
+    }
+    foreach ($status in @('R100', 'C100')) {
+        foreach ($pair in @(
+            @('src/sc_man.cpp', 'src/sc_man.txt'),
+            @('protocolspec/spec.txt', 'docs/spec.txt'),
+            @('CMakeLists.txt', 'CMakeLists.old'),
+            @('src/parser.y', 'docs/parser.txt')
+        )) {
+            $route = Get-CppcheckSourceRoute -Changes @([PSCustomObject]@{ Status = $status; OldPath = $pair[0]; Path = $pair[1] })
+            if ($route.Mode -ne 'Error' -or $route.Sources.Count) { throw "Relevant old endpoint was skipped: $status $($pair -join ' -> ')." }
+        }
+        $route = Get-CppcheckSourceRoute -Changes @([PSCustomObject]@{ Status = $status; OldPath = 'src/sample.h'; Path = 'docs/sample.txt' })
+        if ($route.Mode -ne 'Skip') { throw 'True header/document-only change no longer skips.' }
+    }
+    foreach ($status in @('A', 'R100', 'C100', 'T')) {
+        $route = Get-CppcheckSourceRoute -Changes @([PSCustomObject]@{ Status = $status; Path = 'src/sample.cpp'; OldPath = 'src/old.cpp' })
+        if ($route.Mode -ne 'Full') { throw "Unsafe source status $status entered Fast qualification." }
+    }
+    Write-Host 'Conservative all-diff source routing: passed.'
 }
 
 function Assert-ClassifiedFailureEvidence {
@@ -748,6 +812,7 @@ function Exit-CppcheckCacheLock {
 $cppcheckCacheRoot = 'fixture-cache-root'
 $inputManifestData = $null
 $inputManifestRoots = $null
+$stageName = 'regression-normal'
 $prepare =
 '@ + $callbackText + @'
 
@@ -981,6 +1046,415 @@ function Assert-NativeCppcheckBatchSmoke {
     Write-Host 'V1/V7 three native TU diagnostics/exit and real Cppcheck process overlap: passed.'
 }
 
+function Assert-CppcheckFastContracts {
+    param([string]$RepositoryRoot = (Split-Path -Parent $PSScriptRoot), [string]$LintScript = (Join-Path $PSScriptRoot 'lint.ps1'))
+
+    $tokens = $null
+    $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($LintScript, [ref]$tokens, [ref]$errors)
+    if ($errors.Count) { throw $errors[0].Message }
+    foreach ($definition in $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+        Invoke-Expression ($definition.Extent.Text -replace '^function\s+', 'function global:')
+    }
+    foreach ($name in @('generatedBundlePaths', 'fastSourceGeneratedPaths', 'generatedBuildInputRules')) {
+        $assignment = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.AssignmentStatementAst] }, $true) | Where-Object { $_.Left.Extent.Text -eq ('$' + $name) } | Select-Object -First 1
+        Set-Variable -Name $name -Scope Global -Value @(& ([scriptblock]::Create($assignment.Right.Extent.Text)))
+    }
+    $global:utf8 = [Text.UTF8Encoding]::new($false)
+    $evidenceRoot = Join-Path $RepositoryRoot ('completes/lint-source-tu-fast-path/phase-1/contracts-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path (Join-Path $evidenceRoot 'commands') -Force | Out-Null
+    $evidence = [PSCustomObject]@{ Root = $evidenceRoot; Counter = 0 }
+    $clone = Join-Path $evidenceRoot 'objects'
+    $cloneResult = Invoke-LintChild -Path 'git' -Arguments @('clone', '--shared', '--no-hardlinks', '--no-checkout', $RepositoryRoot, $clone) -Label 'fixture-objects-clone' -Evidence $evidence
+    if ($cloneResult.ExitCode) { throw 'Fast object fixture clone failed.' }
+    $cache = Join-Path $evidenceRoot 'cache'
+    $lock = Enter-CppcheckCacheLock -CacheRoot $cache -Name 'regression'
+    $stage = New-CppcheckDisposableStage -CacheRoot $cache -Name 'regression-fast'
+    try {
+        Assert-ExpectedException -Expected 'already exists' -Action { New-CppcheckDisposableStage -CacheRoot $cache -Name 'regression-fast' | Out-Null }
+        $source = Join-Path $stage 'source'
+        New-Item -ItemType Directory -Path $source | Out-Null
+        $raw = [byte[]]@(0, 128, 255, 13, 10, 65, 10)
+        $blob = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $clone -Arguments @('hash-object', '-w', '--stdin') -InputBytes $raw)).Trim()
+        $treeBytes = [Text.Encoding]::UTF8.GetBytes("100644 blob $blob`traw.cpp" + [char]0)
+        $tree = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $clone -Arguments @('mktree', '-z') -InputBytes $treeBytes)).Trim()
+        [IO.File]::WriteAllBytes((Join-Path $source 'raw.cpp'), [byte[]]@(65))
+        Set-CppcheckBaseBlobs -RepositoryRoot $clone -BaseCommit $tree -Files @('raw.cpp') -StageSourceRoot $source
+        if ([Convert]::ToHexString([IO.File]::ReadAllBytes((Join-Path $source 'raw.cpp'))) -cne [Convert]::ToHexString($raw)) { throw 'Raw Base blob was transcoded.' }
+        [IO.File]::WriteAllBytes((Join-Path $evidenceRoot 'raw-input.bin'), $raw)
+        @{ Blob = $blob; Tree = $tree; Path = 'raw.cpp'; Bytes = $raw } | ConvertTo-Json | Set-Content (Join-Path $evidenceRoot 'raw-identity.json')
+        $reader = (Get-Command Get-CppcheckGitBytes).Definition
+        try {
+            $global:fastNulFixture = [Text.Encoding]::UTF8.GetBytes("M" + [char]0 + "src/tab`tnewline`n.cpp" + [char]0 + 'R100' + [char]0 + 'src/old.cpp' + [char]0 + 'src/new.cpp' + [char]0 + 'D' + [char]0 + 'src/deleted.cpp' + [char]0)
+            function global:Get-CppcheckGitBytes { param($RepositoryRoot, $Arguments, $InputBytes); return ,$global:fastNulFixture }
+            $changes = @(Get-CppcheckTreeChanges -RepositoryRoot $clone -BaseCommit base -HeadCommit head)
+            if ($changes.Count -ne 3 -or $changes[0].Path -cne "src/tab`tnewline`n.cpp" -or $changes[1].OldPath -cne 'src/old.cpp' -or $changes[2].Status -ne 'D') { throw 'NUL all-diff parser corrupted status/path data.' }
+            [IO.File]::WriteAllBytes((Join-Path $evidenceRoot 'routing-input.bin'), $global:fastNulFixture)
+            $changes | ConvertTo-Json | Set-Content (Join-Path $evidenceRoot 'routing-output.json')
+        }
+        finally { Invoke-Expression ("function global:Get-CppcheckGitBytes {`n" + $reader + "`n}"); Remove-Variable fastNulFixture -Scope Global }
+        $build = Join-Path $RepositoryRoot 'build-v143'
+        $header = Join-Path $build 'src/sc_man_scanner.h'
+        $rule = Join-Path $RepositoryRoot 'src/sc_man_scanner.re'
+        $aliases = @(Get-CppcheckGeneratedDiagnosticAliases -GeneratedPaths @($header) -InputPaths @($rule) -RepositoryRoot $RepositoryRoot -BuildRoot $build)
+        if ($aliases.Count -ne 1) { throw 'Real generated scanner #line alias missing.' }
+        $rawDiagnostic = $aliases[0].AbsolutePath + "`t20`t1`twarning`tfixture`tmessage retains " + $aliases[0].AbsolutePath
+        $headOutput = @(ConvertTo-CppcheckAliasedOutput -Output @($rawDiagnostic) -Aliases $aliases -StageSourceRoot $source)
+        $baseOutput = @(ConvertTo-CppcheckAliasedOutput -Output @($rawDiagnostic -replace "`t20`t", "`t40`t") -Aliases $aliases -StageSourceRoot $source)
+        $head = @(ConvertFrom-CppcheckProjectOutput -Output $headOutput -ExitCode 1 -RepositoryRoot $source -BuildRoot $build -TargetName 'src/zdoom.vcxproj' -TranslationUnit 'src/sc_man.cpp')
+        $base = @(ConvertFrom-CppcheckProjectOutput -Output $baseOutput -ExitCode 1 -RepositoryRoot $source -BuildRoot $build -TargetName 'src/zdoom.vcxproj' -TranslationUnit 'src/sc_man.cpp')
+        if ($head[0].RelativePath -cne 'src/sc_man_scanner.re' -or $head[0].Fingerprint -cne $base[0].Fingerprint -or $head[0].Message -notmatch [regex]::Escape($aliases[0].AbsolutePath)) { throw 'Exact real #line file-only alias/fingerprint failed.' }
+        $unknown = Join-Path $stage 'unknown.h'
+        [IO.File]::WriteAllText($unknown, [IO.File]::ReadAllText($header) + "`n#line 1 `"C:/unknown/unverified.re`"")
+        Assert-ExpectedException -Expected 'Unknown generated #line input' -Action { Get-CppcheckGeneratedDiagnosticAliases -GeneratedPaths @($unknown) -InputPaths @($rule) -RepositoryRoot $RepositoryRoot -BuildRoot $build | Out-Null }
+        $unverified = "C:/unknown/unverified.re`t1`t1`twarning`tfixture`tunchanged"
+        if (@(ConvertTo-CppcheckAliasedOutput -Output @($unverified) -Aliases $aliases -StageSourceRoot $source)[0] -cne $unverified) { throw 'Unknown diagnostic file was broadly aliased.' }
+        @{ Header = $header; HeaderSHA256 = (Get-FileHash $header).Hash; Aliases = $aliases; Raw = $rawDiagnostic; HEAD = $head; Base = $base; Unknown = $unverified } | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $evidenceRoot 'real-line-alias.json')
+        [IO.File]::Copy($header, (Join-Path $evidenceRoot 'sc_man_scanner.h'))
+        $project = Get-ProjectSources -BuildRoot $build -RepositoryRoot $RepositoryRoot | Where-Object RelativeProject -eq 'src/zdoom.vcxproj'
+        $project.Files = @('src/sc_man.cpp')
+        $mapped = New-CppcheckFastProject -Project $project -RepositoryRoot $RepositoryRoot -BuildRoot $build -StageSourceRoot $source -ProjectRoot (Join-Path $stage 'project') -AnalyzerVersion 'fixture'
+        if (($mapped.Files -join '|') -cne 'src/sc_man.cpp') { throw 'Real XML selected-only set changed.' }
+        [IO.File]::Copy($mapped.ProjectPath, (Join-Path $evidenceRoot 'mapped-zdoom.vcxproj'))
+        $lineLiveRoot = Join-Path $evidenceRoot 'line/live'
+        $lineBuildRoot = Join-Path $evidenceRoot 'line/build'
+        New-Item -ItemType Directory -Force -Path (Join-Path $lineLiveRoot 'src'), $lineBuildRoot, (Join-Path $source 'src') | Out-Null
+        $lineRule = Join-Path $lineLiveRoot 'src/line_fixture.re'
+        $lineHeader = Join-Path $lineBuildRoot 'generated.h'
+        [IO.File]::WriteAllText($lineRule, 'inline int line_fixture() { int *generatedPointer = 0; return *generatedPointer; }', [Text.UTF8Encoding]::new($false))
+        $generator = Invoke-LintChild -Path (Join-Path $build 'tools/re2c/Release/re2c.exe') -Arguments @('-o', $lineHeader, $lineRule.Replace('\', '/')) -Label 'real-line-generator' -Evidence $evidence
+        if ($generator.ExitCode) { throw 'Real line fixture re2c generation failed.' }
+        $lineAliases = @(Get-CppcheckGeneratedDiagnosticAliases -GeneratedPaths @($lineHeader) -InputPaths @($lineRule) -RepositoryRoot $lineLiveRoot -BuildRoot $lineBuildRoot)
+        $lineResults = @()
+        foreach ($role in @('head', 'baseline')) {
+            $prefix = if ($role -eq 'baseline') { "`n`n" } else { '' }
+            [IO.File]::WriteAllText((Join-Path $source 'src/sc_man.cpp'), ($prefix + '#include "' + $lineHeader.Replace('\', '/') + '"'), [Text.UTF8Encoding]::new($false))
+            $descriptor = New-CppcheckDescriptor -CppcheckPath (Get-Command cppcheck -ErrorAction Stop).Source -ProjectPath $mapped.ProjectPath -CachePath (Join-Path $cache "line-$role") -RepositoryRoot $source -BuildRoot $build -TargetName 'src/zdoom.vcxproj' -TranslationUnit 'src/sc_man.cpp' -Index 0
+            $descriptor.WorkingDirectory = $source
+            $descriptor | Add-Member -NotePropertyName DiagnosticFileAliases -NotePropertyValue $lineAliases
+            $diagnostics = @(Invoke-CppcheckBatch -Descriptors @($descriptor) -CppcheckJobs 1 -Evidence $evidence)
+            $lineResults += ,$diagnostics
+            if ($diagnostics.Count -ne 1 -or $diagnostics[0].RelativePath -cne 'src/line_fixture.re') { throw 'Real generated native #line logical path mismatch.' }
+        }
+        if ($lineResults[0][0].Fingerprint -cne $lineResults[1][0].Fingerprint) { throw 'Real generated native #line HEAD/Base fingerprint mismatch.' }
+        @{ Generator = (Join-Path $build 'tools/re2c/Release/re2c.exe'); GeneratorSHA256 = (Get-FileHash (Join-Path $build 'tools/re2c/Release/re2c.exe')).Hash; Aliases = $lineAliases; Results = $lineResults } | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $evidenceRoot 'native-line-alias.json')
+        $state = Get-CppcheckPreparationState -RepositoryRoot $RepositoryRoot -BuildRoot $build -Projects @($project) -AnalyzerVersion 'fixture'
+        Save-CppcheckPreparationReceipt -CacheRoot $cache -BuildRoot $build -Receipt ([PSCustomObject]@{ SchemaVersion = 1; Anchor = 'fixture'; PreparationVerified = $true; State = $state })
+        $receipt = Get-CppcheckPreparationReceipt -CacheRoot $cache -BuildRoot $build
+        Assert-CppcheckPreparationState -Expected $state -Actual $receipt.State
+        $changed = $state | ConvertTo-Json -Depth 16 | ConvertFrom-Json
+        $changed.Inputs[0].SHA256 = 'changed'
+        Assert-ExpectedException -Expected 'context/input/output changed' -Action { Assert-CppcheckPreparationState -Expected $receipt.State -Actual $changed }
+        Assert-ExpectedException -Expected 'live HEAD/index/tracked inputs changed' -Action { Assert-CppcheckFastLiveHead -RepositoryRoot $RepositoryRoot -HeadCommit 'not-current-head' }
+        Assert-CppcheckFastSourceSafety -RepositoryRoot $RepositoryRoot -BuildRoot $build -HeadCommit (& git -C $RepositoryRoot rev-parse HEAD) -ChangedFiles @('src/sc_man.cpp') -Projects @($project)
+        $receipt | ConvertTo-Json -Depth 16 | Set-Content (Join-Path $evidenceRoot 'receipt-roundtrip.json')
+    }
+    finally { try { Remove-CppcheckDisposableStage -CacheRoot $cache -StageRoot $stage -Name 'regression-fast' } finally { Exit-CppcheckCacheLock -Lock $lock } }
+    $reacquired = Enter-CppcheckCacheLock -CacheRoot $cache -Name 'regression'
+    Exit-CppcheckCacheLock -Lock $reacquired
+    if (Test-Path -LiteralPath $stage) { throw 'Fast contract fixture leaked its owned stage.' }
+    Write-Host "Fast raw/NUL/real-line/XML/receipt/cleanup contracts: passed ($evidenceRoot)."
+}
+
+function Assert-CppcheckFastSafetyPreflight {
+    param([string]$RepositoryRoot = (Split-Path -Parent $PSScriptRoot), [string]$LintScript = (Join-Path $PSScriptRoot 'lint.ps1'))
+
+    $root = Join-Path $RepositoryRoot ('completes/lint-source-tu-fast-path/phase-1/safety-' + [guid]::NewGuid().ToString('N'))
+    $source = Join-Path $root 'source'
+    $build = Join-Path $source 'build'
+    $global:utf8 = [Text.UTF8Encoding]::new($false)
+    New-Item -ItemType Directory -Force -Path (Join-Path $root 'commands'), (Join-Path $source 'src/xlat'), (Join-Path $build 'CMakeFiles'), (Join-Path $build 'src') | Out-Null
+    $evidence = [PSCustomObject]@{ Root = $root; Counter = 0 }
+    $initialize = Invoke-LintChild -Path 'git' -Arguments @('init', $source) -Label 'safety-init' -Evidence $evidence
+    if ($initialize.ExitCode) { throw 'Safety fixture Git initialization failed.' }
+    $files = @{
+        '.gitignore' = "/build/`n/src/review-ignored`n"
+        'src/sc_man.cpp' = "#include `"sample.h`"`nint sample;`n"
+        'src/sample.h' = '#define SAMPLE 1'
+        'src/xlat/parse_xlat.cpp' = '#include "xlat_parser.c"'
+        'src/guard.h' = "#ifdef ROUTINE_OPTIONAL_HEADER`n#include ROUTINE_OPTIONAL_HEADER`n#endif`n"
+    }
+    foreach ($path in $files.Keys) {
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($files[$path])
+        [IO.File]::WriteAllBytes((Join-Path $source $path), $bytes)
+        $blob = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('hash-object', '-w', '--stdin') -InputBytes $bytes)).Trim()
+        $null = Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('update-index', '--add', '--cacheinfo', "100644,$blob,$path")
+    }
+    $tree = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('write-tree'))).Trim()
+    [IO.File]::WriteAllText((Join-Path $build 'CMakeFiles/generate.stamp.depend'), '# fixture')
+    $generated = Join-Path $build 'src/xlat_parser.c'
+    [IO.File]::WriteAllText($generated, 'int generated;')
+    $projectPath = Join-Path $build 'fixture.vcxproj'
+    $escaped = [Security.SecurityElement]::Escape((Join-Path $source 'src'))
+    [IO.File]::WriteAllText($projectPath, ('<Project><PropertyGroup Condition="''$(Configuration)|$(Platform)''==''Release|x64''"><PlatformToolset>v143</PlatformToolset></PropertyGroup><ItemDefinitionGroup Condition="''$(Configuration)|$(Platform)''==''Release|x64''"><ClCompile><PreprocessorDefinitions>RELEASE</PreprocessorDefinitions><AdditionalIncludeDirectories>' + $escaped + '</AdditionalIncludeDirectories></ClCompile></ItemDefinitionGroup></Project>'))
+    $project = [PSCustomObject]@{ ProjectPath = $projectPath; RelativeProject = 'fixture.vcxproj'; Sources = @{ 'src/sc_man.cpp' = (Join-Path $source 'src/sc_man.cpp') }; Files = @('src/sc_man.cpp') }
+    $tokens = $null
+    $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($LintScript, [ref]$tokens, [ref]$errors)
+    if ($errors.Count) { throw $errors[0].Message }
+    $route = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Extent.Text.StartsWith('if ($null -eq $inputManifestData -and $sourceRoute.Mode') }, $true) | Select-Object -First 1
+    if ($null -eq $route) { throw 'Actual Auto preflight route block not found.' }
+    $routeScript = [scriptblock]::Create($route.Extent.Text)
+    $results = @()
+    foreach ($case in @('ordinary', 'macro-source', 'macro-header', 'macro-unknown', 'literal-source', 'absolute-header', 'tracked-def', 'untracked-def', 'ignored-extensionless', 'unknown-extension', 'approved-generated', 'generated-macro-source', 'operational-outside', 'missing-generated', 'shared-relative-header', 'shared-line-alias', 'base-absolute-header', 'base-bom-absolute-header', 'base-macro-source', 'base-macro-unknown', 'base-unresolved-source', 'base-included-def', 'base-guard-head-definition')) {
+        $unitPath = Join-Path $source 'src/sc_man.cpp'
+        $guardPath = Join-Path $source 'src/guard.h'
+        $extras = @()
+        $caseTree = $tree
+        $baseTree = $tree
+        $unit = 'src/sc_man.cpp'
+        try {
+            switch ($case) {
+                'macro-source' { [IO.File]::WriteAllText($guardPath, "#define REVIEW_SOURCE `"sc_man.cpp`"`n#include REVIEW_SOURCE`n") }
+                'macro-header' { [IO.File]::WriteAllText($guardPath, ('#define REVIEW_HEADER "' + (Join-Path $source 'src/sample.h').Replace('\', '/') + '"' + "`n#include REVIEW_HEADER`n")) }
+                'macro-unknown' { [IO.File]::WriteAllText($guardPath, '#include REVIEW_UNKNOWN') }
+                'literal-source' { [IO.File]::WriteAllText($guardPath, '#include "sc_man.cpp"') }
+                'absolute-header' { [IO.File]::WriteAllText($guardPath, ('#include "' + (Join-Path $source 'src/sample.h').Replace('\', '/') + '"')) }
+                'tracked-def' {
+                    $extra = Join-Path $source 'src/review.def'; $extras += $extra
+                    $bytes = [Text.UTF8Encoding]::new($false).GetBytes('#include "sc_man.cpp"')
+                    [IO.File]::WriteAllBytes($extra, $bytes)
+                    $blob = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('hash-object', '-w', '--stdin') -InputBytes $bytes)).Trim()
+                    $null = Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('update-index', '--add', '--cacheinfo', "100644,$blob,src/review.def")
+                    $caseTree = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('write-tree'))).Trim()
+                    [IO.File]::WriteAllText($unitPath, '#include "review.def"')
+                }
+                'untracked-def' { $extra = Join-Path $source 'src/review.def'; $extras += $extra; [IO.File]::WriteAllText($extra, '#define REVIEW 1'); [IO.File]::WriteAllText($unitPath, '#include "review.def"') }
+                'ignored-extensionless' { $extra = Join-Path $source 'src/review-ignored'; $extras += $extra; [IO.File]::WriteAllText($extra, '#define REVIEW 1'); [IO.File]::WriteAllText($unitPath, '#include "review-ignored"') }
+                'unknown-extension' { $extra = Join-Path $source 'src/review.custom'; $extras += $extra; [IO.File]::WriteAllText($extra, '#define REVIEW 1') }
+                'approved-generated' { $extra = Join-Path $source 'src/gitinfo.h'; $extras += $extra; [IO.File]::WriteAllText($extra, '#define REVIEW 1') }
+                'generated-macro-source' { $extra = Join-Path $source 'src/gitinfo.h'; $extras += $extra; [IO.File]::WriteAllText($extra, '#define ROUTINE_OPTIONAL_HEADER "sc_man.cpp"') }
+                'operational-outside' { New-Item -ItemType Directory -Path (Join-Path $source 'completes') | Out-Null; $extra = Join-Path $source 'completes/review.def'; $extras += $extra; [IO.File]::WriteAllText($extra, '#include REVIEW_UNKNOWN') }
+                'missing-generated' { Remove-Item -LiteralPath $generated }
+                'shared-relative-header' { $unit = 'src/xlat/parse_xlat.cpp'; [IO.File]::WriteAllText($generated, '#include "../../src/sample.h"') }
+                'shared-line-alias' { $unit = 'src/xlat/parse_xlat.cpp'; [IO.File]::WriteAllText($generated, ('#line 1 "' + (Join-Path $source 'src/sample.h').Replace('\', '/') + '"')) }
+                'base-absolute-header' { $baseText = '#include "' + (Join-Path $source 'src/sample.h').Replace('\', '/') + '"' }
+                'base-bom-absolute-header' { $baseText = [string][char]0xFEFF + '#include "' + (Join-Path $source 'src/sample.h').Replace('\', '/') + '"' }
+                'base-macro-source' { $baseText = "#define REVIEW_BASE_SOURCE `"sc_man.cpp`"`n#include REVIEW_BASE_SOURCE`n" }
+                'base-macro-unknown' { $baseText = '#include REVIEW_BASE_UNKNOWN' }
+                'base-unresolved-source' { $baseText = '#include "missing.cpp"' }
+                'base-included-def' {
+                    $baseText = '#include "review.def"'
+                    $extra = Join-Path $source 'src/review.def'; $extras += $extra
+                    $bytes = [Text.UTF8Encoding]::new($false).GetBytes('#include "' + (Join-Path $source 'src/sample.h').Replace('\', '/') + '"')
+                    [IO.File]::WriteAllBytes($extra, $bytes)
+                    $blob = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('hash-object', '-w', '--stdin') -InputBytes $bytes)).Trim()
+                    $null = Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('update-index', '--add', '--cacheinfo', "100644,$blob,src/review.def")
+                    $caseTree = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('write-tree'))).Trim()
+                }
+                'base-guard-head-definition' {
+                    $baseText = "#ifdef REVIEW_BASE_HEADER`n#include REVIEW_BASE_HEADER`n#endif`n"
+                    [IO.File]::WriteAllText($guardPath, '#define REVIEW_BASE_HEADER "sample.h"')
+                }
+            }
+            if ($case.StartsWith('base-')) {
+                $bytes = [Text.UTF8Encoding]::new($false).GetBytes($baseText)
+                $blob = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('hash-object', '-w', '--stdin') -InputBytes $bytes)).Trim()
+                $null = Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('update-index', '--cacheinfo', "100644,$blob,src/sc_man.cpp")
+                $baseTree = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('write-tree'))).Trim()
+            }
+            $result = & {
+                param($routeScript, $source, $build, $caseTree, $baseTree, $project, $unit)
+                $repositoryRoot = $source; $buildRoot = $build; $headCommit = $caseTree; $baseCommit = $baseTree
+                $inputManifestData = $null; $sourceRoute = [PSCustomObject]@{ Mode = 'Candidate' }
+                $cppcheckCacheRoot = 'fixture'; $CppcheckMode = 'Auto'; $cppcheckVersion = @('fixture')
+                $changedFiles = @($unit); $headProjects = @($project)
+                if ($unit -eq 'src/xlat/parse_xlat.cpp') { $project.Sources[$unit] = Join-Path $source $unit }
+                $isWindowsVisualStudioBuild = $true; $BuildDir = 'build'
+                $useFast = $false; $routeReason = ''; $probe = [PSCustomObject]@{ StateCalls = 0; BaseBlobReads = 0 }
+                $gitReader = [scriptblock]::Create((Get-Command Get-CppcheckGitBytes).Definition)
+                function Get-CppcheckGitBytes {
+                    param($RepositoryRoot, $Arguments, $InputBytes = $null)
+                    if ($Arguments[0] -eq 'cat-file' -and $Arguments[2].StartsWith($baseCommit + ':')) { $probe.BaseBlobReads++ }
+                    $bytes = & $gitReader -RepositoryRoot $RepositoryRoot -Arguments $Arguments -InputBytes $InputBytes
+                    return ,$bytes
+                }
+                function Enter-CppcheckCacheLock { return $null }
+                function Get-CppcheckPreparationReceipt { return [PSCustomObject]@{ Anchor = $caseTree; PreparationVerified = $true; State = 'valid unchanged receipt' } }
+                function Get-CppcheckTreeChanges { return @() }
+                function Get-CppcheckPreparationState { $probe.StateCalls++; return 'valid unchanged receipt' }
+                . $routeScript
+                [PSCustomObject]@{ Mode = $(if ($useFast) { 'Fast' } else { 'Full' }); Reason = $routeReason; StateCalls = $probe.StateCalls; BaseBlobReads = $probe.BaseBlobReads }
+            } $routeScript $source $build $caseTree $baseTree $project $unit
+            $expected = if ($case -in @('ordinary', 'approved-generated', 'operational-outside', 'shared-line-alias')) { 'Fast' } else { 'Full' }
+            if ($result.Mode -ne $expected) { throw "Safety route mismatch for ${case}: $($result | ConvertTo-Json -Compress)." }
+            if ($expected -eq 'Full' -and $result.StateCalls) { throw "Unsafe $case reached receipt comparison before rejection." }
+            if ($expected -eq 'Fast' -and $result.StateCalls -ne 1) { throw "Safe $case did not compare the preparation receipt." }
+            if (($expected -eq 'Fast' -or $case.StartsWith('base-')) -and $result.BaseBlobReads -ne 1) { throw "Selected Base TU was not inspected before routing for '$case'." }
+            if ($case -eq 'missing-generated' -and $result.Reason -notmatch 'Missing approved generated source inclusion') { throw 'Missing generated input did not route Full for regeneration.' }
+            $results += [PSCustomObject]@{ Case = $case; Result = $result; Expected = $expected; TU = [IO.File]::ReadAllText((Join-Path $source $unit)); Include = [IO.File]::ReadAllText($guardPath); Generated = $(if (Test-Path $generated) { [IO.File]::ReadAllText($generated) } else { $null }); Tree = $caseTree; BaseTree = $baseTree; BaseTU = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('cat-file', 'blob', "${baseTree}:$unit"))) }
+        }
+        finally {
+            if ($case -in @('tracked-def', 'base-included-def')) { $null = Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('update-index', '--force-remove', 'src/review.def') }
+            if ($case.StartsWith('base-')) {
+                $bytes = [Text.UTF8Encoding]::new($false).GetBytes($files['src/sc_man.cpp'])
+                $blob = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('hash-object', '-w', '--stdin') -InputBytes $bytes)).Trim()
+                $null = Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('update-index', '--cacheinfo', "100644,$blob,src/sc_man.cpp")
+            }
+            foreach ($extra in $extras) { Remove-Item -LiteralPath $extra -Force }
+            [IO.File]::WriteAllText($unitPath, $files['src/sc_man.cpp'])
+            [IO.File]::WriteAllText($guardPath, $files['src/guard.h'])
+            [IO.File]::WriteAllText($generated, 'int generated;')
+        }
+    }
+    $results | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $root 'route-results.json')
+    Get-FileHash $LintScript, (Join-Path $RepositoryRoot 'scripts/test-lint-vendor-dispositions.ps1') | ConvertTo-Json | Set-Content (Join-Path $root 'script-hashes.json')
+    Write-Host "R1/R2/R4 actual Auto preflight concrete safety routes: passed ($root)."
+}
+
+function Assert-CppcheckFastNativeRoute {
+    param([string]$RepositoryRoot = (Split-Path -Parent $PSScriptRoot), [string]$PreparedFixtureRoot = '', [string]$PreparedCommitFile = 'input-commits.json')
+
+    $root = if ($PreparedFixtureRoot) { $PreparedFixtureRoot } else { Join-Path $RepositoryRoot ('completes/lint-source-tu-fast-path/phase-1/n-' + [guid]::NewGuid().ToString('N').Substring(0, 8)) }
+    New-Item -ItemType Directory -Force -Path (Join-Path $root 'commands') | Out-Null
+    $evidence = [PSCustomObject]@{ Root = $root; Counter = 0 }
+    $source = Join-Path $root 'r'
+    $baseRoot = Join-Path $root 'b'
+    $build = Join-Path $source 'build-v143'
+    $baseBuild = Join-Path $baseRoot 'build-v143'
+    $analyzer = (Get-Command cppcheck -ErrorAction Stop).Source
+    $version = & $analyzer --version
+    $hash = (Get-FileHash $analyzer).Hash
+    $cmakePath = (Get-Command cmake -ErrorAction Stop).Source
+    $unit = 'src/sc_man.cpp'
+    if (-not $PreparedFixtureRoot) {
+    $clone = Invoke-LintChild -Path 'git' -Arguments @('clone', '--shared', '--no-hardlinks', $RepositoryRoot, $source) -Label 'native-fixture-clone' -Evidence $evidence
+    if ($clone.ExitCode) { throw 'Native Fast fixture clone failed.' }
+    $original = [IO.File]::ReadAllText((Join-Path $source $unit))
+    $original += "`n#if defined(FAST_FIXTURE_GENERATED)`nint fast_fixture_output() { int *outputPointer = 0; return *outputPointer; }`n#endif`n"
+    $original += "`n#if defined(FAST_FIXTURE_CONTEXT)`nint fast_fixture_context() { int *contextPointer = 0; return *contextPointer; }`n#endif`n"
+    foreach ($relative in @('scripts/lint.ps1', 'scripts/cppcheck-cache.ps1', 'scripts/test-lint-vendor-dispositions.ps1')) {
+        [IO.File]::Copy((Join-Path $RepositoryRoot $relative), (Join-Path $source $relative), $true)
+        $blob = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('hash-object', '-w', '--stdin') -InputBytes ([IO.File]::ReadAllBytes((Join-Path $source $relative))))).Trim()
+        $null = Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('update-index', '--cacheinfo', "100644,$blob,$relative")
+    }
+    $commits = @()
+    foreach ($suffix in @(
+        "`nint fast_fixture_existing() { int *basePointer = 0; return *basePointer; }`n",
+        "`n`n`nint fast_fixture_existing() { int *basePointer = 0; return *basePointer; }`nint fast_fixture_new() { int *headPointer = 0; return *headPointer; }`n",
+        "`n`n`nint fast_fixture_existing() { int *basePointer = 0; return *basePointer; }`nint fast_fixture_new() { int *headPointer = 0; return *headPointer; }`nint fast_fixture_advanced() { int *nextPointer = 0; return *nextPointer; }`n"
+    )) {
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($original + $suffix)
+        $blob = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('hash-object', '-w', '--stdin') -InputBytes $bytes)).Trim()
+        $null = Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('update-index', '--cacheinfo', "100644,$blob,$unit")
+        $tree = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('write-tree'))).Trim()
+        $parent = if ($commits.Count) { $commits[-1] } else { [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('rev-parse', 'HEAD'))).Trim() }
+        $commit = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('-c', 'user.name=Fast fixture', '-c', 'user.email=fast-fixture@example.invalid', 'commit-tree', $tree, '-p', $parent, '-m', 'isolated source-only fixture'))).Trim()
+        $commits += $commit
+        [IO.File]::WriteAllBytes((Join-Path $root ("input-$($commits.Count).cpp")), $bytes)
+    }
+    $null = Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('checkout', '--detach', '--force', $commits[1])
+    $null = Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('worktree', 'add', '--detach', $baseRoot, $commits[0])
+    $cacheFile = Join-Path $RepositoryRoot 'build-v143/CMakeCache.txt'
+    foreach ($pair in @(@($source, $build), @($baseRoot, $baseBuild))) {
+        $arguments = @('-S', $pair[0], '-B', $pair[1], '-G', 'Visual Studio 17 2022', '-A', 'x64', '-T', 'v143')
+        foreach ($name in @('BUILD_TESTING', 'DYN_FLUIDSYNTH', 'NO_SOUND', 'FMOD_INCLUDE_DIR', 'FMOD_LIBRARY', 'OPENAL_INCLUDE_DIR', 'OPENAL_LIBRARY', 'OPUS_INCLUDE_DIR', 'OPUS_LIBRARIES', 'ZSTD_INCLUDE_DIR', 'ZSTD_LIBRARY', 'FLUIDSYNTH_INCLUDE_DIR', 'FLUIDSYNTH_LIBRARIES')) {
+            $setting = Get-CMakeCacheSetting -CachePath $cacheFile -Name $name
+            if ($setting -and $setting.Value -notmatch 'NOTFOUND') { $arguments += "-D$($name):$($setting.Type)=$($setting.Value)" }
+        }
+        $configure = Invoke-LintChild -Path $cmakePath -Arguments $arguments -Label "configure-$([IO.Path]::GetFileName($pair[0]))" -Evidence $evidence
+        if ($configure.ExitCode) { throw "Native fixture configure failed: $($configure.Output -join [Environment]::NewLine)" }
+        Invoke-GeneratedBuildInputPreparation -CMakePath $cmakePath -BuildRoot $pair[1] -RevisionName ([IO.Path]::GetFileName($pair[0])) -Evidence $evidence
+        Invoke-ProtocolspecGeneration -CMakePath $cmakePath -BuildRoot $pair[1] -RevisionName ([IO.Path]::GetFileName($pair[0])) -Evidence $evidence
+    }
+    $revision = Invoke-LintChild -Path $cmakePath -Arguments @('--build', $build, '--config', 'Release', '--target', 'revision_check') -Label 'fixture-head-revision' -Evidence $evidence
+    if ($revision.ExitCode) { throw 'Native fixture revision preparation failed.' }
+    $commits | ConvertTo-Json | Set-Content (Join-Path $root 'input-commits.json')
+    }
+    else {
+        $commits = @(Get-Content (Join-Path $root $PreparedCommitFile) -Raw | ConvertFrom-Json)
+        $evidence.Counter = @(Get-ChildItem (Join-Path $root 'commands') -Filter '*.invocation.json').Count
+    }
+    Push-Location $source
+    try { $bundle = Get-VerifiedGeneratedBundle -SourceRoot $source -GeneratedOutputRoot $source -BaseCommit $commits[0] -HeadCommit $commits[1] -TempRoot (Join-Path $root 'verification') -RelativePaths $generatedBundlePaths -PythonPath (Get-CMakePythonExecutable -CachePath (Join-Path $build 'CMakeCache.txt')) -Evidence $evidence }
+    finally { Pop-Location }
+    Copy-VerifiedGeneratedBundle -VerifiedBundle $bundle -DestinationRoot $baseRoot
+    $projects = @(Get-ProjectSources -BuildRoot $build -RepositoryRoot $source | Where-Object RelativeProject -eq 'src/zdoom.vcxproj')
+    $baseProjects = @(Get-ProjectSources -BuildRoot $baseBuild -RepositoryRoot $baseRoot)
+    $projects[0].Files = @($unit)
+    Assert-CppcheckFastSourceSafety -RepositoryRoot $source -BuildRoot $build -HeadCommit $commits[1] -ChangedFiles @($unit) -Projects $projects
+    $state = Get-CppcheckPreparationState -RepositoryRoot $source -BuildRoot $build -Projects $projects -AnalyzerVersion $version
+    $receipt = New-CppcheckPreparationReceipt -State $state -HeadCommit $commits[1] -RepositoryRoot $source -BuildRoot $build -Projects $projects -BaselineProjects $baseProjects -BaselineRoot $baseRoot -BaselineBuildRoot $baseBuild -AnalyzerVersion $version
+    $cache = Join-Path $source '.cppcheck-cache'
+    $attemptRoot = Join-Path $root ('attempt-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $lock = Enter-CppcheckCacheLock -CacheRoot $cache -Name 'regression'
+    try {
+        Save-CppcheckPreparationReceipt -CacheRoot $cache -BuildRoot $build -Receipt $receipt
+        $runs = @()
+        foreach ($run in @('cold', 'warm', 'advanced', 'base-changed', 'fresh')) {
+            if ($run -eq 'advanced') { $null = Get-CppcheckGitBytes -RepositoryRoot $source -Arguments @('checkout', '--detach', $commits[2]) }
+            $headCommit = if ($run -in @('advanced', 'base-changed', 'fresh')) { $commits[2] } else { $commits[1] }
+            $baseCommit = if ($run -in @('base-changed', 'fresh')) { $commits[1] } else { $commits[0] }
+            $runCache = if ($run -eq 'fresh') { Join-Path $cache 'fresh' } else { $cache }
+            $stage = New-CppcheckDisposableStage -CacheRoot $cache -Name 'regression-fast'
+            $runRoot = Join-Path $attemptRoot $run
+            New-Item -ItemType Directory -Force -Path (Join-Path $runRoot 'commands') | Out-Null
+            $script:lintTotalTimer = [Diagnostics.Stopwatch]::StartNew()
+            try {
+                $result = Invoke-CppcheckFastAnalysis -RepositoryRoot $source -BuildRoot $build -Projects $projects -State $state -HeadCommit $headCommit -BaseCommit $baseCommit -TempRoot $stage -CacheRoot $runCache -CppcheckPath $analyzer -AnalyzerVersion $version -AnalyzerSHA256 $hash -CppcheckJobs 1 -Evidence ([PSCustomObject]@{ Root = $runRoot; Counter = 0 })
+                $result | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $runRoot 'result.json')
+                $runs += $result
+            }
+            finally { Remove-CppcheckDisposableStage -CacheRoot $cache -StageRoot $stage -Name 'regression-fast' }
+            $calls = @(Get-ChildItem (Join-Path $runRoot 'commands') -Filter '*.invocation.json' | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json })
+            if (@($calls | Where-Object { $_.Path -eq $analyzer }).Count -ne 2 -or @($calls | Where-Object { $_.Path -match 'cmake|lemon|re2c|python' -or $_.Arguments -contains 'worktree' }).Count) { throw 'Fast did not execute exactly the two selected native descriptors with zero preparation calls.' }
+            if ($run -in @('warm', 'advanced')) {
+                $baseRaw = Get-Content (Get-ChildItem (Join-Path $runRoot 'commands') -Filter '*cppcheck*.raw.txt' | Sort-Object Name | Select-Object -Last 1).FullName -Raw
+                if ($baseRaw -notmatch 'skipping analysis - loaded [0-9]+ cached finding\(s\)') { throw 'Recreated Fast stage did not reuse native Base cache.' }
+                if ($result.CachePaths["baseline/src/zdoom.vcxproj/$unit"] -cne $runs[0].CachePaths["baseline/src/zdoom.vcxproj/$unit"]) { throw 'HEAD advance changed the native Base leaf.' }
+            }
+            if (@($result.Head | Where-Object Identifier -eq 'nullPointer').Count -lt 2 -or @($result.Baseline | Where-Object Identifier -eq 'nullPointer').Count -lt 1) { throw 'Native Fast source-only diagnostic fixture was not detected.' }
+        }
+        if (($runs[0].Baseline.Fingerprint -join '|') -cne ($runs[2].Baseline.Fingerprint -join '|')) { throw 'HEAD advance changed Base diagnostics.' }
+        if (($runs[3].Baseline.Fingerprint -join '|') -cne ($runs[4].Baseline.Fingerprint -join '|') -or ($runs[3].Head.Fingerprint -join '|') -cne ($runs[4].Head.Fingerprint -join '|') -or @($runs[3].Baseline | Where-Object { $_.Message -match 'headPointer' }).Count -eq 0) { throw 'Base blob native re-evaluation differs from fresh diagnostics.' }
+        $stage = New-CppcheckDisposableStage -CacheRoot $cache -Name 'regression-fast'
+        $stageSource = Join-Path $stage 'source'
+        Push-Location $source
+        try { Expand-GitArchive -Commit $commits[2] -Destination $stageSource -Evidence $evidence }
+        finally { Pop-Location }
+        try {
+            foreach ($relative in $generatedBundlePaths + $fastSourceGeneratedPaths) { [IO.File]::Copy((Join-Path $source $relative), (Join-Path $stageSource $relative), $true) }
+            $mapped = New-CppcheckFastProject -Project $projects[0] -RepositoryRoot $source -BuildRoot $build -StageSourceRoot $stageSource -ProjectRoot (Join-Path $stage 'project') -AnalyzerVersion $version
+            $header = Join-Path $stageSource 'src/sc_man.h'
+            [IO.File]::AppendAllText($header, "`ninline int fast_fixture_header() { int *headerPointer = 0; return *headerPointer; }`n")
+            $generated = Join-Path $build 'src/sc_man_scanner.h'
+            $generatedBytes = [IO.File]::ReadAllBytes($generated)
+            try {
+                foreach ($scenario in @('header', 'generated', 'context')) {
+                    if ($scenario -eq 'generated') { [IO.File]::AppendAllText($generated, "`n#define FAST_FIXTURE_GENERATED 1`n") }
+                    if ($scenario -eq 'context') {
+                        [xml]$document = [IO.File]::ReadAllText($mapped.ProjectPath)
+                        foreach ($node in $document.SelectNodes("//*[local-name()='PreprocessorDefinitions']")) { $node.InnerText = 'FAST_FIXTURE_CONTEXT;' + $node.InnerText }
+                        $document.Save($mapped.ProjectPath)
+                    }
+                    $scenarioRoot = Join-Path $attemptRoot $scenario
+                    New-Item -ItemType Directory -Force -Path (Join-Path $scenarioRoot 'commands') | Out-Null
+                    $scenarioEvidence = [PSCustomObject]@{ Root = $scenarioRoot; Counter = 0 }
+                    $diagnostics = @()
+                    foreach ($role in @('cached', 'fresh')) {
+                        $leaf = if ($role -eq 'cached') { $runs[2].CachePaths["head/src/zdoom.vcxproj/$unit"] } else { Join-Path $cache ("fresh-$scenario") }
+                        $descriptor = New-CppcheckDescriptor -CppcheckPath $analyzer -ProjectPath $mapped.ProjectPath -CachePath $leaf -RepositoryRoot $stageSource -BuildRoot $build -TargetName 'src/zdoom.vcxproj' -TranslationUnit $unit -Index 0
+                        $descriptor.WorkingDirectory = $stageSource
+                        $descriptor | Add-Member -NotePropertyName DiagnosticFileAliases -NotePropertyValue $state.Aliases
+                        $diagnostics += ,@(Invoke-CppcheckBatch -Descriptors @($descriptor) -CppcheckJobs 1 -Evidence $scenarioEvidence)
+                    }
+                    $diagnostics | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $scenarioRoot 'diagnostics.json')
+                    if (($diagnostics[0].Fingerprint -join '|') -cne ($diagnostics[1].Fingerprint -join '|') -or @($diagnostics[0] | Where-Object Message -match 'headerPointer').Count -eq 0) { throw "Native $scenario re-evaluation differs from fresh diagnostics." }
+                    if ($scenario -eq 'generated' -and @($diagnostics[0] | Where-Object Message -match 'outputPointer').Count -eq 0) { throw 'Changed generated input did not produce its native diagnostic.' }
+                    if ($scenario -eq 'context' -and @($diagnostics[0] | Where-Object Message -match 'contextPointer').Count -eq 0) { throw 'Changed project context did not produce its native diagnostic.' }
+                }
+            }
+            finally { [IO.File]::WriteAllBytes($generated, $generatedBytes) }
+        }
+        finally { Remove-CppcheckDisposableStage -CacheRoot $cache -StageRoot $stage -Name 'regression-fast' }
+        @{ Base = $commits[0]; HEAD = $commits[1]; AdvancedHEAD = $commits[2]; Target = 'src/zdoom.vcxproj'; TU = $unit; Analyzer = $analyzer; AnalyzerSHA256 = $hash; AnalyzerVersion = $version; Receipt = $receipt; ScriptHashes = @(Get-FileHash (Join-Path $RepositoryRoot 'scripts/lint.ps1'), (Join-Path $RepositoryRoot 'scripts/cppcheck-cache.ps1'), (Join-Path $RepositoryRoot 'scripts/test-lint-vendor-dispositions.ps1')) } | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $attemptRoot 'identities.json')
+    }
+    finally { Exit-CppcheckCacheLock -Lock $lock }
+    $auto = Invoke-LintChild -Path (Get-Process -Id $PID).Path -Arguments @('-NoProfile', '-File', (Join-Path $source 'scripts/lint.ps1'), '-BuildDir', 'build-v143', '-BaseSha', $commits[0], '-HeadSha', 'HEAD', '-CppcheckMode', 'Auto', '-CppcheckJobs', '1') -Label 'actual-auto' -WorkingDirectory $source -Evidence $evidence
+    if ($auto.ExitCode -ne 1 -or ($auto.Output -join "`n") -notmatch 'Cppcheck mode: Fast;' -or ($auto.Output -join "`n") -notmatch 'selected TUs=1') { throw "Actual Auto did not use the verified 1TU Fast route: $($auto.Output -join [Environment]::NewLine)" }
+    Write-Host "Real Release|x64 Fast cold/warm/HEAD-advance/Auto: passed ($root)."
+}
+
 function Save-NativeCppcheckCacheEvidence {
     param(
         [string]$FixtureRoot,
@@ -1212,6 +1686,7 @@ $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('zn-vp-' + [guid]::N
 
 try {
     Assert-CppcheckProjectSelection
+    Assert-CppcheckSourceRouting
     $cacheFixtureRoot = Join-Path $fixtureRoot 'cppcheck-cache'
     $contextBuildRoot = Join-Path $fixtureRoot 'context-build'
     $contextProjectPath = Join-Path $contextBuildRoot 'fixture.vcxproj'
@@ -1656,6 +2131,9 @@ try {
     $projectXml = '<Project><PropertyGroup><CLToolExe>clang-cl.exe</CLToolExe></PropertyGroup><PropertyGroup Condition="''$(Configuration)|$(Platform)''==''Release|x64''"><PlatformToolset>v143</PlatformToolset></PropertyGroup><ItemDefinitionGroup Condition="''$(Configuration)|$(Platform)''==''Release|x64''"><ClCompile><PreprocessorDefinitions>RELEASE</PreprocessorDefinitions></ClCompile></ItemDefinitionGroup></Project>'
     Set-Content -LiteralPath $projectPath -Value $projectXml -NoNewline
     Assert-ExpectedException -Expected 'unsupported compiler override' -Action { Get-CppcheckVendorDispositionContext -ProjectPath $projectPath -TargetName 'fixture' -AnalyzerVersion 'Cppcheck 2.21.0' | Out-Null }
+    Assert-CppcheckFastContracts
+    Assert-CppcheckFastSafetyPreflight
+    Assert-CppcheckFastNativeRoute -PreparedFixtureRoot $PreparedNativeFixtureRoot -PreparedCommitFile $PreparedNativeCommitFile
     Write-Host 'cppcheck vendor disposition tests: PASS'
 }
 finally {

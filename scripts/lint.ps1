@@ -5,6 +5,7 @@ param(
     [string]$InputManifest = "",
     [string]$EvidenceDir = "",
     [switch]$PreflightOnly,
+    [ValidateSet('Auto', 'Full')][string]$CppcheckMode = 'Auto',
     [int]$CppcheckJobs = [Math]::Min(12, [Environment]::ProcessorCount)
 )
 
@@ -37,6 +38,7 @@ $generatedBundlePaths = @(
     'src/network/servercommands.cpp'
     'src/network/servercommands.h'
 )
+$fastSourceGeneratedPaths = @('sqlite/sqlite3.c', 'sqlite/sqlite3.h', 'sqlite/sqlite3ext.h', 'src/gitinfo.h')
 
 $generatedBuildInputRules = @(
     [PSCustomObject]@{
@@ -1284,6 +1286,80 @@ function Get-ProjectSources {
     return $projects
 }
 
+function Get-CppcheckGitBytes {
+    param([string]$RepositoryRoot, [string[]]$Arguments, [byte[]]$InputBytes = $null)
+
+    $process = [Diagnostics.Process]::new()
+    $stream = [IO.MemoryStream]::new()
+    try {
+        $process.StartInfo.FileName = 'git'
+        $process.StartInfo.WorkingDirectory = $RepositoryRoot
+        $process.StartInfo.UseShellExecute = $false
+        $process.StartInfo.RedirectStandardOutput = $true
+        $process.StartInfo.RedirectStandardError = $true
+        $process.StartInfo.RedirectStandardInput = $null -ne $InputBytes
+        foreach ($argument in $Arguments) { $process.StartInfo.ArgumentList.Add($argument) }
+        if (-not $process.Start()) { throw 'Could not start Git input reader.' }
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        $outputTask = $process.StandardOutput.BaseStream.CopyToAsync($stream)
+        if ($null -ne $InputBytes) {
+            $process.StandardInput.BaseStream.Write($InputBytes, 0, $InputBytes.Length)
+            $process.StandardInput.Close()
+        }
+        $null = $outputTask.GetAwaiter().GetResult()
+        $process.WaitForExit()
+        $details = $errorTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) { throw "Git input reader failed ($($process.ExitCode)): $details" }
+        return ,$stream.ToArray()
+    }
+    finally { $stream.Dispose(); $process.Dispose() }
+}
+
+function Get-CppcheckTreeChanges {
+    param([string]$RepositoryRoot, [string]$BaseCommit, [string]$HeadCommit)
+
+    $bytes = Get-CppcheckGitBytes -RepositoryRoot $RepositoryRoot -Arguments @('diff', '--name-status', '-z', '--no-ext-diff', '--no-textconv', '-M', '-C', $BaseCommit, $HeadCommit, '--')
+    $fields = [Text.UTF8Encoding]::new($false, $true).GetString($bytes).Split([char]0)
+    for ($index = 0; $index -lt $fields.Length - 1; $index++) {
+        $status = $fields[$index]
+        if ($status -notmatch '^[ACDMRTUXB][0-9]*$') { throw 'Malformed NUL Git diff status.' }
+        $index++
+        if ($index -ge $fields.Length - 1) { throw 'Truncated NUL Git diff path.' }
+        $path = $fields[$index]
+        $oldPath = ''
+        if ($status -match '^[RC]') {
+            $oldPath = $path
+            $index++
+            if ($index -ge $fields.Length - 1) { throw 'Truncated NUL Git rename/copy path.' }
+            $path = $fields[$index]
+        }
+        [PSCustomObject]@{ Status = $status; Path = $path; OldPath = $oldPath }
+    }
+}
+
+function Get-CppcheckSourceRoute {
+    param([object[]]$Changes, [bool]$TrackedDirty = $false)
+
+    $sources = @($Changes | Where-Object { $_.Status -match '^[ACMRT]' -and $_.Path -match '\.(c|cc|cpp|cxx)$' } | ForEach-Object { $_.Path } | Sort-Object -Unique)
+    $unsupported = @($Changes | Where-Object {
+        ($_.Status -eq 'D' -and $_.Path -match '\.(c|cc|cpp|cxx)$') -or
+        ($_.Status -match '^[RC]' -and $_.OldPath -match '\.(c|cc|cpp|cxx)$') -or
+        $_.Path -match '(^|/)(CMakeLists\.txt|[^/]+\.cmake)$|^(tools|protocolspec)/|(^|/)[^/]+\.(in|re|y)$' -or
+        ($_.Status -match '^[RC]' -and $_.OldPath -match '(^|/)(CMakeLists\.txt|[^/]+\.cmake)$|^(tools|protocolspec)/|(^|/)[^/]+\.(in|re|y)$')
+    })
+    $mode = 'Full'
+    $reason = 'receipt validation required'
+    if ($sources.Count -eq 0) {
+        $mode = if ($unsupported.Count) { 'Error' } else { 'Skip' }
+        $reason = if ($unsupported.Count) { 'Build/generator/protocol/deleted-source changes have no selectable TU; this gate does not support an empty analysis.' } else { 'No changed C/C++ TU; headers and documents are not validated by this source gate.' }
+    }
+    elseif ($TrackedDirty) { $reason = 'tracked index/worktree inputs are dirty; Full retains live-worktree semantics' }
+    elseif (@($Changes | Where-Object { $_.Status -ne 'M' -or $_.Path -notmatch '\.(c|cc|cpp|cxx)$' }).Count) { $reason = 'all-diff input is not exclusively existing modified C/C++ TUs' }
+    elseif (@($sources | Where-Object { $_ -notmatch '^src/' -or $_ -match '(^|/)(thirdparty|third_party)/|^src/(huffman|oplsynth|timidity)/|^src/network/servercommands\.cpp$' }).Count) { $reason = 'generator/vendor/generated source requires Full' }
+    else { $mode = 'Candidate'; $reason = 'existing modified source-only inputs' }
+    [PSCustomObject]@{ Mode = $mode; Reason = $reason; Sources = $sources }
+}
+
 function Select-CppcheckProjects {
     param(
         [object[]]$Projects,
@@ -1291,7 +1367,8 @@ function Select-CppcheckProjects {
         [bool]$IsInputManifest,
         [bool]$IsWindowsVisualStudioBuild,
         [string]$BuildDirectory,
-        [scriptblock]$PrepareAnalysis = $null
+        [scriptblock]$PrepareAnalysis = $null,
+        [switch]$SelectedOnly
     )
 
     $selectedProjects = @()
@@ -1306,7 +1383,11 @@ function Select-CppcheckProjects {
 
         if ($projectMatches.Count -ne 0) {
             foreach ($project in $projectMatches) {
-                $project.Files = @($project.Sources.Keys | Sort-Object)
+                $project.Files = if ($SelectedOnly) {
+                    @($ChangedFiles | Where-Object { $project.Sources.ContainsKey($_) } | Sort-Object -Unique)
+                } else {
+                    @($project.Sources.Keys | Sort-Object)
+                }
                 $selectedProjects += $project
             }
 
@@ -1341,6 +1422,298 @@ function Select-CppcheckProjects {
     }
 }
 
+function Assert-CppcheckFastSourceSafety {
+    param([string]$RepositoryRoot, [string]$BuildRoot, [string]$HeadCommit, [string[]]$ChangedFiles, [object[]]$Projects, [string]$BaseCommit = '')
+
+    $treeBytes = Get-CppcheckGitBytes -RepositoryRoot $RepositoryRoot -Arguments @('ls-tree', '-rz', '--full-tree', $HeadCommit)
+    $entries = [Text.UTF8Encoding]::new($false, $true).GetString($treeBytes).Split([char]0, [StringSplitOptions]::RemoveEmptyEntries)
+    $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $entries) {
+        if ($entry -notmatch '^100(644|755) blob [0-9a-f]+\t(?<path>.+)$') { throw [NotSupportedException]::new('Fast tree contains a symlink/submodule or unsupported mode.') }
+        if (-not $paths.Add($Matches.path)) { throw [NotSupportedException]::new('Fast tree contains case-colliding paths.') }
+    }
+    $trackedBytes = [Text.Encoding]::UTF8.GetBytes((@($paths | Sort-Object) -join [char]0) + [char]0)
+    $attributeBytes = Get-CppcheckGitBytes -RepositoryRoot $RepositoryRoot -Arguments @('check-attr', '-z', '--all', '--stdin') -InputBytes $trackedBytes
+    $attributes = [Text.Encoding]::UTF8.GetString($attributeBytes).Split([char]0)
+    for ($index = 0; $index -lt $attributes.Length - 1; $index += 3) {
+        if ($attributes[$index + 1] -in @('filter', 'working-tree-encoding', 'export-ignore', 'export-subst', 'ident') -and $attributes[$index + 2] -notin @('unset', 'unspecified')) {
+            throw [NotSupportedException]::new("Fast archive/input transformation attribute on '$($attributes[$index])'.")
+        }
+    }
+    $indexBytes = Get-CppcheckGitBytes -RepositoryRoot $RepositoryRoot -Arguments @('ls-files', '-v', '-z')
+    if (@([Text.Encoding]::UTF8.GetString($indexBytes).Split([char]0) | Where-Object { $_ -cmatch '^[a-zS] ' }).Count) { throw [NotSupportedException]::new('Fast cannot trust assume-unchanged/sparse tracked inputs.') }
+    $configureInputs = @(Get-Content -LiteralPath (Join-Path $BuildRoot 'CMakeFiles/generate.stamp.depend') | Where-Object { $_ -notmatch '^#' -and -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { [IO.Path]::GetFullPath($_) })
+    foreach ($file in $ChangedFiles) {
+        if ((Join-Path $RepositoryRoot $file) -in $configureInputs) { throw [NotSupportedException]::new("Changed TU is a configure input: '$file'.") }
+    }
+    $topDirectories = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $includeDirectories = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $definedMacros = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($project in $Projects) {
+        $context = Get-CppcheckVendorDispositionContext -ProjectPath $project.ProjectPath -TargetName $project.RelativeProject -AnalyzerVersion ''
+        foreach ($definition in $context.Defines.Split(';')) { [void]$definedMacros.Add(($definition -split '=')[0]) }
+        foreach ($source in $project.Sources.Keys) {
+            if ($source -match '^[^/]+/' -and -not $source.StartsWith(([IO.Path]::GetFileName($BuildRoot) + '/'))) { [void]$topDirectories.Add(($source -split '/')[0]) }
+        }
+        [xml]$document = [IO.File]::ReadAllText($project.ProjectPath)
+        foreach ($node in $document.SelectNodes("//*[local-name()='AdditionalIncludeDirectories']")) {
+            foreach ($include in $node.InnerText.Split(';')) {
+                if ($include -eq '%(AdditionalIncludeDirectories)' -or [string]::IsNullOrWhiteSpace($include)) { continue }
+                if ($include -match '\$\(|%\(') { throw [NotSupportedException]::new("Unknown Fast include macro '$include'.") }
+                $fullPath = [IO.Path]::GetFullPath($include, (Split-Path $project.ProjectPath))
+                [void]$includeDirectories.Add($fullPath)
+                if ($null -ne (Get-PathRelativeToRoot -Path $fullPath -RootPath $BuildRoot)) { continue }
+                $relative = Get-PathRelativeToRoot -Path $fullPath -RootPath $RepositoryRoot
+                if ($null -ne $relative) {
+                    if ([string]::IsNullOrWhiteSpace($relative)) { throw [NotSupportedException]::new('Fast cannot classify source-root-wide untracked includes.') }
+                    [void]$topDirectories.Add(($relative -split '/')[0])
+                }
+            }
+        }
+    }
+    foreach ($ignored in @($false, $true)) {
+        $arguments = @('ls-files', '-z', '--others', '--exclude-standard')
+        if ($ignored) { $arguments += '--ignored' }
+        $bytes = Get-CppcheckGitBytes -RepositoryRoot $RepositoryRoot -Arguments ($arguments + @('--') + @($topDirectories | Sort-Object))
+        foreach ($path in [Text.Encoding]::UTF8.GetString($bytes).Split([char]0, [StringSplitOptions]::RemoveEmptyEntries)) {
+            if ($path -match '^sqlite/sqlite-(?:[0-9a-f]{40}|autoconf-[0-9]+)\.tar\.gz$') { continue }
+            if ($path -notin ($generatedBundlePaths + $fastSourceGeneratedPaths)) { throw [NotSupportedException]::new("Unclassified untracked Fast analysis input '$path'.") }
+        }
+    }
+    $changedNames = @($ChangedFiles | ForEach-Object { [IO.Path]::GetFileName($_) })
+    $inputs = @{}
+    $pending = [Collections.Generic.Queue[object]]::new()
+    foreach ($path in @($paths | Where-Object { ($_ -split '/')[0] -in $topDirectories -and $_ -match '\.(h|hh|hpp|hxx|inc|c|cc|cpp|cxx|in|re|y)$' })) { $pending.Enqueue(@{ Path = $path; Commit = '' }) }
+    foreach ($path in $generatedBundlePaths + $fastSourceGeneratedPaths) {
+        if (Test-Path -LiteralPath (Join-Path $RepositoryRoot $path) -PathType Leaf) { $pending.Enqueue(@{ Path = $path; Commit = '' }) }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($BaseCommit)) {
+        foreach ($file in @($Projects | ForEach-Object { $_.Files } | Sort-Object -Unique)) { $pending.Enqueue(@{ Path = $file; Commit = $BaseCommit }) }
+    }
+    while ($pending.Count) {
+        $pendingInput = $pending.Dequeue()
+        $path = $pendingInput.Path
+        $inputKey = "$($pendingInput.Commit):$path"
+        if ($inputs.ContainsKey($inputKey)) { continue }
+        $inputPath = if ([IO.Path]::IsPathRooted($path)) { $path } else { Join-Path $RepositoryRoot $path }
+        Assert-CppcheckPathHasNoReparseAncestor -Path $inputPath
+        $text = if ($pendingInput.Commit) {
+            try { [Text.UTF8Encoding]::new($false, $true).GetString((Get-CppcheckGitBytes -RepositoryRoot $RepositoryRoot -Arguments @('cat-file', 'blob', "$($pendingInput.Commit):$path"))).TrimStart([char]0xFEFF) }
+            catch [Text.DecoderFallbackException] { throw [NotSupportedException]::new("Unsupported Fast Base source encoding in '$path'.") }
+        } else { [IO.File]::ReadAllText($inputPath) }
+        $text = $text -replace '\\\r?\n', ''
+        $text = [regex]::Replace($text, '(?ms)(?<literal>"(?:\\.|[^"\\])*"|''(?:\\.|[^''\\])*''|^[ \t]*#[ \t]*include[ \t]*<[^>\r\n]+>)|/\*.*?\*/|//[^\r\n]*', {
+            param($match)
+            if ($match.Groups['literal'].Success) { return $match.Value }
+            return ' ' + ([regex]::Replace($match.Value, '[^\r\n]', ''))
+        })
+        $inputs[$inputKey] = $text
+        foreach ($definition in [regex]::Matches($text, '(?m)^\s*#\s*define\s+(?<name>[A-Za-z_][A-Za-z_0-9]*)')) { [void]$definedMacros.Add($definition.Groups['name'].Value) }
+        foreach ($match in [regex]::Matches($text, '(?m)^\s*#\s*include\s*["<](?<path>[^">]+)[">]')) {
+            $included = $match.Groups['path'].Value.Replace('\', '/')
+            if ($included -match '\.(c|cc|cpp|cxx)$' -and [IO.Path]::GetFileName($included) -in $changedNames) { throw [NotSupportedException]::new("Changed source is textually included by '$path'.") }
+            if ([IO.Path]::IsPathRooted($included)) {
+                $absolute = [IO.Path]::GetFullPath($included)
+                if ($null -ne (Get-PathRelativeToRoot -Path $absolute -RootPath $RepositoryRoot) -and $null -eq (Get-PathRelativeToRoot -Path $absolute -RootPath $BuildRoot)) { throw [NotSupportedException]::new("Literal include reads live source root: '$included' in '$path'.") }
+            }
+            if ($included -eq 'xlat_parser.c' -and $path -eq 'src/xlat/parse_xlat.cpp') {
+                $generated = Join-Path $BuildRoot 'src/xlat_parser.c'
+                if (-not (Test-Path -LiteralPath $generated -PathType Leaf)) { throw [NotSupportedException]::new("Missing approved generated source inclusion '$generated'; Full required.") }
+                Assert-NormalGeneratedBuildInput -Path $generated -Description 'known generated source inclusion'
+                $pending.Enqueue(@{ Path = $generated; Commit = '' })
+                continue
+            }
+            $resolved = $false
+            foreach ($directory in @((Split-Path $inputPath)) + @($includeDirectories)) {
+                $candidate = [IO.Path]::GetFullPath($included, $directory)
+                $relative = Get-PathRelativeToRoot -Path $candidate -RootPath $RepositoryRoot
+                if ($null -ne (Get-PathRelativeToRoot -Path $candidate -RootPath $BuildRoot)) {
+                    if (Test-Path -LiteralPath $candidate -PathType Leaf) { $resolved = $true; $pending.Enqueue(@{ Path = $candidate; Commit = '' }); break }
+                    continue
+                }
+                if ($null -eq $relative) { continue }
+                if (-not $resolved -and $null -ne (Get-PathRelativeToRoot -Path $directory -RootPath $BuildRoot) -and ($paths.Contains($relative) -or (Test-Path -LiteralPath $candidate -PathType Leaf))) {
+                    throw [NotSupportedException]::new("Shared build include reads live source root: '$included' in '$path'.")
+                }
+                if ($paths.Contains($relative)) { $resolved = $true; $pending.Enqueue(@{ Path = $relative; Commit = '' }); break }
+                elseif (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                    if ($relative -notin ($generatedBundlePaths + $fastSourceGeneratedPaths)) { throw [NotSupportedException]::new("Unclassified include input '$relative' in '$path'.") }
+                    $resolved = $true
+                    break
+                }
+            }
+            if (-not $resolved -and $included -match '\.(c|cc|cpp|cxx)$') {
+                throw [NotSupportedException]::new("Unresolved source inclusion '$included' in '$path'.")
+            }
+        }
+    }
+    foreach ($path in $inputs.Keys) {
+        $text = $inputs[$path]
+        if ($text -match '(?m)^\s*#\s*(include_next|import)\b') { throw [NotSupportedException]::new("Unsupported include directive in '$path'.") }
+        foreach ($match in [regex]::Matches($text, '(?m)^\s*#\s*include\s+(?<operand>[^"<\s][^\r\n]*)')) {
+            $operand = $match.Groups['operand'].Value.Trim()
+            $prefix = $text.Substring(0, $match.Index).TrimEnd()
+            $guard = '(?:^|\n)[ \t]*#[ \t]*(?:ifdef[ \t]+' + [regex]::Escape($operand) + '|(?:if|elif)[ \t]+defined[ \t]*\(?[ \t]*' + [regex]::Escape($operand) + '[ \t]*\)?)[ \t]*$'
+            if ($operand -match '^[A-Za-z_][A-Za-z_0-9]*$' -and -not $definedMacros.Contains($operand) -and $prefix -match $guard) { continue }
+            throw [NotSupportedException]::new("Unresolved macro source/include operand '$operand' in '$path'.")
+        }
+    }
+}
+
+function Get-CppcheckPreparationState {
+    param([string]$RepositoryRoot, [string]$BuildRoot, [object[]]$Projects, [string]$AnalyzerVersion)
+
+    $RepositoryRoot = [IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\', '/')
+    $BuildRoot = [IO.Path]::GetFullPath($BuildRoot).TrimEnd('\', '/')
+    $inputPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $cacheHome = Get-CMakeCacheSetting -CachePath (Join-Path $BuildRoot 'CMakeCache.txt') -Name 'CMAKE_HOME_DIRECTORY'
+    if ($null -eq $cacheHome -or [IO.Path]::GetFullPath($cacheHome.Value).TrimEnd('\', '/') -ine $RepositoryRoot.TrimEnd('\', '/')) { throw [NotSupportedException]::new('HEAD build does not belong to the selected repository root.') }
+    $tracked = Get-CppcheckGitBytes -RepositoryRoot $RepositoryRoot -Arguments @('ls-files', '-z')
+    foreach ($path in [Text.Encoding]::UTF8.GetString($tracked).Split([char]0, [StringSplitOptions]::RemoveEmptyEntries)) {
+        if ($path -match '(^|/)CMakeLists\.txt$|\.(cmake|in|re|y)$|^(protocolspec|tools/lemon|tools/re2c|tools/updaterevision)/') { [void]$inputPaths.Add((Join-Path $RepositoryRoot $path)) }
+    }
+    [void]$inputPaths.Add((Join-Path $BuildRoot 'CMakeCache.txt'))
+    $dependencyPath = Join-Path $BuildRoot 'CMakeFiles/generate.stamp.depend'
+    Assert-NormalGeneratedBuildInput -Path $dependencyPath -Description 'CMake configure dependency inventory'
+    [void]$inputPaths.Add($dependencyPath)
+    foreach ($path in Get-Content -LiteralPath $dependencyPath) {
+        if (-not [string]::IsNullOrWhiteSpace($path) -and $path -notmatch '^#') {
+            $fullPath = [IO.Path]::GetFullPath($path)
+            if (Test-Path -LiteralPath $fullPath -PathType Leaf) { [void]$inputPaths.Add($fullPath) }
+            else { throw "Missing configure input '$fullPath'." }
+        }
+    }
+    $projectStates = @(foreach ($project in @($Projects | Sort-Object RelativeProject)) {
+        [void]$inputPaths.Add($project.ProjectPath)
+        $context = Get-CppcheckVendorDispositionContext -ProjectPath $project.ProjectPath -TargetName $project.RelativeProject -AnalyzerVersion $AnalyzerVersion
+        [PSCustomObject]@{
+            Target = $project.RelativeProject
+            Context = ConvertTo-NormalizedCppcheckProjectContext -Context $context -ProjectPath $project.ProjectPath -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot -ResolveIncludePaths
+            TranslationUnits = @($project.Sources.Keys | Sort-Object)
+        }
+    })
+    $commands = @(Get-GeneratedBuildInputCommands -BuildRoot $BuildRoot)
+    foreach ($command in $commands) { foreach ($path in $command.InputPaths) { [void]$inputPaths.Add($path) } }
+    $generatedPaths = @($commands | ForEach-Object { $_.RelativeOutputs } | ForEach-Object { Join-Path $BuildRoot $_ })
+    foreach ($path in $generatedPaths + @(($generatedBundlePaths + $fastSourceGeneratedPaths) | ForEach-Object { Join-Path $RepositoryRoot $_ })) { [void]$inputPaths.Add($path) }
+    foreach ($path in @('src/xlat_parser.y', 'tools/lemon/Release/lemon.exe', 'tools/lemon/Release/lempar.c', 'tools/re2c/Release/re2c.exe', 'tools/updaterevision/Release/updaterevision.exe')) {
+        $fullPath = Join-Path $BuildRoot $path
+        if ($path -like '*lempar.c' -and -not (Test-Path -LiteralPath $fullPath)) { $fullPath = Join-Path $RepositoryRoot 'tools/lemon/lempar.c' }
+        [void]$inputPaths.Add($fullPath)
+    }
+    foreach ($file in Get-ChildItem -LiteralPath $BuildRoot -Recurse -File -Include '*.h', '*.hpp', '*.inc', '*.c', '*.cpp') { [void]$inputPaths.Add($file.FullName) }
+    $python = Get-CMakePythonExecutable -CachePath (Join-Path $BuildRoot 'CMakeCache.txt')
+    if ([string]::IsNullOrWhiteSpace($python)) { throw 'Fast receipt requires the configured Python executable.' }
+    [void]$inputPaths.Add($python)
+    [void]$inputPaths.Add((Get-Command cmake -ErrorAction Stop).Source)
+    $inputs = @(foreach ($path in @($inputPaths | Sort-Object)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw [NotSupportedException]::new("Missing receipt preparation input '$path'; Full required.") }
+        Assert-CppcheckPathHasNoReparseAncestor -Path $path
+        Assert-NormalGeneratedBuildInput -Path $path -Description 'Fast preparation input'
+        [PSCustomObject]@{ Path = [IO.Path]::GetFullPath($path); SHA256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+    })
+    $aliases = @(Get-CppcheckGeneratedDiagnosticAliases -GeneratedPaths $generatedPaths -InputPaths @((Join-Path $RepositoryRoot 'src/sc_man_scanner.re'), (Join-Path $RepositoryRoot 'src/xlat/xlat_parser.y')) -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot)
+    [PSCustomObject]@{ MappingVersion = 1; Representation = 'git-archive/raw-base-blob-v1'; BuildRoot = $BuildRoot; Projects = $projectStates; Commands = $commands; Inputs = $inputs; Aliases = $aliases }
+}
+
+function Assert-CppcheckPreparationState {
+    param([object]$Expected, [object]$Actual)
+
+    if (($Expected | ConvertTo-Json -Compress -Depth 16) -cne ($Actual | ConvertTo-Json -Compress -Depth 16)) { throw 'Fast preparation context/input/output changed.' }
+}
+
+function New-CppcheckPreparationReceipt {
+    param([object]$State, [string]$HeadCommit, [string]$RepositoryRoot, [string]$BuildRoot, [object[]]$Projects, [object[]]$BaselineProjects, [string]$BaselineRoot, [string]$BaselineBuildRoot, [string]$AnalyzerVersion)
+
+    foreach ($project in $Projects) {
+        $baseline = @($BaselineProjects | Where-Object RelativeProject -eq $project.RelativeProject)
+        if ($baseline.Count -ne 1) { throw 'Receipt requires an exact baseline target.' }
+        $expected = Get-CppcheckVendorDispositionContext -ProjectPath $project.ProjectPath -TargetName $project.RelativeProject -AnalyzerVersion $AnalyzerVersion
+        $actual = Get-CppcheckVendorDispositionContext -ProjectPath $baseline[0].ProjectPath -TargetName $project.RelativeProject -AnalyzerVersion $AnalyzerVersion
+        Assert-EqualCppcheckProjectContext -Expected (ConvertTo-NormalizedCppcheckProjectContext -Context $expected -ProjectPath $project.ProjectPath -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot -ResolveIncludePaths) -Actual (ConvertTo-NormalizedCppcheckProjectContext -Context $actual -ProjectPath $baseline[0].ProjectPath -RepositoryRoot $BaselineRoot -BuildRoot $BaselineBuildRoot -ResolveIncludePaths) -Description 'receipt HEAD/baseline parity'
+        $headUnits = @($project.Sources.Values | ForEach-Object { Get-RepositoryRelativePath -Path $_ -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot })
+        $baseUnits = @($baseline[0].Sources.Values | ForEach-Object { Get-RepositoryRelativePath -Path $_ -RepositoryRoot $BaselineRoot -BuildRoot $BaselineBuildRoot })
+        Assert-EqualTranslationUnitSet -Expected $headUnits -Actual $baseUnits -Description 'receipt HEAD/baseline full TU parity'
+    }
+    foreach ($path in @('sqlite/sqlite3.c', 'sqlite/sqlite3.h', 'sqlite/sqlite3ext.h')) {
+        if ((Get-FileHash -LiteralPath (Join-Path $RepositoryRoot $path)).Hash -ne (Get-FileHash -LiteralPath (Join-Path $BaselineRoot $path)).Hash) { throw "Receipt configure-generated input parity differs: '$path'." }
+    }
+    $revision = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src/gitinfo.h'))
+    if ($revision -notmatch ('(?m)^// ' + [regex]::Escape($HeadCommit) + '\s*$')) { throw 'Receipt revision input is not generated from clean HEAD.' }
+    [PSCustomObject]@{ SchemaVersion = 1; Anchor = $HeadCommit; PreparationVerified = $true; State = $State }
+}
+
+function Assert-CppcheckFastLiveHead {
+    param([string]$RepositoryRoot, [string]$HeadCommit)
+
+    $head = [Text.Encoding]::UTF8.GetString((Get-CppcheckGitBytes -RepositoryRoot $RepositoryRoot -Arguments @('rev-parse', '--verify', 'HEAD^{commit}'))).Trim()
+    $dirty = Get-CppcheckGitBytes -RepositoryRoot $RepositoryRoot -Arguments @('status', '--porcelain=v1', '-z', '--untracked-files=no')
+    if ($head -ne $HeadCommit -or $dirty.Length) { throw 'Fast live HEAD/index/tracked inputs changed during the run.' }
+}
+
+function Invoke-CppcheckFastAnalysis {
+    param([string]$RepositoryRoot, [string]$BuildRoot, [object[]]$Projects, [object]$State, [string]$HeadCommit, [string]$BaseCommit, [string]$TempRoot, [string]$CacheRoot, [string]$CppcheckPath, [string]$AnalyzerVersion, [string]$AnalyzerSHA256, [int]$CppcheckJobs, [object]$Evidence = $null)
+
+    $sourceRoot = Join-Path $TempRoot 'source'
+    Assert-CppcheckFastLiveHead -RepositoryRoot $RepositoryRoot -HeadCommit $HeadCommit
+    Assert-CppcheckPreparationState -Expected $State -Actual (Get-CppcheckPreparationState -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot -Projects $Projects -AnalyzerVersion $AnalyzerVersion)
+    Push-Location -LiteralPath $RepositoryRoot
+    try { Expand-GitArchive -Commit $HeadCommit -Destination $sourceRoot -Evidence $Evidence }
+    finally { Pop-Location }
+    foreach ($relative in $generatedBundlePaths + $fastSourceGeneratedPaths) {
+        $inputPath = Join-Path $RepositoryRoot $relative
+        $verifiedInput = @($State.Inputs | Where-Object Path -eq $inputPath)
+        if ($verifiedInput.Count -ne 1) { throw "Fast generated input not verified: '$relative'." }
+        Copy-VerifiedGeneratedBundle -VerifiedBundle @([PSCustomObject]@{ RelativePath = $relative; GeneratedPath = $inputPath; Hash = $verifiedInput[0].SHA256 }) -DestinationRoot $sourceRoot
+    }
+    $mappedProjects = @(foreach ($project in $Projects) {
+        New-CppcheckFastProject -Project $project -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot -StageSourceRoot $sourceRoot -ProjectRoot (Join-Path $TempRoot 'project') -AnalyzerVersion $AnalyzerVersion
+    })
+    $headBatch = [Collections.Generic.List[object]]::new()
+    $baseBatch = [Collections.Generic.List[object]]::new()
+    $identities = @{}
+    $leaves = @{}
+    $contexts = @{}
+    $cfgPaths = @(Get-CppcheckInstalledConfigurationPaths -AnalyzerPath $CppcheckPath)
+    foreach ($project in $Projects) {
+        $target = $project.RelativeProject
+        $contexts[$target] = Get-CppcheckVendorDispositionContext -ProjectPath $project.ProjectPath -TargetName $target -AnalyzerVersion $AnalyzerVersion
+        $fastContext = Get-CppcheckRegressionAnalysisContext -BuildRoot $BuildRoot -RepositoryRoot $RepositoryRoot -ProjectPath $project.ProjectPath -InputRootIdentities @('regression-fast-head-context') -AnalyzerConfigurationPaths $cfgPaths -AnalyzerOptions @('--project-configuration=Release|x64', '--enable=warning,performance,portability')
+        $fastContext | Add-Member -NotePropertyName FastContract -NotePropertyValue ([PSCustomObject]@{ Version = 1; Representation = $State.Representation; SharedInputs = $State.Inputs })
+        $fastIdentity = Get-CppcheckCacheIdentity -AnalyzerVersion $AnalyzerVersion -AnalyzerSHA256 $AnalyzerSHA256 -InputMode 'normal-fast-head-context' -Configuration $contexts[$target].Configuration -Compiler $contexts[$target].Compiler -Toolset $contexts[$target].Toolset -Abi $contexts[$target].Abi -RootIdentity 'regression-fast-head-context-v1' -AnalysisContext $fastContext
+        Save-CppcheckCacheIdentity -CacheRoot $CacheRoot -Namespace 'regression' -Identity $fastIdentity
+        $mapped = $mappedProjects | Where-Object RelativeProject -eq $target | Select-Object -First 1
+        foreach ($unit in $project.Files) {
+            $headBytes = Get-CppcheckGitBytes -RepositoryRoot $RepositoryRoot -Arguments @('cat-file', 'blob', "${HeadCommit}:$unit")
+            if ((Get-ByteSHA256 -Bytes ([IO.File]::ReadAllBytes((Join-Path $sourceRoot $unit)))) -ne (Get-ByteSHA256 -Bytes $headBytes)) { throw "Fast archive TU bytes differ from HEAD: '$unit'." }
+            foreach ($role in @('head', 'baseline')) {
+                $batch = $headBatch
+                if ($role -eq 'baseline') { $batch = $baseBatch }
+                $leaf = Get-CppcheckCacheLeaf -CacheRoot $CacheRoot -Namespace 'regression' -Identity $fastIdentity -Role $role -TargetName $target -TranslationUnit $unit
+                $descriptor = New-CppcheckDescriptor -CppcheckPath $CppcheckPath -ProjectPath $mapped.ProjectPath -CachePath $leaf -RepositoryRoot $sourceRoot -BuildRoot $BuildRoot -TargetName $target -TranslationUnit $unit -Index $batch.Count
+                $descriptor.WorkingDirectory = $sourceRoot
+                $descriptor | Add-Member -NotePropertyName DiagnosticFileAliases -NotePropertyValue @($State.Aliases)
+                $batch.Add($descriptor)
+                $leaves["$role/$target/$unit"] = $leaf
+                $identities["$role/$target"] = $fastIdentity
+            }
+        }
+    }
+    if (($headBatch | ForEach-Object { "$($_.TargetName)|$($_.TranslationUnit)" } | ConvertTo-Json -Compress) -cne ($baseBatch | ForEach-Object { "$($_.TargetName)|$($_.TranslationUnit)" } | ConvertTo-Json -Compress)) { throw 'Fast selected HEAD/Base descriptor sets differ.' }
+    if ($null -ne $Evidence) {
+        @{ HEAD = $headBatch.ToArray(); Base = $baseBatch.ToArray(); State = $State; HeadCommit = $HeadCommit; BaseCommit = $BaseCommit } | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath (Join-Path $Evidence.Root 'fast-inputs.json')
+    }
+    $preparationElapsed = $script:lintTotalTimer.Elapsed.TotalMilliseconds
+    $analyzerTimer = [Diagnostics.Stopwatch]::StartNew()
+    $fastHeadDiagnostics = @(Invoke-CppcheckBatch -Descriptors $headBatch.ToArray() -CppcheckJobs $CppcheckJobs -Evidence $Evidence)
+    Set-CppcheckBaseBlobs -RepositoryRoot $RepositoryRoot -BaseCommit $BaseCommit -Files @($Projects | ForEach-Object { $_.Files } | Sort-Object -Unique) -StageSourceRoot $sourceRoot
+    $fastBaseDiagnostics = @(Invoke-CppcheckBatch -Descriptors $baseBatch.ToArray() -CppcheckJobs $CppcheckJobs -Evidence $Evidence)
+    $analyzerTimer.Stop()
+    Assert-CppcheckPreparationState -Expected $State -Actual (Get-CppcheckPreparationState -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot -Projects $Projects -AnalyzerVersion $AnalyzerVersion)
+    Assert-CppcheckFastLiveHead -RepositoryRoot $RepositoryRoot -HeadCommit $HeadCommit
+    [PSCustomObject]@{ Head = $fastHeadDiagnostics; Baseline = $fastBaseDiagnostics; Contexts = $contexts; Identities = $identities; CachePaths = $leaves; Projects = $mappedProjects; PreparationMilliseconds = $preparationElapsed; AnalyzerMilliseconds = $analyzerTimer.Elapsed.TotalMilliseconds }
+}
+
 function Assert-EqualCppcheckProjectContext {
     param(
         [object]$Expected,
@@ -1360,7 +1733,8 @@ function ConvertTo-NormalizedCppcheckProjectContext {
         [object]$Context,
         [string]$ProjectPath,
         [string]$RepositoryRoot,
-        [string]$BuildRoot
+        [string]$BuildRoot,
+        [switch]$ResolveIncludePaths
     )
 
     $normalized = [PSCustomObject]@{}
@@ -1375,7 +1749,7 @@ function ConvertTo-NormalizedCppcheckProjectContext {
         $normalized | Add-Member -NotePropertyName $property -NotePropertyValue $value
     }
 
-    $normalized | Add-Member -NotePropertyName AdditionalIncludeDirectories -NotePropertyValue (Get-NormalizedCppcheckAdditionalIncludeDirectories -ProjectPath $ProjectPath -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot)
+    $normalized | Add-Member -NotePropertyName AdditionalIncludeDirectories -NotePropertyValue (Get-NormalizedCppcheckAdditionalIncludeDirectories -ProjectPath $ProjectPath -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot -ResolvePaths:$ResolveIncludePaths)
 
     return $normalized
 }
@@ -1400,7 +1774,8 @@ function Get-NormalizedCppcheckAdditionalIncludeDirectories {
     param(
         [string]$ProjectPath,
         [string]$RepositoryRoot,
-        [string]$BuildRoot
+        [string]$BuildRoot,
+        [switch]$ResolvePaths
     )
 
     $project = New-Object System.Xml.XmlDocument
@@ -1419,7 +1794,11 @@ function Get-NormalizedCppcheckAdditionalIncludeDirectories {
     $value = if ($includeDirectories.Count -eq 1) { $includeDirectories[0] } else { '' }
 
     return (@($value -split ';' | ForEach-Object {
-        ConvertTo-NormalizedCppcheckPathValue -Value $_ -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot
+        $include = $_
+        if ($ResolvePaths -and -not [string]::IsNullOrWhiteSpace($include) -and $include -notmatch '%\(|\$\(') {
+            $include = [IO.Path]::GetFullPath($include, (Split-Path $ProjectPath))
+        }
+        ConvertTo-NormalizedCppcheckPathValue -Value $include -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot
     }) -join ';')
 }
 
@@ -1462,6 +1841,115 @@ function Assert-EqualTranslationUnitSet {
 
     if ($difference.Count -ne 0) {
         throw "Cppcheck translation-unit selection mismatch for $Description."
+    }
+}
+
+function ConvertTo-CppcheckStagePath {
+    param([string]$Path, [string]$ProjectDirectory, [string]$RepositoryRoot, [string]$BuildRoot, [string]$StageSourceRoot)
+
+    if ($Path -match '\$\(|%\(') { throw [NotSupportedException]::new("Unknown Fast path macro '$Path'.") }
+    $fullPath = [IO.Path]::GetFullPath($Path, $ProjectDirectory)
+    $buildRelative = Get-PathRelativeToRoot -Path $fullPath -RootPath $BuildRoot
+    if ($null -ne $buildRelative) { return $fullPath }
+    $sourceRelative = Get-PathRelativeToRoot -Path $fullPath -RootPath $RepositoryRoot
+    if ($null -ne $sourceRelative) { return [IO.Path]::GetFullPath((Join-Path $StageSourceRoot $sourceRelative)) }
+    return $fullPath
+}
+
+function New-CppcheckFastProject {
+    param([object]$Project, [string]$RepositoryRoot, [string]$BuildRoot, [string]$StageSourceRoot, [string]$ProjectRoot, [string]$AnalyzerVersion)
+
+    $originalContext = Get-CppcheckVendorDispositionContext -ProjectPath $Project.ProjectPath -TargetName $Project.RelativeProject -AnalyzerVersion $AnalyzerVersion
+    $document = [Xml.XmlDocument]::new()
+    $document.PreserveWhitespace = $true
+    $document.Load($Project.ProjectPath)
+    $projectDirectory = Split-Path -Parent $Project.ProjectPath
+    foreach ($item in $document.SelectNodes("//*[local-name()='ItemGroup']/*[local-name()='ClCompile']")) {
+        $originalPath = [IO.Path]::GetFullPath($item.GetAttribute('Include'), $projectDirectory)
+        if ($null -eq (Get-PathRelativeToRoot -Path $originalPath -RootPath $RepositoryRoot) -and $null -eq (Get-PathRelativeToRoot -Path $originalPath -RootPath $BuildRoot)) { throw [NotSupportedException]::new('Fast cannot isolate an external TU path.') }
+        $item.SetAttribute('Include', (ConvertTo-CppcheckStagePath -Path $item.GetAttribute('Include') -ProjectDirectory $projectDirectory -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot -StageSourceRoot $StageSourceRoot))
+    }
+    foreach ($node in $document.SelectNodes("//*[local-name()='ClCompile']/*[local-name()='AdditionalIncludeDirectories']")) {
+        $includes = @(foreach ($include in $node.InnerText.Split(';')) {
+            if ($include -eq '%(AdditionalIncludeDirectories)' -or [string]::IsNullOrWhiteSpace($include)) { $include; continue }
+            ConvertTo-CppcheckStagePath -Path $include -ProjectDirectory $projectDirectory -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot -StageSourceRoot $StageSourceRoot
+        })
+        $node.InnerText = $includes -join ';'
+    }
+    foreach ($node in $document.SelectNodes("//*[local-name()='ClCompile']/*[local-name()='PreprocessorDefinitions']")) {
+        if (($node.InnerText -replace '%\(PreprocessorDefinitions\)', '') -match '\$\(|%\(') { throw 'Unknown Fast define macro.' }
+        $value = ConvertTo-NormalizedCppcheckPathValue -Value $node.InnerText -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot
+        $node.InnerText = $value.Replace('<source>', $StageSourceRoot.Replace('\', '/')).Replace('<build>', $BuildRoot.Replace('\', '/'))
+    }
+    $destination = Join-Path $ProjectRoot $Project.RelativeProject
+    New-Item -ItemType Directory -Force -Path (Split-Path $destination) | Out-Null
+    $document.Save($destination)
+    $mappedContext = Get-CppcheckVendorDispositionContext -ProjectPath $destination -TargetName $Project.RelativeProject -AnalyzerVersion $AnalyzerVersion
+    $expectedContext = ConvertTo-NormalizedCppcheckProjectContext -Context $originalContext -ProjectPath $Project.ProjectPath -RepositoryRoot $RepositoryRoot -BuildRoot $BuildRoot -ResolveIncludePaths
+    $actualContext = ConvertTo-NormalizedCppcheckProjectContext -Context $mappedContext -ProjectPath $destination -RepositoryRoot $StageSourceRoot -BuildRoot $BuildRoot -ResolveIncludePaths
+    Assert-EqualCppcheckProjectContext -Expected $expectedContext -Actual $actualContext -Description 'Fast HEAD XML path mapping'
+    $sources = @{}
+    foreach ($item in $document.SelectNodes("//*[local-name()='ItemGroup']/*[local-name()='ClCompile']")) {
+        $path = $item.GetAttribute('Include')
+        $root = if ($null -ne (Get-PathRelativeToRoot -Path $path -RootPath $BuildRoot)) { $RepositoryRoot } else { $StageSourceRoot }
+        $sources[(Get-RepositoryRelativePath -Path $path -RepositoryRoot $root)] = $path
+    }
+    Assert-EqualTranslationUnitSet -Expected @($Project.Sources.Keys) -Actual @($sources.Keys) -Description 'Fast entire project TU mapping'
+    [PSCustomObject]@{ RelativeProject = $Project.RelativeProject; ProjectPath = $destination; Sources = $sources; Files = @($Project.Files) }
+}
+
+function Get-CppcheckGeneratedDiagnosticAliases {
+    param([string[]]$GeneratedPaths, [string[]]$InputPaths, [string]$RepositoryRoot, [string]$BuildRoot)
+
+    $aliases = [Collections.Generic.List[object]]::new()
+    foreach ($generatedPath in $GeneratedPaths) {
+        Assert-NormalGeneratedBuildInput -Path $generatedPath -Description 'Fast generated diagnostic input'
+        foreach ($match in [regex]::Matches([IO.File]::ReadAllText($generatedPath), '(?m)^\s*#\s*(?:line\s+)?[0-9]+\s+"(?<path>[^"]+)"')) {
+            $path = $match.Groups['path'].Value
+            if (-not [IO.Path]::IsPathRooted($path)) {
+                if ($path -in @('xlat_parser.y', 'xlat_parser.c', 'xlat_parser.h', 'sc_man_scanner.h')) { continue }
+                throw [NotSupportedException]::new("Unknown generated #line path '$path'.")
+            }
+            $fullPath = [IO.Path]::GetFullPath($path)
+            if ($fullPath -in $GeneratedPaths) { continue }
+            $relative = Get-PathRelativeToRoot -Path $fullPath -RootPath $RepositoryRoot
+            if ($null -eq $relative -or $fullPath -notin $InputPaths) { throw [NotSupportedException]::new("Unknown generated #line input '$path'.") }
+            Assert-NormalGeneratedBuildInput -Path $fullPath -Description 'Fast #line source input'
+            $aliases.Add([PSCustomObject]@{
+                AbsolutePath = $path; RelativePath = $relative
+                InputPath = $fullPath; InputSHA256 = (Get-FileHash -LiteralPath $fullPath).Hash
+                GeneratedPath = $generatedPath; GeneratedSHA256 = (Get-FileHash -LiteralPath $generatedPath).Hash
+            })
+        }
+    }
+    return @($aliases.ToArray() | Sort-Object AbsolutePath, GeneratedPath -Unique)
+}
+
+function ConvertTo-CppcheckAliasedOutput {
+    param([string[]]$Output, [object[]]$Aliases, [string]$StageSourceRoot)
+
+    foreach ($line in $Output) {
+        $separator = $line.IndexOf("`t")
+        if ($separator -gt 0) {
+            $file = $line.Substring(0, $separator)
+            $alias = @($Aliases | Where-Object { $_.AbsolutePath -ceq $file -or $_.InputPath -ceq $file } | Select-Object -First 1)
+            if ($alias.Count) { $line = (Join-Path $StageSourceRoot $alias[0].RelativePath) + $line.Substring($separator) }
+        }
+        $line
+    }
+}
+
+function Set-CppcheckBaseBlobs {
+    param([string]$RepositoryRoot, [string]$BaseCommit, [string[]]$Files, [string]$StageSourceRoot)
+
+    foreach ($file in @($Files | Sort-Object -Unique)) {
+        $relative = ConvertTo-SafeRelativePath -Path $file -Description 'Fast Base TU'
+        $destination = Join-Path $StageSourceRoot $relative
+        Assert-NormalPathWithinRoot -Path $destination -RootPath $StageSourceRoot -Description 'Fast Base TU overlay'
+        Assert-NormalGeneratedBuildInput -Path $destination -Description 'Fast existing TU'
+        $bytes = Get-CppcheckGitBytes -RepositoryRoot $RepositoryRoot -Arguments @('cat-file', 'blob', "${BaseCommit}:$relative")
+        [IO.File]::WriteAllBytes($destination, $bytes)
+        if ((Get-ByteSHA256 -Bytes ([IO.File]::ReadAllBytes($destination))) -ne (Get-ByteSHA256 -Bytes $bytes)) { throw "Fast Base blob overlay failed for '$relative'." }
     }
 }
 
@@ -1547,6 +2035,12 @@ function Get-GeneratedBuildInputCommands {
                 Description = $rule.Description
                 Command = $commandNode[0].InnerText
                 RelativeOutputs = $rule.RelativeOutputs
+                InputPaths = @($customBuild.ChildNodes | Where-Object {
+                    $_.LocalName -eq 'AdditionalInputs' -and $_.GetAttribute('Condition') -eq $configurationCondition
+                } | ForEach-Object { $_.InnerText.Split(';') } | Where-Object { $_ -ne '%(AdditionalInputs)' } | ForEach-Object {
+                    if ($_ -match '\$\(|%\(') { throw "Unknown generated-input macro '$_'." }
+                    [IO.Path]::GetFullPath($_, (Split-Path $projectPath))
+                })
             }
         }
 
@@ -1816,7 +2310,11 @@ function Invoke-CppcheckBatch {
     $results = @(Invoke-CppcheckProcessBatch -Descriptors $Descriptors -CppcheckJobs $CppcheckJobs -Evidence $Evidence)
     foreach ($descriptor in $Descriptors) {
         $result = $results[$descriptor.Index]
-        ConvertFrom-CppcheckProjectOutput -Output $result.Output -ExitCode $result.ExitCode -RepositoryRoot $descriptor.RepositoryRoot -BuildRoot $descriptor.BuildRoot -TargetName $descriptor.TargetName -TranslationUnit $descriptor.TranslationUnit -AllowedMissingFiles $generatedBundlePaths
+        $output = $result.Output
+        if ($null -ne $descriptor.PSObject.Properties['DiagnosticFileAliases']) {
+            $output = @(ConvertTo-CppcheckAliasedOutput -Output $output -Aliases $descriptor.DiagnosticFileAliases -StageSourceRoot $descriptor.RepositoryRoot)
+        }
+        ConvertFrom-CppcheckProjectOutput -Output $output -ExitCode $result.ExitCode -RepositoryRoot $descriptor.RepositoryRoot -BuildRoot $descriptor.BuildRoot -TargetName $descriptor.TargetName -TranslationUnit $descriptor.TranslationUnit -AllowedMissingFiles $generatedBundlePaths
     }
 }
 
@@ -1922,6 +2420,10 @@ if ($null -ne $inputManifestData) {
 }
 
 Write-Host "Cppcheck parallel jobs: $CppcheckJobs"
+$script:lintTotalTimer = [Diagnostics.Stopwatch]::StartNew()
+$preparationMilliseconds = 0.0
+$analyzerMilliseconds = 0.0
+$analysisProjects = @()
 
 $workspaceHead = Get-GitSingleLine -Arguments @('rev-parse', '--verify', '--quiet', 'HEAD^{commit}') -ErrorMessage 'Could not resolve the current worktree HEAD.'
 $buildRoot = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot $BuildDir))
@@ -1976,19 +2478,18 @@ $cachePaths = @{}
 $cacheIdentities = @{}
 
 $changedFiles = @()
+$sourceRoute = $null
+$treeChanges = @()
 
 if ($null -ne $inputManifestData) {
     $changedFiles = @($inputManifestData.Files | Where-Object { $_.Path -match '\.(c|cc|cpp|cxx)$' } | ForEach-Object { $_.Path })
 }
 else {
-    $changedFiles = @(
-        & git diff --name-only --diff-filter=ACMR $baseCommit $headCommit -- '*.c' '*.cc' '*.cpp' '*.cxx'
-
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "Failed to determine changed C/C++ source files."
-            exit $LASTEXITCODE
-        }
-    )
+    $treeChanges = @(Get-CppcheckTreeChanges -RepositoryRoot $repositoryRoot -BaseCommit $baseCommit -HeadCommit $headCommit)
+    $dirtyBytes = Get-CppcheckGitBytes -RepositoryRoot $repositoryRoot -Arguments @('status', '--porcelain=v1', '-z', '--untracked-files=no')
+    $sourceRoute = Get-CppcheckSourceRoute -Changes $treeChanges -TrackedDirty:($dirtyBytes.Length -ne 0)
+    $changedFiles = $sourceRoute.Sources
+    if ($sourceRoute.Mode -eq 'Error') { throw $sourceRoute.Reason }
 }
 
 $changedFiles = @($changedFiles | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
@@ -1999,7 +2500,7 @@ if ($changedFiles.Count -eq 0) {
         exit 1
     }
 
-    Write-Host "No changed C/C++ translation units require Cppcheck."
+    Write-Host $sourceRoute.Reason
     exit 0
 }
 
@@ -2008,12 +2509,45 @@ $isWindowsVisualStudioBuild = ($null -ne $generatorSetting) -and
     ($generatorSetting.Value -match '^Visual Studio ') -and
     ($null -ne $platformSetting) -and
     (-not [string]::IsNullOrWhiteSpace($platformSetting.Value))
+$useFast = $false
+$fastState = $null
+$receipt = $null
+$routeReason = if ($null -ne $inputManifestData) { 'InputManifest retains its independent Full context' } elseif ($CppcheckMode -eq 'Full') { 'explicit Full mode' } else { $sourceRoute.Reason }
+if ($null -eq $inputManifestData -and $sourceRoute.Mode -eq 'Candidate') {
+    $cacheLock = Enter-CppcheckCacheLock -CacheRoot $cppcheckCacheRoot -Name 'regression'
+    if ($CppcheckMode -eq 'Auto') {
+        $receipt = Get-CppcheckPreparationReceipt -CacheRoot $cppcheckCacheRoot -BuildRoot $buildRoot
+        if ($null -eq $receipt) { $routeReason = 'no verified preparation receipt; cold Full required' }
+        elseif ($null -eq $receipt.PSObject.Properties['Anchor'] -or $null -eq $receipt.PSObject.Properties['State'] -or $null -eq $receipt.PSObject.Properties['PreparationVerified'] -or -not $receipt.PreparationVerified) { $routeReason = 'incomplete preparation receipt' }
+        else {
+            $anchorChanges = @(Get-CppcheckTreeChanges -RepositoryRoot $repositoryRoot -BaseCommit $receipt.Anchor -HeadCommit $headCommit)
+            $anchorRoute = Get-CppcheckSourceRoute -Changes $anchorChanges
+            if ($anchorChanges.Count -and $anchorRoute.Mode -ne 'Candidate') { $routeReason = 'receipt anchor has non-source-only changes' }
+            else {
+                $candidateSelection = Select-CppcheckProjects -Projects $headProjects -ChangedFiles $changedFiles -IsInputManifest:$false -IsWindowsVisualStudioBuild:$isWindowsVisualStudioBuild -BuildDirectory $BuildDir -SelectedOnly
+                if ($candidateSelection.Projects.Count) {
+                    try {
+                        Assert-CppcheckFastSourceSafety -RepositoryRoot $repositoryRoot -BuildRoot $buildRoot -HeadCommit $headCommit -ChangedFiles @($changedFiles + $anchorRoute.Sources | Sort-Object -Unique) -Projects $candidateSelection.Projects -BaseCommit $baseCommit
+                        $fastState = Get-CppcheckPreparationState -RepositoryRoot $repositoryRoot -BuildRoot $buildRoot -Projects $candidateSelection.Projects -AnalyzerVersion $cppcheckVersion[0]
+                        if (($receipt.State | ConvertTo-Json -Depth 16 -Compress) -ceq ($fastState | ConvertTo-Json -Depth 16 -Compress)) { $useFast = $true; $routeReason = 'verified source-only receipt reuse' }
+                        else { $routeReason = 'preparation receipt context/input/output mismatch' }
+                    }
+                    catch [NotSupportedException] { $routeReason = $_.Exception.Message }
+                }
+            }
+        }
+    }
+}
+$stageName = if ($null -ne $inputManifestData) { 'regression-manifest' } elseif ($useFast) { 'regression-fast' } else { 'regression-normal' }
+Write-Host "Cppcheck mode: $(if ($useFast) { 'Fast' } else { 'Full' }); reason: $routeReason."
+if ($useFast) { Write-Host 'Scope: selected TUs only, both roles share verified HEAD context; not whole-project/Base-build equivalence. Do not run a concurrent build.' }
 $selection = Select-CppcheckProjects `
     -Projects $headProjects `
     -ChangedFiles $changedFiles `
     -IsInputManifest:($null -ne $inputManifestData) `
     -IsWindowsVisualStudioBuild:$isWindowsVisualStudioBuild `
     -BuildDirectory $BuildDir `
+    -SelectedOnly:$useFast `
     -PrepareAnalysis {
         $acquiredCacheLock = $null
         $preparedCacheLock = $cacheLock
@@ -2026,7 +2560,7 @@ $selection = Select-CppcheckProjects `
         try {
             [PSCustomObject]@{
                 CacheLock = $preparedCacheLock
-                TempRoot = if ($null -ne $inputManifestData) { $inputManifestRoots.TempRoot } else { New-CppcheckDisposableStage -CacheRoot $cppcheckCacheRoot -Name 'regression-normal' }
+                TempRoot = if ($null -ne $inputManifestData) { $inputManifestRoots.TempRoot } else { New-CppcheckDisposableStage -CacheRoot $cppcheckCacheRoot -Name $stageName }
             }
         }
         catch {
@@ -2061,6 +2595,19 @@ $cleanupState = [PSCustomObject]@{ Completed = $false }
 $gateFailure = ''
 
 try {
+    $receiptStartState = $null
+    $receiptCandidate = $null
+    if ($useFast) {
+        $fastResult = Invoke-CppcheckFastAnalysis -RepositoryRoot $repositoryRoot -BuildRoot $buildRoot -Projects $analysisProjects -State $fastState -HeadCommit $headCommit -BaseCommit $baseCommit -TempRoot $tempRoot -CacheRoot $cppcheckCacheRoot -CppcheckPath $cppcheck.Source -AnalyzerVersion $cppcheckVersion[0] -AnalyzerSHA256 $cppcheckSHA256 -CppcheckJobs $CppcheckJobs -Evidence $evidence
+        $headDiagnostics = $fastResult.Head
+        $baselineDiagnostics = $fastResult.Baseline
+        $vendorDispositionContexts = $fastResult.Contexts
+        $cacheIdentities = $fastResult.Identities
+        $cachePaths = $fastResult.CachePaths
+        $preparationMilliseconds = $fastResult.PreparationMilliseconds
+        $analyzerMilliseconds = $fastResult.AnalyzerMilliseconds
+    }
+    else {
     if ($null -eq $inputManifestData) {
         New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
         & git worktree add --detach $baselineRoot $baseCommit | Out-Null
@@ -2074,7 +2621,12 @@ try {
         $platform = Get-CMakeCacheSetting -CachePath $cacheFile -Name 'CMAKE_GENERATOR_PLATFORM'
         $toolset = Get-CMakeCacheSetting -CachePath $cacheFile -Name 'CMAKE_GENERATOR_TOOLSET'
         $python = Get-CMakePythonExecutable -CachePath $cacheFile
-
+        if ($sourceRoute.Mode -eq 'Candidate') {
+            $refresh = Invoke-LintChild -Path $cmake.Source -Arguments @('-S', $repositoryRoot, '-B', $buildRoot) -Label 'receipt-refresh-head' -Evidence $evidence
+            if ($refresh.ExitCode -ne 0) { throw 'Cold receipt HEAD CMake refresh failed.' }
+            $headProjects = Get-ProjectSources -BuildRoot $buildRoot -RepositoryRoot $repositoryRoot
+            $analysisProjects = (Select-CppcheckProjects -Projects $headProjects -ChangedFiles $changedFiles -IsInputManifest:$false -IsWindowsVisualStudioBuild:$isWindowsVisualStudioBuild -BuildDirectory $BuildDir).Projects
+        }
     }
 
     if ($null -ne $inputManifestData) {
@@ -2082,9 +2634,14 @@ try {
     }
     else {
         Invoke-GeneratedBuildInputPreparation -CMakePath $cmake.Source -BuildRoot $analysisBuildRoot -RevisionName 'source' -Evidence $evidence
+        if ($sourceRoute.Mode -eq 'Candidate') {
+            $revisionResult = Invoke-LintChild -Path $cmake.Source -Arguments @('--build', $buildRoot, '--config', 'Release', '--target', 'revision_check') -Label 'receipt-source-revision' -Evidence $evidence
+            if ($revisionResult.ExitCode -ne 0) { throw 'Cold receipt revision preparation failed.' }
+            Invoke-ProtocolspecGeneration -CMakePath $cmake.Source -BuildRoot $buildRoot -RevisionName 'source' -Evidence $evidence
+        }
     }
 
-    Write-Host 'Protocolspec provenance equality: confirmed.'
+    if ($null -ne $inputManifestData) { Write-Host 'Protocolspec provenance equality: confirmed.' }
 
     foreach ($generatedFile in $verifiedGeneratedBundle) {
         Write-Host "Generated baseline input: $($generatedFile.RelativePath) SHA-256 $($generatedFile.Hash)"
@@ -2135,6 +2692,7 @@ try {
             -PythonPath $python `
             -Evidence $evidence
         Copy-VerifiedGeneratedBundle -VerifiedBundle $verifiedGeneratedBundle -DestinationRoot $baselineRoot
+        Write-Host 'Protocolspec provenance and generated output equality: confirmed.'
     }
 
     $baselineProjects = Get-ProjectSources -BuildRoot $baselineBuildRoot -RepositoryRoot $baselineRoot
@@ -2185,9 +2743,26 @@ try {
         }
     }
 
-    Write-Host "Cppcheck context and full translation-unit equality: confirmed for $($analysisProjects.Count) target(s)."
+    if ($null -ne $inputManifestData) { Write-Host "Cppcheck context parity: confirmed for $($analysisProjects.Count) target(s) (InputManifest)." }
+    else { Write-Host 'Full uses independently configured HEAD/live-worktree and Base projects; context/TU parity is not implied.' }
+    if ($null -eq $inputManifestData -and $sourceRoute.Mode -eq 'Candidate') {
+        try {
+            Assert-CppcheckFastSourceSafety -RepositoryRoot $repositoryRoot -BuildRoot $buildRoot -HeadCommit $headCommit -ChangedFiles $changedFiles -Projects $analysisProjects
+            $receiptStartState = Get-CppcheckPreparationState -RepositoryRoot $repositoryRoot -BuildRoot $buildRoot -Projects $analysisProjects -AnalyzerVersion $cppcheckVersion[0]
+            $null = @(foreach ($project in $analysisProjects) { New-CppcheckFastProject -Project $project -RepositoryRoot $repositoryRoot -BuildRoot $buildRoot -StageSourceRoot (Join-Path $tempRoot 'receipt-proof/source') -ProjectRoot (Join-Path $tempRoot 'receipt-proof/project') -AnalyzerVersion $cppcheckVersion[0] })
+            $receiptCandidate = New-CppcheckPreparationReceipt -State $receiptStartState -HeadCommit $headCommit -RepositoryRoot $repositoryRoot -BuildRoot $buildRoot -Projects $analysisProjects -BaselineProjects $baselineProjects -BaselineRoot $baselineRoot -BaselineBuildRoot $baselineBuildRoot -AnalyzerVersion $cppcheckVersion[0]
+            Write-Host 'Receipt preparation: real HEAD/Base context and entire TU parity verified.'
+        }
+        catch {
+            if ($_.Exception -isnot [NotSupportedException] -and $_.Exception.Message -notmatch '^Cppcheck project context mismatch|^Cppcheck translation-unit selection mismatch|^Receipt ') { throw }
+            Write-Host "Receipt not issued: $($_.Exception.Message)"
+            $receiptCandidate = $null
+        }
+    }
     Save-LintEvidenceState -Evidence $evidence -AnalysisBuildRoot $analysisBuildRoot -BaselineBuildRoot $baselineBuildRoot -TempRoot $tempRoot -AnalysisProjects $analysisProjects -BaselineProjects $baselineProjects -Contexts $vendorDispositionContexts -VerifiedGeneratedBundle $verifiedGeneratedBundle -CacheIdentity $cacheIdentities -CachePaths $cachePaths -HeadCommit $headCommit -BaseCommit $baseCommit
     Write-Host "Running isolated Cppcheck analysis for $($analysisProjects.Count) target(s):"
+    $preparationMilliseconds = $script:lintTotalTimer.Elapsed.TotalMilliseconds
+    $fullAnalyzerTimer = [Diagnostics.Stopwatch]::StartNew()
 
     foreach ($project in $analysisProjects) {
         $targetName = $project.RelativeProject
@@ -2280,13 +2855,22 @@ try {
 
     $baselineDiagnostics = $baselineDiagnostics.ToArray()
     $headDiagnostics = $headDiagnostics.ToArray()
+    $fullAnalyzerTimer.Stop()
+    $analyzerMilliseconds = $fullAnalyzerTimer.Elapsed.TotalMilliseconds
+    if ($null -ne $receiptCandidate) {
+        Assert-CppcheckPreparationState -Expected $receiptStartState -Actual (Get-CppcheckPreparationState -RepositoryRoot $repositoryRoot -BuildRoot $buildRoot -Projects $analysisProjects -AnalyzerVersion $cppcheckVersion[0])
+        Assert-CppcheckFastLiveHead -RepositoryRoot $repositoryRoot -HeadCommit $headCommit
+        Save-CppcheckPreparationReceipt -CacheRoot $cppcheckCacheRoot -BuildRoot $buildRoot -Receipt $receiptCandidate
+        Write-Host 'Verified preparation receipt published (independent of diagnostic classification).'
+    }
+    }
     $vendorDispositionPolicy = Join-Path $PSScriptRoot 'cppcheck-vendor-dispositions.json'
     Write-Host "Raw HEAD diagnostics ($($headDiagnostics.Count)):"
     $headDiagnostics | Sort-Object Display | ForEach-Object { Write-Host "  $($_.Display)" }
     $vendorDispositionResult = Get-CppcheckVendorDispositionResult `
         -Diagnostics $headDiagnostics `
         -PolicyPath $vendorDispositionPolicy `
-        -RepositoryRoot $analysisRepositoryRoot `
+        -RepositoryRoot $(if ($useFast) { $repositoryRoot } else { $analysisRepositoryRoot }) `
         -Contexts $vendorDispositionContexts `
         -NormalizeTrackedTextNewlines:($null -eq $inputManifestData)
     $headDiagnosticsForComparison = @($vendorDispositionResult.Unaccepted)
@@ -2333,7 +2917,7 @@ try {
             Save-LintEvidenceState -Evidence $evidence -AnalysisBuildRoot $analysisBuildRoot -BaselineBuildRoot $baselineBuildRoot -TempRoot $tempRoot -AnalysisProjects $analysisProjects -BaselineProjects $baselineProjects -Contexts $vendorDispositionContexts -VerifiedGeneratedBundle $verifiedGeneratedBundle -CacheIdentity $cacheIdentities -CachePaths $cachePaths -HeadCommit $headCommit -BaseCommit $baseCommit
         } `
         -CleanupAction {
-            Complete-LintTemporaryCleanup -BaselineWorktreeCreated:$baselineWorktreeCreated -BaselineRoot $baselineRoot -TempRoot $tempRoot -CppcheckCacheRoot $cppcheckCacheRoot -StageName $(if ($null -eq $inputManifestData) { 'regression-normal' } else { 'regression-manifest' })
+            Complete-LintTemporaryCleanup -BaselineWorktreeCreated:$baselineWorktreeCreated -BaselineRoot $baselineRoot -TempRoot $tempRoot -CppcheckCacheRoot $cppcheckCacheRoot -StageName $stageName
             $cleanupState.Completed = $true
         } `
         -SaveResultAction {
@@ -2352,7 +2936,7 @@ catch {
 finally {
     if (-not $cleanupState.Completed) {
         try {
-            Complete-LintTemporaryCleanup -BaselineWorktreeCreated:$baselineWorktreeCreated -BaselineRoot $baselineRoot -TempRoot $tempRoot -CppcheckCacheRoot $cppcheckCacheRoot -StageName $(if ($null -eq $inputManifestData) { 'regression-normal' } else { 'regression-manifest' })
+            Complete-LintTemporaryCleanup -BaselineWorktreeCreated:$baselineWorktreeCreated -BaselineRoot $baselineRoot -TempRoot $tempRoot -CppcheckCacheRoot $cppcheckCacheRoot -StageName $stageName
             $cleanupState.Completed = $true
         }
         catch {
@@ -2380,6 +2964,10 @@ finally {
 }
 
 finally {
+    if ($null -ne (Get-Variable lintTotalTimer -Scope Script -ErrorAction SilentlyContinue)) {
+        $script:lintTotalTimer.Stop()
+        Write-Host ("Cppcheck timing (ms): preparation={0:F3}; analyzer={1:F3}; total={2:F3}; targets={3}; selected TUs={4}." -f $preparationMilliseconds, $analyzerMilliseconds, $script:lintTotalTimer.Elapsed.TotalMilliseconds, $analysisProjects.Count, @($analysisProjects | ForEach-Object { $_.Files }).Count)
+    }
     try {
         if (($null -ne $inputManifestRoots) -and ($null -eq $tempRoot) -and (Test-Path -LiteralPath $inputManifestRoots.TempRoot)) {
             Remove-CppcheckDisposableStage -CacheRoot $cppcheckCacheRoot -StageRoot $inputManifestRoots.TempRoot -Name 'regression-manifest'
