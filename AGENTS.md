@@ -9,6 +9,8 @@ This repository is a fork of Zandronum based on:
 
 The primary goal of this fork is to add a native OpenAL Soft audio backend while preserving compatibility with stock Zandronum wherever possible.
 
+The primary validated platform is Windows x64. Linux is not actively validated, and hosted CI is intentionally not maintained. Historical Phase 1/2 evidence remains valid under its original scope.
+
 Later work may include:
 
 * OpenAL Soft HRTF, EFX, Doppler, and source-radius support
@@ -82,7 +84,7 @@ Generated PK3 files may differ in authenticated lump hashes even when generated 
 
 ## Windows Build Environment
 
-Primary supported development environment:
+Primary validated development environment:
 
 * Visual Studio 2022
 * MSVC v143
@@ -106,6 +108,8 @@ cmake --build build-v143 --config Release
 ```
 
 Do not reintroduce the legacy VS2015 / `v140_xp` / Windows SDK 7.1A toolchain unless explicitly requested.
+
+Local dependency and runtime readiness is an explicit prerequisite: preserve the configured dependency roots and provide the required x64 runtime DLLs adjacent to the launched game and relevant test executable. Do not rely on developer PATH or require CI artifact downloads to build or run locally.
 
 ---
 
@@ -227,12 +231,18 @@ Before considering a change complete, run the checks relevant to that change.
 
 For ordinary C/C++ changes:
 
-1. Build the affected target.
-2. Run applicable Lizard checks.
-3. Run applicable Cppcheck checks.
-4. Check for unintended generated-file changes.
+1. Configure the local Windows x64 build and build the affected target in Release using VS2022/v143.
+2. Run relevant focused CTest checks.
+3. Run applicable incremental Lizard checks.
+4. Run applicable incremental Cppcheck checks.
+5. Perform relevant manual runtime validation.
+6. Check for unintended generated-file changes.
 
-For networking-sensitive changes, additionally verify compatibility implications explicitly.
+Preserve the baseline-debt rules above; failing local checks or legitimate new warnings are not waived by this policy.
+
+Linux, Win32, and AppImage validation is required only when explicitly targeted by the task.
+
+Routine isolated audio or acoustics changes do not require a stock-server connection on every commit. Network-, revision-, or PK3-sensitive changes require explicit stock compatibility validation. Stock-server confirmation at major milestones is optional and manual unless the change is compatibility-sensitive.
 
 For audio backend work, test both the existing FMOD path and the OpenAL path when both are affected.
 
@@ -281,5 +291,7 @@ Agents should avoid without explicit justification:
 * Broad warning suppressions
 * Disabling lint or tests to obtain a passing result
 * Stage files included in .gitignore
+
+Do not add or restore GitHub Actions, GitLab/Heptapod CI, or hosted cross-platform, package, or AppImage jobs unless explicitly requested by the user. Do not expand Windows-local work into cross-platform packaging without an explicit user request.
 
 When a task reveals a pre-existing defect outside its scope, document it rather than silently expanding the task.
